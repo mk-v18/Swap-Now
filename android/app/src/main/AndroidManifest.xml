@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.example.credbro">
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         NETWORK
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         LOCATION
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         NOTIFICATIONS
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         AUDIO / RECORDING
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         CAMERA
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         STORAGE
+         API ≤ 29: legacy write (scoped storage makes this unnecessary on 30+)
+         API 33+:  granular media permissions replace READ_EXTERNAL_STORAGE
+         ══════════════════════════════════════════════════════════════════════ -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+
+    <!--
+    ╔═══════════════════════════════════════════════════════════════════════════╗
+    ║  NOTE: No SMS permissions needed.                                        ║
+    ║  Firebase Phone Auth uses the SMS Retriever API silently via GMS —       ║
+    ║  no READ_SMS / RECEIVE_SMS required, and no manual receiver needed.      ║
+    ║  The RetrieveSmsIntentService receiver was REMOVED because:              ║
+    ║    • It is a Service, not a BroadcastReceiver — declaring it as          ║
+    ║      <receiver> caused a fatal ClassNotFoundException crash.             ║
+    ║    • GMS registers it automatically when play-services-auth is present.  ║
+    ╚═══════════════════════════════════════════════════════════════════════════╝
+    -->
+
+    <application
+        android:label="SwapNow"
+        android:icon="@mipmap/launcher_icon"
+        android:requestLegacyExternalStorage="true"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:replace="android:label">
+
+        <!-- Google Mobile Ads app ID
+             TODO: Replace with your real ad app ID before release. -->
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-3940256099942544~3347511713" />
+
+        <!-- ── Main activity ──────────────────────────────────────────────── -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+
+            <meta-data
+                android:name="com.google.firebase.messaging.default_notification_icon"
+                android:resource="@mipmap/ic_notification" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ── FCM background service ──────────────────────────────────────
+             Required for background push notifications on Android 8+.
+             Without this the background message handler is never invoked.
+             ──────────────────────────────────────────────────────────────── -->
+        <service
+            android:name="com.google.firebase.messaging.FirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <meta-data android:name="flutterEmbedding" android:value="2" />
+
+    </application>
+
+</manifest>
