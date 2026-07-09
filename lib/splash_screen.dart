@@ -382,7 +382,7 @@ class _SplashScreenState extends State<SplashScreen>
                 'SwapNow',
                 fontSize: taglineFontSize,
                 fontWeight: FontWeight.w800,
-                letterSpacing: 2.5,
+                letterSpacing: 0,
               ),
             ),
           ),

@@ -22,7 +22,7 @@ import 'package:cloud_functions/cloud_functions.dart';
 // A hardcoded fallback is kept ONLY for the case where Remote Config is
 // unreachable (first launch, offline, etc.) — set this to your current
 // test key so behavior is unchanged if the fetch fails.
-const String _kRazorpayKeyFallback = 'rzp_test_iUsvSvPsR86ha0';
+const String _kRazorpayKeyFallback = 'rzp_test_TBJCKQmpFKyNl6'; // TODO: paste your regenerated test key_id
 const int _kAmountPaise = 9900; // ₹99.00
 
 // If the Razorpay checkout sheet is dismissed/killed without firing any
@@ -404,6 +404,10 @@ class _PaymentPageState extends State<PaymentPage>
     final code = response.code ?? 0;
     final message = response.message ?? 'Unknown error';
 
+    // TEMP DEBUG — remove once root cause is confirmed.
+    debugPrint('Razorpay payment error — code: $code, message: $message');
+    debugPrint('Razorpay error details: ${response.error}');
+
     try {
       await FirebaseFirestore.instance.collection('payments').add({
         'userId': user?.uid ?? 'unknown',
@@ -543,8 +547,7 @@ class _PaymentPageState extends State<PaymentPage>
                               _FeatureLabel("Unlimited access to features"),
                               _FeatureLabel("Priority customer support"),
                               _FeatureLabel("All updates included"),
-                              _FeatureLabel(
-                                  "One-time payment, no hidden charges"),
+                              _FeatureLabel("One-time payment, no hidden charges"),
                               _FeatureLabel("Instant account activation"),
                               _FeatureLabel("Secure & encrypted transactions"),
                             ],

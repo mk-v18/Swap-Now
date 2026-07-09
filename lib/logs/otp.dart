@@ -1,6 +1,5 @@
 // ignore_for_file: unawaited_futures
 import 'dart:async';
-
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:credbro/logs/wrapper.dart';
 import 'package:credbro/start/privacy_policy.dart';
@@ -24,8 +23,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   // ── Constants ─────────────────────────────────────────────────────────────
   static const _purple      = Color(0xFF5800B3);
   static const _deepPurple  = Color(0xFF26004D);
-  // FIX(perf): Pre-compute opacity variants — avoids Color allocation every build().
-  static const _purpleShadow   = Color(0x4D5800B3); // ~30% opacity
+  static const _purpleShadow    = Color(0x4D5800B3); // ~30% opacity
   static const _purpleBoxShadow = Color(0x0F5800B3); // ~6%  opacity
 
   // ── Firebase ──────────────────────────────────────────────────────────────
@@ -40,7 +38,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   final List<FocusNode> _keyListenerNodes =
   List.generate(6, (_) => FocusNode());
 
-  // FIX: GestureRecognizers created once in initState and disposed — no leak.
   late final TapGestureRecognizer _termsRecognizer;
   late final TapGestureRecognizer _privacyRecognizer;
 
@@ -53,18 +50,19 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   int    _resendCooldown = 0;
   Timer? _resendTimer;
 
-  // FIX: Single atomic guard — prevents double sign-in when SMS auto-read
-  // and manual submit fire concurrently.
   bool _verificationInFlight = false;
 
-  // FIX(perf): Memoised OTP string — recomputed only on change, not on every
-  // build() call or repeated reads within the same gesture handler.
-  String _cachedOtpCode = '';
-  String get _otpCode {
-    final code = _otpControllers.map((c) => c.text).join();
-    _cachedOtpCode = code;
-    return code;
-  }
+  // FIX(reliability + perf): Single source of truth for the joined code,
+  // updated by ONE listener attached to all 6 controllers. Any UI that needs
+  // the live code (verify button, "all digits entered" badge) listens to
+  // this instead of the whole page rebuilding via setState.
+  final ValueNotifier<String> _codeNotifier = ValueNotifier<String>('');
+
+  // FIX(reliability): Prevents re-triggering verification for the exact same
+  // 6-digit code repeatedly (e.g. redundant notifications), while still
+  // allowing a fresh attempt if the user edits and re-enters the same digits
+  // after a failure (cleared on failure below).
+  String _lastAttemptedCode = '';
 
   // ── Animation ─────────────────────────────────────────────────────────────
   late final AnimationController _slideCtrl;
@@ -98,20 +96,47 @@ class _OtpSignupPageState extends State<OtpSignupPage>
           MaterialPageRoute(builder: (_) => const PrivacyPolicyPage()),
         );
       };
+
+    // FIX(reliability + perf): This fires no matter HOW a controller's text
+    // changed — typed, pasted, or programmatically set via
+    // `_fillBoxesVisually` (SMS autofill / platform autofill / paste). That
+    // means auto-verify now works uniformly for every input path, instead of
+    // being wired separately (and inconsistently) into each one.
+    for (final c in _otpControllers) {
+      c.addListener(_onOtpTextChanged);
+    }
   }
 
   @override
   void dispose() {
+    for (final c in _otpControllers) c.dispose(); // also removes listeners
     _phoneController.dispose();
-    for (final c in _otpControllers)   c.dispose();
     for (final f in _focusNodes)       f.dispose();
     for (final f in _keyListenerNodes) f.dispose();
     _termsRecognizer.dispose();
     _privacyRecognizer.dispose();
     _resendTimer?.cancel();
     _slideCtrl.dispose();
+    _codeNotifier.dispose();
     TextInput.finishAutofillContext(shouldSave: false);
     super.dispose();
+  }
+
+  // ── Centralized OTP-change handler ────────────────────────────────────────
+  void _onOtpTextChanged() {
+    final code = _otpControllers.map((c) => c.text).join();
+    if (code == _codeNotifier.value) return; // nothing actually changed
+    _codeNotifier.value = code;
+
+    if (code.length == 6 &&
+        !_verificationInFlight &&
+        code != _lastAttemptedCode) {
+      _lastAttemptedCode = code;
+      // Let the current frame (focus/unfocus, box repaint) settle first.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _verifyOtp();
+      });
+    }
   }
 
   // ── Error mapping ─────────────────────────────────────────────────────────
@@ -189,7 +214,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  /// Fill all 6 OTP boxes visually. Does NOT trigger sign-in.
+  /// Fill all 6 OTP boxes (SMS autofill / paste). Setting `.value` on a
+  /// TextEditingController still notifies listeners, so `_onOtpTextChanged`
+  /// fires automatically for each box here — no need to manually trigger
+  /// verification afterwards.
   void _fillBoxesVisually(String digits) {
     if (!mounted) return;
     final clean = digits.replaceAll(RegExp(r'\D'), '');
@@ -201,8 +229,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       );
     }
     FocusScope.of(context).unfocus();
-    TextInput.finishAutofillContext(); // tells platform autofill is complete
-    if (mounted) setState(() {});
+    TextInput.finishAutofillContext();
   }
 
   void _startResendTimer() {
@@ -236,7 +263,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     }
   }
 
-  // FIX(security): Validate Indian mobile number prefix (must start with 6–9).
   bool _isValidIndianNumber(String digits) {
     if (digits.length != 10) return false;
     final first = int.tryParse(digits[0]) ?? 0;
@@ -247,7 +273,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   Future<void> _sendOtp({bool isResend = false}) async {
     final phone = _phoneController.text.trim().replaceAll(RegExp(r'\D'), '');
 
-    // FIX(security): Stricter validation — length + valid Indian prefix.
     if (!_isValidIndianNumber(phone)) {
       _showErrorSnack('Please enter a valid 10-digit Indian mobile number.');
       return;
@@ -318,11 +343,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   // ── Verify OTP ────────────────────────────────────────────────────────────
   Future<void> _verifyOtp() async {
-    final code = _otpCode;
+    final code = _codeNotifier.value;
     if (code.length < 6) return;
 
-    // FIX(reliability): Guard empty verificationId — Firebase throws an
-    // opaque internal error if verificationId is blank.
     if (_verificationId.isEmpty) {
       _showErrorSnack('Session expired. Please request a new OTP.');
       return;
@@ -339,7 +362,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   Future<void> _signInWithCredential(PhoneAuthCredential credential) async {
     if (!mounted) return;
-    // FIX: Synchronous flag flip before any await — true atomic guard.
     if (_verificationInFlight) return;
     _verificationInFlight = true;
     setState(() => _isVerifying = true);
@@ -350,7 +372,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       final user = userCredential.user;
       if (user == null || !mounted) return;
 
-      // FIX: Fire-and-forget FCM token save — non-blocking, non-critical.
       _saveFCMToken(user.uid);
 
       final userRef =
@@ -364,8 +385,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
           MaterialPageRoute(builder: (_) => const Wrapper()),
         );
       } else {
-        // FIX: Await the Firestore write before navigating — PersonalDetailsPage
-        // must never open before the user doc exists.
         await userRef.set({
           'uid':       user.uid,
           'phone':     user.phoneNumber,
@@ -374,23 +393,26 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
         if (!mounted) return;
 
-        // FIX(reliability): Use pushReplacement so user cannot press Back
-        // to the OTP screen and re-trigger verification.
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (_) => const PersonalDetailsPage()),
         );
       }
 
-      // FIX(security): Clear verificationId after use — cannot be replayed.
       _verificationId = '';
     } on FirebaseAuthException catch (e) {
+      // FIX(reliability): Allow retrying the same code after a failure
+      // (e.g. user was mid-typing when an auto-verify attempt failed, or
+      // wants to resubmit) instead of it being silently blocked forever.
+      _lastAttemptedCode = '';
       if (mounted) _showErrorSnack(_friendlyError(e.code));
     } on TimeoutException {
+      _lastAttemptedCode = '';
       if (mounted) {
         _showErrorSnack('Request timed out. Please check your connection.');
       }
     } catch (_) {
+      _lastAttemptedCode = '';
       if (mounted) _showErrorSnack('Something went wrong. Please try again.');
     } finally {
       _verificationInFlight = false;
@@ -402,16 +424,13 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   Future<void> _resendOtp() async {
     if (_resendCooldown > 0) return;
     for (final c in _otpControllers) c.clear();
-    _cachedOtpCode = '';
-    if (mounted) setState(() {});
+    _lastAttemptedCode = '';
     _focusNodes[0].requestFocus();
     await _sendOtp(isResend: true);
   }
 
   // ── Back to phone screen ──────────────────────────────────────────────────
   void _goBackToPhone() {
-    // FIX(reliability): Cancel timer when going back — prevents setState
-    // calls on a stale widget sub-tree.
     _resendTimer?.cancel();
     _resendCooldown = 0;
 
@@ -419,105 +438,98 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       if (!mounted) return;
       setState(() => _otpSent = false);
       for (final c in _otpControllers) c.clear();
-      _cachedOtpCode = '';
+      _lastAttemptedCode = '';
     });
   }
 
   // ── OTP box widget ────────────────────────────────────────────────────────
+  // FIX(perf): Wrapped in AnimatedBuilder listening ONLY to this box's own
+  // controller. Typing a digit now only rebuilds this one small widget,
+  // instead of setState() rebuilding the entire page on every keystroke.
   Widget _buildOtpBox(int index, double boxSize) {
-    // FIX(perf): Read fill-state once — avoids repeated controller.text access.
-    final isFilled = _otpControllers[index].text.isNotEmpty;
-
     return SizedBox(
       width:  boxSize,
       height: boxSize * 1.15,
-      child: KeyboardListener(
-        focusNode: _keyListenerNodes[index],
-        onKeyEvent: (KeyEvent event) {
-          if (event is KeyDownEvent &&
-              event.logicalKey == LogicalKeyboardKey.backspace) {
-            if (_otpControllers[index].text.isEmpty && index > 0) {
-              _otpControllers[index - 1].clear();
-              _focusNodes[index - 1].requestFocus();
-              if (mounted) setState(() {});
-            }
-          }
+      child: AnimatedBuilder(
+        animation: _otpControllers[index],
+        builder: (context, _) {
+          final isFilled = _otpControllers[index].text.isNotEmpty;
+          return KeyboardListener(
+            focusNode: _keyListenerNodes[index],
+            onKeyEvent: (KeyEvent event) {
+              if (event is KeyDownEvent &&
+                  event.logicalKey == LogicalKeyboardKey.backspace) {
+                if (_otpControllers[index].text.isEmpty && index > 0) {
+                  _otpControllers[index - 1].clear();
+                  _focusNodes[index - 1].requestFocus();
+                }
+              }
+            },
+            child: TextField(
+              controller:      _otpControllers[index],
+              focusNode:       _focusNodes[index],
+              keyboardType:    TextInputType.number,
+              textAlign:       TextAlign.center,
+              maxLength:       1,
+              autofillHints:   const [AutofillHints.oneTimeCode],
+              textInputAction:
+              index < 5 ? TextInputAction.next : TextInputAction.done,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              style: TextStyle(
+                fontSize:   boxSize * 0.30,
+                fontWeight: FontWeight.w600,
+                color:      Colors.black,
+              ),
+              decoration: InputDecoration(
+                counterText:    '',
+                contentPadding: EdgeInsets.zero,
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide:
+                  const BorderSide(color: Color(0xFFDDD6F0), width: 1.5),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: const BorderSide(color: _purple, width: 2),
+                ),
+                filled:    true,
+                fillColor: isFilled
+                    ? const Color(0xFFF5F0FF)
+                    : Colors.white,
+              ),
+              // FIX(reliability + perf): onChanged now ONLY handles focus
+              // movement and paste distribution — nothing else. Fill color
+              // is handled above via AnimatedBuilder, and auto-verify is
+              // handled centrally by `_onOtpTextChanged`, so this can never
+              // get out of sync with what the controllers actually contain.
+              onChanged: (value) {
+                if (value.length > 1) {
+                  final digits = value.replaceAll(RegExp(r'\D'), '');
+                  if (digits.length == 6) {
+                    _fillBoxesVisually(digits);
+                    return;
+                  }
+                  _otpControllers[index].value = TextEditingValue(
+                    text:      value[0],
+                    selection: const TextSelection.collapsed(offset: 1),
+                  );
+                }
+
+                if (value.isEmpty) {
+                  if (index > 0 && _otpControllers[index - 1].text.isNotEmpty) {
+                    _focusNodes[index - 1].requestFocus();
+                  }
+                } else {
+                  if (index < 5) {
+                    _focusNodes[index + 1].requestFocus();
+                  } else {
+                    FocusScope.of(context).unfocus();
+                  }
+                }
+              },
+            ),
+          );
         },
-        child: TextField(
-          controller:      _otpControllers[index],
-          focusNode:       _focusNodes[index],
-          keyboardType:    TextInputType.number,
-          textAlign:       TextAlign.center,
-          maxLength:       1,
-          autofillHints:   const [AutofillHints.oneTimeCode],
-          textInputAction:
-          index < 5 ? TextInputAction.next : TextInputAction.done,
-          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-          style: TextStyle(
-            fontSize:   boxSize * 0.30,
-            fontWeight: FontWeight.w600,
-            color:      Colors.black,
-          ),
-          decoration: InputDecoration(
-            counterText:    '',
-            contentPadding: EdgeInsets.zero,
-            enabledBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-              borderSide:
-              const BorderSide(color: Color(0xFFDDD6F0), width: 1.5),
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-              borderSide: const BorderSide(color: _purple, width: 2),
-            ),
-            filled:    true,
-            // FIX(perf): Use pre-read local — no repeated controller.text in build.
-            fillColor: isFilled
-                ? const Color(0xFFF5F0FF)
-                : Colors.white,
-          ),
-          onChanged: (value) {
-            // ── Paste / SMS auto-fill: full 6-digit string in one box ──────
-            if (value.length > 1) {
-              final digits = value.replaceAll(RegExp(r'\D'), '');
-              if (digits.length == 6) {
-                _fillBoxesVisually(digits);
-                Future.delayed(const Duration(milliseconds: 150), () {
-                  if (mounted) _verifyOtp();
-                });
-                return;
-              }
-              _otpControllers[index].value = TextEditingValue(
-                text:      value[0],
-                selection: const TextSelection.collapsed(offset: 1),
-              );
-            }
-
-            if (value.isEmpty) {
-              if (index > 0 && _otpControllers[index - 1].text.isNotEmpty) {
-                _focusNodes[index - 1].requestFocus();
-              }
-            } else {
-              if (index < 5) {
-                _focusNodes[index + 1].requestFocus();
-              } else {
-                FocusScope.of(context).unfocus();
-              }
-            }
-
-            // FIX(perf): Only call setState if fill-color actually toggled.
-            final nowFilled = _otpControllers[index].text.isNotEmpty;
-            if (nowFilled != isFilled && mounted) setState(() {});
-
-            // Auto-verify when all 6 boxes are filled.
-            final code = _otpCode;
-            if (code.length == 6 && !_verificationInFlight) {
-              Future.delayed(const Duration(milliseconds: 80), () {
-                if (mounted) _verifyOtp();
-              });
-            }
-          },
-        ),
       ),
     );
   }
@@ -540,7 +552,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     final rawBoxW   = (otpTotalW - 5 * 8) / 6;
     final boxSize   = rawBoxW.clamp(36.0, 52.0);
 
-    // Full-screen verifying overlay.
     if (_isVerifying) {
       return const Scaffold(
         backgroundColor: Colors.white,
@@ -579,8 +590,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                   children: [
                     SizedBox(height: screenH * 0.03),
 
-                    // FIX(perf): cacheWidth constrains image decode size to
-                    // the actual render width, reducing GPU memory usage.
                     Center(
                       child: Image.asset(
                         'assets/images/signup-image.png',
@@ -628,7 +637,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                           Border.all(color: _purple, width: 1.5),
                           borderRadius: BorderRadius.circular(16),
                           boxShadow: const [
-                            // FIX(perf): Constant BoxShadow — no allocation per build.
                             BoxShadow(
                               color:      _purpleBoxShadow,
                               blurRadius: 12,
@@ -676,7 +684,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                                   FilteringTextInputFormatter.digitsOnly,
                                   LengthLimitingTextInputFormatter(10),
                                 ],
-                                onChanged: (_) => setState(() {}),
+                                // FIX(perf): No more setState() here — the
+                                // Continue button below listens to this
+                                // controller directly via AnimatedBuilder.
                                 style: const TextStyle(
                                     fontSize:      16,
                                     fontWeight:    FontWeight.w500,
@@ -698,11 +708,17 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
                       const SizedBox(height: 24),
 
-                      _PurpleButton(
-                        label:     'Continue',
-                        isLoading: _isSendingOtp,
-                        enabled:   _phoneController.text.length == 10,
-                        onTap:     _isSendingOtp ? null : _sendOtp,
+                      // FIX(perf): Only this button rebuilds as the phone
+                      // number is typed, via AnimatedBuilder on
+                      // _phoneController — not the whole page.
+                      AnimatedBuilder(
+                        animation: _phoneController,
+                        builder: (context, _) => _PurpleButton(
+                          label:     'Continue',
+                          isLoading: _isSendingOtp,
+                          enabled:   _phoneController.text.length == 10,
+                          onTap:     _isSendingOtp ? null : _sendOtp,
+                        ),
                       ),
                     ],
 
@@ -778,33 +794,42 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
                             const SizedBox(height: 8),
 
-                            AnimatedOpacity(
-                              opacity:  _cachedOtpCode.length == 6 ? 1.0 : 0.0,
-                              duration: const Duration(milliseconds: 200),
-                              child: const Padding(
-                                padding: EdgeInsets.only(top: 4),
-                                child: Row(
-                                  children: [
-                                    Icon(Icons.check_circle_outline,
-                                        size: 14, color: Color(0xFF1B8A4C)),
-                                    SizedBox(width: 4),
-                                    Text('All digits entered',
-                                        style: TextStyle(
-                                            fontSize:   12,
-                                            color:      Color(0xFF1B8A4C),
-                                            fontWeight: FontWeight.w500)),
-                                  ],
+                            // FIX(perf): Only this small badge rebuilds as
+                            // digits are entered, via ValueListenableBuilder
+                            // on _codeNotifier.
+                            ValueListenableBuilder<String>(
+                              valueListenable: _codeNotifier,
+                              builder: (context, code, _) => AnimatedOpacity(
+                                opacity:  code.length == 6 ? 1.0 : 0.0,
+                                duration: const Duration(milliseconds: 200),
+                                child: const Padding(
+                                  padding: EdgeInsets.only(top: 4),
+                                  child: Row(
+                                    children: [
+                                      Icon(Icons.check_circle_outline,
+                                          size: 14, color: Color(0xFF1B8A4C)),
+                                      SizedBox(width: 4),
+                                      Text('All digits entered',
+                                          style: TextStyle(
+                                              fontSize:   12,
+                                              color:      Color(0xFF1B8A4C),
+                                              fontWeight: FontWeight.w500)),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),
 
                             const SizedBox(height: 24),
 
-                            _PurpleButton(
-                              label:     'Verify',
-                              isLoading: _isVerifying,
-                              enabled:   _cachedOtpCode.length == 6,
-                              onTap:     _isVerifying ? null : _verifyOtp,
+                            ValueListenableBuilder<String>(
+                              valueListenable: _codeNotifier,
+                              builder: (context, code, _) => _PurpleButton(
+                                label:     'Verify',
+                                isLoading: _isVerifying,
+                                enabled:   code.length == 6,
+                                onTap:     _isVerifying ? null : _verifyOtp,
+                              ),
                             ),
 
                             const SizedBox(height: 20),
@@ -914,7 +939,6 @@ class _PurpleButton extends StatelessWidget {
 
   static const _purple      = Color(0xFF5800B3);
   static const _deepPurple  = Color(0xFF26004D);
-  // FIX(perf): Pre-computed opacity constant — no Color allocation per build.
   static const _shadowColor = Color(0x4D5800B3); // purple @ 30%
 
   @override
@@ -933,7 +957,6 @@ class _PurpleButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(16),
           boxShadow: enabled
               ? const [
-            // FIX(perf): Constant BoxShadow — never allocates during build.
             BoxShadow(
               color:      _shadowColor,
               blurRadius: 14,

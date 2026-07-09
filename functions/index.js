@@ -209,7 +209,10 @@ exports.createRazorpayOrder = onCall(
       throw new HttpsError("unauthenticated", "Must be signed in.");
     }
 
-    const receipt = `rcpt_${request.auth.uid}_${Date.now()}`;
+    // Razorpay caps `receipt` at 40 chars. Full UID (28 chars) + prefix +
+    // timestamp blew past that, so truncate the UID to keep this well
+    // under the limit while still being useful for support lookups.
+    const receipt = `ord_${request.auth.uid.slice(0, 12)}_${Date.now()}`;
     const auth = Buffer.from(
       `${razorpayKeyId.value()}:${razorpayKeySecret.value()}`
     ).toString("base64");
