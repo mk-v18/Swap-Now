@@ -10,8 +10,9 @@ initializeApp();
 const db = getFirestore();
 
 // ── Secrets ──────────────────────────────────────────────────────────────
-// Both set via: firebase functions:secrets:set <NAME>
+// All set via: firebase functions:secrets:set <NAME>
 // Never stored in any file in this repo.
+const razorpayKeyId = defineSecret("RAZORPAY_KEY_ID");         // ✅ NEW — needed to auth the Orders API call
 const razorpayKeySecret = defineSecret("RAZORPAY_KEY_SECRET");
 const chatAesKeySecret = defineSecret("CHAT_AES_KEY"); // base64, 32 bytes
 
@@ -187,7 +188,69 @@ function _safeImageUrl(url) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 2. Payment verification — called from PaymentPage after Razorpay's
+// 2a. Create Razorpay order — MUST be called before opening checkout.
+//
+// ✅ NEW: This was the missing piece. Razorpay only returns a
+// `razorpay_signature` in the client success callback when checkout was
+// opened against a real order created via the Orders API. Without this,
+// verifyPayment's HMAC(orderId + "|" + paymentId, secret) check can never
+// match, so every payment was failing verification regardless of whether
+// the key/secret pair was correct.
+//
+// Amount is intentionally hardcoded server-side (not read from the client)
+// so a tampered client can't request a cheaper order.
+// ══════════════════════════════════════════════════════════════════════
+const RAZORPAY_AMOUNT_PAISE = 9900; // ₹99.00 — keep in sync with _kAmountPaise in payment_page.dart
+
+exports.createRazorpayOrder = onCall(
+  { secrets: [razorpayKeyId, razorpayKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const receipt = `rcpt_${request.auth.uid}_${Date.now()}`;
+    const auth = Buffer.from(
+      `${razorpayKeyId.value()}:${razorpayKeySecret.value()}`
+    ).toString("base64");
+
+    let res;
+    try {
+      res = await fetch("https://api.razorpay.com/v1/orders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${auth}`,
+        },
+        body: JSON.stringify({
+          amount: RAZORPAY_AMOUNT_PAISE,
+          currency: "INR",
+          receipt,
+          notes: { uid: request.auth.uid },
+        }),
+      });
+    } catch (err) {
+      console.error("Razorpay order request failed:", err.message);
+      throw new HttpsError("unavailable", "Could not reach payment gateway.");
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.error("Razorpay order creation failed:", res.status, errBody);
+      throw new HttpsError("internal", "Could not create order.");
+    }
+
+    const order = await res.json();
+    return {
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+    };
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════
+// 2b. Payment verification — called from PaymentPage after Razorpay's
 //    success callback. This is the ONLY place `hasPaid` should be set
 //    to true in production; the client-side write in payment_page.dart
 //    should eventually be removed once this is wired up and tested.

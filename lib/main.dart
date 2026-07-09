@@ -22,13 +22,27 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Only the bare minimum needed before the first frame can paint.
+  // IMPORTANT: never rethrow here. If Firebase.initializeApp() fails
+  // (bad google-services.json, no network on first launch, a stripped
+  // class from a misconfigured ProGuard rule, etc.) the old code used
+  // to rethrow, which crashes the whole app before runApp() is ever
+  // called — on a release build that shows up to the user as nothing
+  // but a black screen and no way to know why. Now we always get pixels
+  // on screen: either the real app, or a clear error screen with a
+  // retry button.
+  bool firebaseReady = true;
   try {
     if (Firebase.apps.isEmpty) {
       await Firebase.initializeApp();
     }
   } catch (e) {
-    debugPrint('[SwapNow] FATAL: Firebase.initializeApp() failed: $e');
-    rethrow;
+    debugPrint('[SwapNow] Firebase.initializeApp() failed: $e');
+    firebaseReady = false;
+  }
+
+  if (!firebaseReady) {
+    runApp(const _StartupErrorApp());
+    return;
   }
 
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
@@ -41,6 +55,61 @@ void main() async {
   _deferAppCheckInit();
   _deferMediaKitInit();
   _deferAdsInit();
+}
+
+/// Shown only if Firebase itself fails to initialize — a rare, genuinely
+/// unrecoverable-without-retry scenario (e.g. device has no network on
+/// first cold start and Firebase can't fetch remote config). Gives the
+/// user a way to retry instead of seeing a silent black screen.
+class _StartupErrorApp extends StatelessWidget {
+  const _StartupErrorApp();
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        backgroundColor: Colors.white,
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.wifi_off_rounded,
+                    size: 56, color: Color(0xFF5800B3)),
+                const SizedBox(height: 20),
+                const Text(
+                  "Couldn't start SwapNow",
+                  style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.black87),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  "Please check your internet connection and try again.",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF5800B3),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 32, vertical: 14),
+                  ),
+                  onPressed: () => main(),
+                  child: const Text('Try again'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 void _deferAppCheckInit() {

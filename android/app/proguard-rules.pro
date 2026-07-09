@@ -70,11 +70,6 @@
 -dontwarn com.google.android.gms.auth.api.phone.**
 
 # ============================================================
-# flutter_sound_record (auto-generated warning fix)
-# ============================================================
--dontwarn com.josephcrowell.flutter_sound_record.FlutterSoundRecordPlugin
-
-# ============================================================
 # Keep your own model classes (edit package name to match yours)
 # This prevents R8 from stripping your Firestore data model classes.
 # ============================================================

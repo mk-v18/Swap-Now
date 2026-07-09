@@ -233,8 +233,17 @@ class _PaymentPageState extends State<PaymentPage>
   }
 
   // ── Payment ────────────────────────────────────────────────────────────────
-
-  void _openCheckout() {
+  //
+  // ✅ FIX: Razorpay's `razorpay_signature` is only meaningful when checkout
+  // was opened against a real server-created Order (`order_id`). Previously
+  // this method opened checkout WITHOUT an order_id, so Razorpay could never
+  // return a signature that would match verifyPayment's
+  // HMAC(orderId + "|" + paymentId, secret) check — verification failed
+  // 100% of the time, even with correct test keys.
+  //
+  // Fix: call the new `createRazorpayOrder` Cloud Function first to get a
+  // real order_id from Razorpay's Orders API, then pass that into checkout.
+  Future<void> _openCheckout() async {
     if (_isProcessing) return; // guard against double-tap
 
     final user = FirebaseAuth.instance.currentUser;
@@ -243,15 +252,33 @@ class _PaymentPageState extends State<PaymentPage>
       return;
     }
 
-    final receipt =
-        'rcpt_${user.uid}_${DateTime.now().millisecondsSinceEpoch}';
+    _startProcessing();
+
+    String orderId;
+    try {
+      final callable =
+      FirebaseFunctions.instance.httpsCallable('createRazorpayOrder');
+      final result = await callable.call().timeout(const Duration(seconds: 15));
+      final data = result.data as Map;
+      orderId = data['orderId'] as String;
+    } on FirebaseFunctionsException catch (e) {
+      debugPrint('createRazorpayOrder rejected: ${e.code} ${e.message}');
+      _stopProcessing();
+      _showErrorSnack("Could not start payment. Please try again.");
+      return;
+    } catch (e) {
+      debugPrint('createRazorpayOrder call error: $e');
+      _stopProcessing();
+      _showErrorSnack("Network error. Please check your connection and retry.");
+      return;
+    }
 
     final options = {
       'key': _razorpayKey,
       'amount': _kAmountPaise,
+      'order_id': orderId, // ✅ required for a valid signature to be returned
       'name': 'swapnow',
       'description': 'Registration Fee — Lifetime Access',
-      'receipt': receipt,
       'prefill': {'contact': user.phoneNumber ?? ''},
       'external': {
         'wallets': ['paytm']
@@ -268,7 +295,8 @@ class _PaymentPageState extends State<PaymentPage>
 
     try {
       _razorpay.open(options);
-      _startProcessing();
+      // _isProcessing is already true from _startProcessing() above — the
+      // timeout timer set there still applies while the checkout sheet is open.
     } catch (e) {
       debugPrint('Razorpay open error: $e');
       _stopProcessing();
