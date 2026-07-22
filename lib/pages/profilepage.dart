@@ -34,6 +34,13 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _isSaving = false;
 
   List<String> _suggestions = [];
+  // FIX(gap): this page never captured coordinates at all — GPS detect
+  // only produced a display string, and the saved 'location' field was
+  // string-only, so re-editing a profile here could never restore a
+  // product/home page's ability to sort by distance from the user.
+  List<Map<String, double>?> _suggestionCoords = [];
+  double? _latitude;
+  double? _longitude;
   Timer? _debounce;
   bool _isFetchingSuggestions = false;
 
@@ -101,7 +108,7 @@ class _ProfilePageState extends State<ProfilePage> {
                     top: isFirst ? const Radius.circular(14) : Radius.zero,
                     bottom: isLast ? const Radius.circular(14) : Radius.zero,
                   ),
-                  onTap: () => _selectSuggestion(_suggestions[i]),
+                  onTap: () => _selectSuggestion(i),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 14, vertical: 12),
@@ -145,6 +152,9 @@ class _ProfilePageState extends State<ProfilePage> {
   // ─── Nominatim Autocomplete ───────────────────────────────────────────────────
 
   void _onLocationChanged(String value) {
+    // FIX(gap): manual edits invalidate previously captured coordinates.
+    _latitude = null;
+    _longitude = null;
     _debounce?.cancel();
     if (value.trim().length < 3) {
       setState(() => _suggestions = []);
@@ -171,25 +181,38 @@ class _ProfilePageState extends State<ProfilePage> {
         setState(() {
           _suggestions =
               data.map<String>((item) => item['display_name'] as String).toList();
+          // FIX(gap): capture each suggestion's coordinates.
+          _suggestionCoords = data.map<Map<String, double>?>((item) {
+            final lat = double.tryParse(item['lat']?.toString() ?? '');
+            final lon = double.tryParse(item['lon']?.toString() ?? '');
+            if (lat == null || lon == null) return null;
+            return {'lat': lat, 'lng': lon};
+          }).toList();
         });
         _showOverlay();
       } else {
-        setState(() => _suggestions = []);
+        setState(() { _suggestions = []; _suggestionCoords = []; });
         _removeOverlay();
       }
     } catch (_) {
-      setState(() => _suggestions = []);
+      setState(() { _suggestions = []; _suggestionCoords = []; });
       _removeOverlay();
     } finally {
       setState(() => _isFetchingSuggestions = false);
     }
   }
 
-  void _selectSuggestion(String suggestion) {
+  void _selectSuggestion(int index) {
+    if (index < 0 || index >= _suggestions.length) return;
+    final suggestion = _suggestions[index];
     final parts = suggestion.split(',').map((s) => s.trim()).toList();
+    final coords = index < _suggestionCoords.length ? _suggestionCoords[index] : null;
     _locationController.text = parts.take(3).join(', ');
+    // FIX(gap): persist the coordinates that came with this suggestion.
+    _latitude = coords?['lat'];
+    _longitude = coords?['lng'];
     _locationFocusNode.unfocus();
-    setState(() => _suggestions = []);
+    setState(() { _suggestions = []; _suggestionCoords = []; });
     _removeOverlay();
   }
 
@@ -222,6 +245,10 @@ class _ProfilePageState extends State<ProfilePage> {
           _locationController.text =
           "${place.locality}, ${place.administrativeArea}, ${place.country}";
           _suggestions = [];
+          _suggestionCoords = [];
+          // FIX(gap): keep the exact GPS coordinates.
+          _latitude = position.latitude;
+          _longitude = position.longitude;
         });
         _showSuccessSnack("Location updated successfully!");
       }
@@ -246,6 +273,12 @@ class _ProfilePageState extends State<ProfilePage> {
         _phoneController.text = data['phone'] ?? '';
         _emailController.text = data['email'] ?? '';
         _imageUrl = data['profileImage'];
+        // FIX(gap): preload existing coordinates so re-saving without
+        // touching the location field doesn't wipe them out below.
+        final savedLat = data['lat'];
+        final savedLng = data['lng'];
+        _latitude  = savedLat is num ? savedLat.toDouble() : null;
+        _longitude = savedLng is num ? savedLng.toDouble() : null;
       }
     } catch (_) {
       _showErrorSnack("Error loading profile");
@@ -278,6 +311,9 @@ class _ProfilePageState extends State<ProfilePage> {
         await FirebaseFirestore.instance.collection('users').doc(uid).update({
           'name': _nameController.text.trim(),
           'location': _locationController.text.trim(),
+          // FIX(gap): persist coordinates alongside the location string.
+          'lat': _latitude,
+          'lng': _longitude,
           'email': _emailController.text.trim(), // ✅ email now saved
           'profileImage': imageUrl,
         });
@@ -373,8 +409,8 @@ class _ProfilePageState extends State<ProfilePage> {
           child: Divider(height: 1, thickness: 1, color: Color(0xFFF0ECFF)),
         ),
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new_rounded,
-              color: Colors.black, size: 18),
+            icon: const Icon(Icons.arrow_back_ios_new_rounded,
+                color: Colors.black, size: 18),
             onPressed: () {
               Navigator.pop(context);
             }

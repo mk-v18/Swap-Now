@@ -18,6 +18,22 @@ class PersonalDetailsPage extends StatefulWidget {
   State<PersonalDetailsPage> createState() => _PersonalDetailsPageState();
 }
 
+// FIX(perf): Immutable snapshot of referral-check UI state, held in a single
+// ValueNotifier below instead of three separate setState()-driven bools.
+// Keeping them together means one notification instead of three, and lets
+// the suffix-icon + helper-text widgets rebuild independently of the rest
+// of the page.
+class _ReferralStatus {
+  final bool isChecking;
+  final bool checked;
+  final bool isValid;
+  const _ReferralStatus({
+    this.isChecking = false,
+    this.checked = false,
+    this.isValid = false,
+  });
+}
+
 class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
   // ── Controllers & Focus ────────────────────────────────────────────────────
   final TextEditingController _nameController     = TextEditingController();
@@ -30,18 +46,31 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
   OverlayEntry?   _overlayEntry;
 
   // ── State ──────────────────────────────────────────────────────────────────
-  File? _imageFile;
-  bool  _isLoading           = false;
-  bool  _isDetectingLocation = false;
+  // FIX(perf): The flags below used to be plain bools flipped via setState(),
+  // which reran this whole page's build() — including all the MediaQuery
+  // layout math and every text field — just to toggle one small spinner or
+  // icon. They're now ValueNotifiers consumed by narrowly-scoped
+  // ValueListenableBuilders, so only the relevant leaf widget rebuilds.
+  final ValueNotifier<File?> _imageFileNotifier = ValueNotifier<File?>(null);
+  final ValueNotifier<bool> _isLoadingNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> _isFetchingSuggestionsNotifier =
+  ValueNotifier<bool>(false);
+  final ValueNotifier<bool> _isDetectingLocationNotifier =
+  ValueNotifier<bool>(false);
+  final ValueNotifier<_ReferralStatus> _referralStatusNotifier =
+  ValueNotifier<_ReferralStatus>(const _ReferralStatus());
 
-  List<String> _suggestions           = [];
+  // These feed the overlay only (rebuilt imperatively via _showOverlay()),
+  // not this State's build() — so they stay as plain fields with no
+  // notifier/setState wrapper at all.
+  List<String> _suggestions = [];
+  List<Map<String, double>?> _suggestionCoords = [];
+
+  double? _latitude;
+  double? _longitude;
   Timer?       _debounce;
-  Timer?       _referralDebounce;           // FIX: separate debounce for referral
-  bool         _isFetchingSuggestions = false;
+  Timer?       _referralDebounce;
 
-  bool    _isCheckingCode  = false;
-  bool    _isValidReferral = false;
-  bool    _referralChecked = false;
   String? _referralDocId;
 
   // ── Constants ──────────────────────────────────────────────────────────────
@@ -92,6 +121,11 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
     _emailController.dispose();
     _locationController.dispose();
     _referralController.dispose();
+    _imageFileNotifier.dispose();
+    _isLoadingNotifier.dispose();
+    _isFetchingSuggestionsNotifier.dispose();
+    _isDetectingLocationNotifier.dispose();
+    _referralStatusNotifier.dispose();
     super.dispose();
   }
 
@@ -142,7 +176,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
                       top:    isFirst ? const Radius.circular(12) : Radius.zero,
                       bottom: isLast  ? const Radius.circular(12) : Radius.zero,
                     ),
-                    onTap: () => _selectSuggestion(_suggestions[i]),
+                    onTap: () => _selectSuggestion(i),
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 14, vertical: 11),
@@ -176,9 +210,12 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
 
   // ── Location autocomplete ──────────────────────────────────────────────────
   void _onLocationChanged(String value) {
+    // FIX(gap): manual edits invalidate any previously captured coordinates.
+    _latitude = null;
+    _longitude = null;
     _debounce?.cancel();
     if (value.trim().length < 3) {
-      setState(() => _suggestions = []);
+      _suggestions = [];
       _removeOverlay();
       return;
     }
@@ -189,7 +226,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
 
   Future<void> _fetchSuggestions(String input) async {
     if (!mounted) return;
-    setState(() => _isFetchingSuggestions = true);
+    _isFetchingSuggestionsNotifier.value = true;
     try {
       final url = Uri.parse(
         'https://nominatim.openstreetmap.org/search'
@@ -202,33 +239,49 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
       if (!mounted) return;
       if (response.statusCode == 200) {
         final List<dynamic> data = json.decode(response.body) as List<dynamic>;
-        setState(() {
-          _suggestions = data
-              .map<String>((item) => item['display_name'] as String)
-              .toList();
-        });
+        _suggestions = data
+            .map<String>((item) => item['display_name'] as String)
+            .toList();
+        // FIX(gap): capture each suggestion's coordinates from Nominatim
+        // so a tap can populate _latitude/_longitude, not just the text.
+        _suggestionCoords = data.map<Map<String, double>?>((item) {
+          final lat = double.tryParse(item['lat']?.toString() ?? '');
+          final lon = double.tryParse(item['lon']?.toString() ?? '');
+          if (lat == null || lon == null) return null;
+          return {'lat': lat, 'lng': lon};
+        }).toList();
         _showOverlay();
       } else {
-        setState(() => _suggestions = []);
+        _suggestions = [];
+        _suggestionCoords = [];
         _removeOverlay();
       }
     } on TimeoutException {
-      if (mounted) setState(() => _suggestions = []);
+      _suggestions = [];
+      _suggestionCoords = [];
       _removeOverlay();
     } catch (_) {
-      if (mounted) setState(() => _suggestions = []);
+      _suggestions = [];
+      _suggestionCoords = [];
       _removeOverlay();
     } finally {
-      if (mounted) setState(() => _isFetchingSuggestions = false);
+      if (mounted) _isFetchingSuggestionsNotifier.value = false;
     }
   }
 
-  void _selectSuggestion(String suggestion) {
+  void _selectSuggestion(int index) {
+    if (index < 0 || index >= _suggestions.length) return;
+    final suggestion = _suggestions[index];
     final parts   = suggestion.split(',').map((s) => s.trim()).toList();
     final trimmed = parts.take(3).join(', ');
+    final coords = index < _suggestionCoords.length ? _suggestionCoords[index] : null;
     _locationController.text = trimmed;
+    // FIX(gap): persist the coordinates that came with this suggestion.
+    _latitude = coords?['lat'];
+    _longitude = coords?['lng'];
     _locationFocusNode.unfocus();
-    setState(() => _suggestions = []);
+    _suggestions = [];
+    _suggestionCoords = [];
     _removeOverlay();
   }
 
@@ -253,7 +306,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
     }
 
     if (!mounted) return;
-    setState(() => _isDetectingLocation = true);
+    _isDetectingLocationNotifier.value = true;
     _removeOverlay();
 
     try {
@@ -269,11 +322,13 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
       if (!mounted) return;
       if (placemarks.isNotEmpty) {
         final p = placemarks.first;
-        setState(() {
-          _locationController.text =
-          '${p.locality}, ${p.administrativeArea}, ${p.country}';
-          _suggestions = [];
-        });
+        _locationController.text =
+        '${p.locality}, ${p.administrativeArea}, ${p.country}';
+        _suggestions = [];
+        _suggestionCoords = [];
+        // FIX(gap): keep the exact GPS coordinates, not just the text.
+        _latitude = position.latitude;
+        _longitude = position.longitude;
       }
     } on TimeoutException {
       if (mounted) {
@@ -282,7 +337,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
     } catch (_) {
       if (mounted) _showErrorSnack('Failed to get location. Please try again.');
     } finally {
-      if (mounted) setState(() => _isDetectingLocation = false);
+      if (mounted) _isDetectingLocationNotifier.value = false;
     }
   }
 
@@ -293,11 +348,8 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
   void _onReferralChanged(String val) {
     _referralDebounce?.cancel();
     if (val.isEmpty) {
-      setState(() {
-        _referralChecked = false;
-        _isValidReferral = false;
-        _referralDocId   = null;
-      });
+      _referralDocId = null;
+      _referralStatusNotifier.value = const _ReferralStatus();
       return;
     }
     _referralDebounce = Timer(
@@ -308,15 +360,13 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
 
   Future<void> _validateReferral(String code) async {
     if (code.isEmpty) {
-      setState(() {
-        _referralChecked = false;
-        _isValidReferral = false;
-        _referralDocId   = null;
-      });
+      _referralDocId = null;
+      _referralStatusNotifier.value = const _ReferralStatus();
       return;
     }
     if (!mounted) return;
-    setState(() => _isCheckingCode = true);
+    _referralStatusNotifier.value =
+        _ReferralStatus(isChecking: true, checked: false, isValid: false);
     try {
       final query = await FirebaseFirestore.instance
           .collection('referrals')
@@ -332,29 +382,34 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
         final isActive = expiry == null || DateTime.now().isBefore(expiry);
 
         if (isActive && data['active'] == true) {
-          setState(() {
-            _isValidReferral = true;
-            _referralChecked = true;
-            _referralDocId   = query.docs.first.id;
-          });
+          _referralDocId = query.docs.first.id;
+          _referralStatusNotifier.value =
+          const _ReferralStatus(isChecking: false, checked: true, isValid: true);
         } else {
-          setState(() {
-            _isValidReferral = false;
-            _referralChecked = true;
-            _referralDocId   = null;
-          });
+          _referralDocId = null;
+          _referralStatusNotifier.value = const _ReferralStatus(
+              isChecking: false, checked: true, isValid: false);
         }
       } else {
-        setState(() {
-          _isValidReferral = false;
-          _referralChecked = true;
-          _referralDocId   = null;
-        });
+        _referralDocId = null;
+        _referralStatusNotifier.value = const _ReferralStatus(
+            isChecking: false, checked: true, isValid: false);
       }
     } catch (_) {
       if (mounted) _showErrorSnack('Error checking referral code. Try again.');
+      _referralStatusNotifier.value = _ReferralStatus(
+        isChecking: false,
+        checked: _referralStatusNotifier.value.checked,
+        isValid: _referralStatusNotifier.value.isValid,
+      );
     } finally {
-      if (mounted) setState(() => _isCheckingCode = false);
+      if (mounted && _referralStatusNotifier.value.isChecking) {
+        _referralStatusNotifier.value = _ReferralStatus(
+          isChecking: false,
+          checked: _referralStatusNotifier.value.checked,
+          isValid: _referralStatusNotifier.value.isValid,
+        );
+      }
     }
   }
 
@@ -381,20 +436,21 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
       return;
     }
 
-    if (mounted) setState(() => _imageFile = file);
+    if (mounted) _imageFileNotifier.value = file;
   }
 
   // ── Submit ─────────────────────────────────────────────────────────────────
   Future<void> _submitDetails() async {
     // FIX: Guard re-entry at the top synchronously — prevents double-tap
     // submitting while the first async call is in-flight.
-    if (_isLoading) return;
+    if (_isLoadingNotifier.value) return;
 
     final name     = _nameController.text.trim();
     final email    = _emailController.text.trim();
     final location = _locationController.text.trim();
+    final imageFile = _imageFileNotifier.value;
 
-    if (name.isEmpty || email.isEmpty || location.isEmpty || _imageFile == null) {
+    if (name.isEmpty || email.isEmpty || location.isEmpty || imageFile == null) {
       _showErrorSnack('Please fill in all fields and add a profile photo.');
       return;
     }
@@ -414,12 +470,12 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
     }
     final uid = user.uid;
 
-    setState(() => _isLoading = true);
+    _isLoadingNotifier.value = true;
 
     try {
       // FIX(security): Verify file still exists and is within size limits
       // before attempting upload — file could be deleted between pick and submit.
-      final fileLength = await _imageFile!.length();
+      final fileLength = await imageFile.length();
       if (fileLength > _maxImageBytes) {
         _showErrorSnack('Image is too large. Please choose one under 5 MB.');
         return;
@@ -429,12 +485,14 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
           .ref()
           .child('profile_images/$uid.jpg');
       await ref.putFile(
-        _imageFile!,
+        imageFile,
         // FIX(security): Set explicit content type — prevents Storage from
         // serving an arbitrary MIME type supplied by the client device.
         SettableMetadata(contentType: 'image/jpeg'),
       );
       final imageUrl = await ref.getDownloadURL();
+
+      final referralStatus = _referralStatusNotifier.value;
 
       // FIX: Batch user doc write and referral update — reduces round-trips.
       // User doc uses set+merge so it is idempotent on retry.
@@ -444,8 +502,12 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
         'name':             name,
         'email':            email,
         'location':         location,
+        // FIX(gap): persist coordinates alongside the location string so
+        // home_page.dart can sort nearby products without a live geocode.
+        'lat':              _latitude,
+        'lng':              _longitude,
         'profileImage':     imageUrl,
-        'referralCodeUsed': _isValidReferral
+        'referralCodeUsed': referralStatus.isValid
             ? _referralController.text.trim()
             : null,
         'role':             'user',
@@ -453,7 +515,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
         'createdAt':        FieldValue.serverTimestamp(),
       }, SetOptions(merge: true)); // FIX: merge:true → idempotent on retry
 
-      if (_isValidReferral && _referralDocId != null) {
+      if (referralStatus.isValid && _referralDocId != null) {
         final refDoc = FirebaseFirestore.instance
             .collection('referrals')
             .doc(_referralDocId!);
@@ -482,7 +544,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
     } catch (_) {
       if (mounted) _showErrorSnack('Something went wrong. Please try again.');
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) _isLoadingNotifier.value = false;
     }
   }
 
@@ -566,26 +628,32 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
               SizedBox(height: gapTop),
 
               // ── Avatar ───────────────────────────────────────────────────
-              GestureDetector(
-                onTap: _pickImage,
-                child: CircleAvatar(
-                  radius:          avatarOuter,
-                  backgroundColor: _purple,
+              // FIX(perf): Only this avatar subtree rebuilds when a photo is
+              // picked, via ValueListenableBuilder on _imageFileNotifier —
+              // not the whole page.
+              ValueListenableBuilder<File?>(
+                valueListenable: _imageFileNotifier,
+                builder: (context, imageFile, _) => GestureDetector(
+                  onTap: _pickImage,
                   child: CircleAvatar(
-                    radius:          avatarGap,
-                    backgroundColor: Colors.white,
+                    radius:          avatarOuter,
+                    backgroundColor: _purple,
                     child: CircleAvatar(
-                      radius:          avatarInner,
-                      backgroundColor: _lightPurple,
-                      backgroundImage:
-                      _imageFile != null ? FileImage(_imageFile!) : null,
-                      child: _imageFile == null
-                          ? Icon(
-                        Icons.camera_alt_outlined,
-                        size:  (screenW * 0.07).clamp(24.0, 32.0),
-                        color: _purple,
-                      )
-                          : null,
+                      radius:          avatarGap,
+                      backgroundColor: Colors.white,
+                      child: CircleAvatar(
+                        radius:          avatarInner,
+                        backgroundColor: _lightPurple,
+                        backgroundImage:
+                        imageFile != null ? FileImage(imageFile) : null,
+                        child: imageFile == null
+                            ? Icon(
+                          Icons.camera_alt_outlined,
+                          size:  (screenW * 0.07).clamp(24.0, 32.0),
+                          color: _purple,
+                        )
+                            : null,
+                      ),
                     ),
                   ),
                 ),
@@ -645,33 +713,42 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
                       hintStyle:      TextStyle(fontSize: hintFontSz),
                       contentPadding: const EdgeInsets.symmetric(
                           horizontal: 14, vertical: 0),
-                      prefixIcon: _isFetchingSuggestions
-                          ? const Padding(
-                        padding: EdgeInsets.all(14),
-                        child: SizedBox(
-                          width:  16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: _purple),
-                        ),
-                      )
-                          : const Icon(Icons.location_on_outlined,
-                          color: _purple, size: 20),
-                      suffixIcon: _isDetectingLocation
-                          ? const Padding(
-                        padding: EdgeInsets.all(14),
-                        child: SizedBox(
-                          width:  16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: _purple),
-                        ),
-                      )
-                          : IconButton(
-                        tooltip:  'Use current location',
-                        icon:     const Icon(Icons.my_location,
+                      // FIX(perf): isolated to _isFetchingSuggestionsNotifier
+                      // so typing doesn't rebuild the rest of the form.
+                      prefixIcon: ValueListenableBuilder<bool>(
+                        valueListenable: _isFetchingSuggestionsNotifier,
+                        builder: (context, isFetching, _) => isFetching
+                            ? const Padding(
+                          padding: EdgeInsets.all(14),
+                          child: SizedBox(
+                            width:  16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2, color: _purple),
+                          ),
+                        )
+                            : const Icon(Icons.location_on_outlined,
                             color: _purple, size: 20),
-                        onPressed: _detectLocation,
+                      ),
+                      // FIX(perf): isolated to _isDetectingLocationNotifier.
+                      suffixIcon: ValueListenableBuilder<bool>(
+                        valueListenable: _isDetectingLocationNotifier,
+                        builder: (context, isDetecting, _) => isDetecting
+                            ? const Padding(
+                          padding: EdgeInsets.all(14),
+                          child: SizedBox(
+                            width:  16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2, color: _purple),
+                          ),
+                        )
+                            : IconButton(
+                          tooltip:  'Use current location',
+                          icon:     const Icon(Icons.my_location,
+                              color: _purple, size: 20),
+                          onPressed: _detectLocation,
+                        ),
                       ),
                       // FIX(perf): Use pre-computed static border objects.
                       border:        _borderNormal,
@@ -687,69 +764,83 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
               // ── Referral ──────────────────────────────────────────────────
               _buildLabel('Referral Code  (Optional)', labelFontSz),
               SizedBox(height: gapSm * 0.5),
-              SizedBox(
-                height: fieldH,
-                child: TextField(
-                  controller:  _referralController,
-                  style:       TextStyle(fontSize: hintFontSz),
-                  // FIX: Route through debounced handler — was firing a
-                  // Firestore query on every single keystroke.
-                  onChanged:   _onReferralChanged,
-                  decoration:  InputDecoration(
-                    hintText:       'Enter referral code',
-                    hintStyle:      TextStyle(fontSize: hintFontSz),
-                    contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 0),
-                    suffixIcon: _isCheckingCode
-                        ? const Padding(
-                      padding: EdgeInsets.all(12),
-                      child: SizedBox(
-                        width:  18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: _purple),
-                      ),
-                    )
-                        : _referralChecked
-                        ? Icon(
-                      _isValidReferral
-                          ? Icons.check_circle_rounded
-                          : Icons.cancel_rounded,
-                      color: _isValidReferral
-                          ? Colors.green
-                          : Colors.red,
-                      size: 22,
-                    )
-                        : null,
-                    border:        _borderNormal,
-                    enabledBorder: _borderNormal,
-                    focusedBorder: _borderFocused,
+              // FIX(perf): isolated to _referralStatusNotifier so typing in
+              // the referral field never touches the rest of the form.
+              ValueListenableBuilder<_ReferralStatus>(
+                valueListenable: _referralStatusNotifier,
+                builder: (context, status, _) => SizedBox(
+                  height: fieldH,
+                  child: TextField(
+                    controller:  _referralController,
+                    style:       TextStyle(fontSize: hintFontSz),
+                    // FIX: Route through debounced handler — was firing a
+                    // Firestore query on every single keystroke.
+                    onChanged:   _onReferralChanged,
+                    decoration:  InputDecoration(
+                      hintText:       'Enter referral code',
+                      hintStyle:      TextStyle(fontSize: hintFontSz),
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 0),
+                      suffixIcon: status.isChecking
+                          ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(
+                          width:  18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: _purple),
+                        ),
+                      )
+                          : status.checked
+                          ? Icon(
+                        status.isValid
+                            ? Icons.check_circle_rounded
+                            : Icons.cancel_rounded,
+                        color: status.isValid
+                            ? Colors.green
+                            : Colors.red,
+                        size: 22,
+                      )
+                          : null,
+                      border:        _borderNormal,
+                      enabledBorder: _borderNormal,
+                      focusedBorder: _borderFocused,
+                    ),
                   ),
                 ),
               ),
 
-              if (_referralChecked)
-                Padding(
+              ValueListenableBuilder<_ReferralStatus>(
+                valueListenable: _referralStatusNotifier,
+                builder: (context, status, _) => status.checked
+                    ? Padding(
                   padding: EdgeInsets.only(top: gapSm * 0.5),
                   child: Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
-                      _isValidReferral
+                      status.isValid
                           ? '✓ Referral code applied!'
                           : '✗ Invalid or expired referral code.',
                       style: TextStyle(
                         fontSize:   (screenW * 0.03).clamp(11.0, 13.0),
-                        color:      _isValidReferral ? Colors.green : Colors.red,
+                        color:      status.isValid ? Colors.green : Colors.red,
                         fontWeight: FontWeight.w500,
                       ),
                     ),
                   ),
-                ),
+                )
+                    : const SizedBox.shrink(),
+              ),
 
               SizedBox(height: gapMd * 1.4),
 
               // ── Save button ───────────────────────────────────────────────
-              _buildSaveButton(btnFontSz: btnFontSz),
+              // FIX(perf): isolated to _isLoadingNotifier.
+              ValueListenableBuilder<bool>(
+                valueListenable: _isLoadingNotifier,
+                builder: (context, isLoading, _) =>
+                    _buildSaveButton(btnFontSz: btnFontSz, isLoading: isLoading),
+              ),
 
               SizedBox(height: gapMd),
             ],
@@ -802,15 +893,15 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
     );
   }
 
-  Widget _buildSaveButton({required double btnFontSz}) {
+  Widget _buildSaveButton({required double btnFontSz, required bool isLoading}) {
     return GestureDetector(
-      onTap: _isLoading ? null : _submitDetails,
+      onTap: isLoading ? null : _submitDetails,
       child: AnimatedContainer(
         duration:  const Duration(milliseconds: 150),
         width:     double.infinity,
         padding:   const EdgeInsets.symmetric(vertical: 16),
         decoration: BoxDecoration(
-          gradient: _isLoading
+          gradient: isLoading
               ? const LinearGradient(
               colors: [Color(0xFF8A4FD6), Color(0xFF5800B3)])
               : const LinearGradient(colors: [_purple, _deepPurple]),
@@ -826,7 +917,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
           ],
         ),
         alignment: Alignment.center,
-        child: _isLoading
+        child: isLoading
             ? const SizedBox(
           width:  22,
           height: 22,

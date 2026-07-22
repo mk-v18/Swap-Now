@@ -2,8 +2,8 @@ import 'package:credbro/Advertisement/location_ad.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:credbro/chats/chatservice.dart';
-import 'package:credbro/chats/chatscreen.dart';
+
+import '../chats/swap_request_service.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DESIGN TOKENS  (copied from UserProductDetailsPage)
@@ -63,7 +63,13 @@ class ProductDetailPage extends StatefulWidget {
 class _ProductDetailPageState extends State<ProductDetailPage> {
   int _currentImageIndex = 0;
   final PageController _pageController = PageController();
-  bool _isLoading = false;
+  final SwapRequestService _swapRequestService = SwapRequestService();
+
+  // NEW: once the Cloud Function marks this listing 'exchanged', showing
+  // the "mark exchange successful" flow again doesn't make sense — there's
+  // nothing left to resolve. Used to hide the appbar action and to show
+  // the success banner at the bottom instead.
+  bool get _isExchanged => (widget.data['status'] ?? '') == 'exchanged';
 
   @override
   void dispose() {
@@ -71,110 +77,133 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
     super.dispose();
   }
 
-  // ── SELL TO COMPANY ───────────────────────────────────────────────────────
-  Future<void> _sellToCompany() async {
-    final currentUser = FirebaseAuth.instance.currentUser;
-    if (currentUser == null) {
-      _showErrorSnack("Please login to continue");
-      return;
-    }
+  Future<void> _showMarkExchangeSheet() async {
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+    if (myUid == null) return;
 
-    setState(() => _isLoading = true);
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.55,
+        minChildSize: 0.35,
+        maxChildSize: 0.85,
+        expand: false,
+        builder: (ctx, scrollCtrl) => Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: StreamBuilder<QuerySnapshot>(
+            stream: _swapRequestService.acceptedRequestsForProduct(widget.productId),
+            builder: (context, snap) {
+              if (!snap.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              // Only requests where I'm a participant and not already completed.
+              final docs = snap.data!.docs.where((d) {
+                final data = d.data() as Map<String, dynamic>;
+                return data['fromUserId'] == myUid || data['toUserId'] == myUid;
+              }).toList();
 
-    try {
-      final adminUid = await ChatService.getAdminUid();
-      if (adminUid == null) {
-        _showErrorSnack("Support unavailable. Please try again later.");
-        return;
-      }
+              if (docs.isEmpty) {
+                return const Center(
+                  child: Text('No accepted swap to mark as complete yet.'),
+                );
+              }
 
-      final adminDoc = await FirebaseFirestore.instance
-          .collection('users')
-          .doc(adminUid)
-          .get();
+              return ListView.builder(
+                controller: scrollCtrl,
+                padding: const EdgeInsets.all(16),
+                itemCount: docs.length,
+                itemBuilder: (_, i) {
+                  final doc = docs[i];
+                  final data = doc.data() as Map<String, dynamic>;
+                  final isFrom = data['fromUserId'] == myUid;
+                  final otherId = isFrom ? data['toUserId'] : data['fromUserId'];
+                  final otherName = isFrom ? data['toUserName'] : data['fromUserName'];
 
-      String adminName  = 'SwapNow Support';
-      String adminImage = '';
-      if (adminDoc.exists) {
-        final d = adminDoc.data()!;
-        adminName  = d['name']         ?? 'SwapNow Support';
-        adminImage = d['profileImage'] ?? '';
-      }
-
-      final chatService = ChatService();
-      final chatId =
-      await chatService.getOrCreateChat(currentUser.uid, adminUid);
-
-      final productForDb = {
-        'id':          widget.productId,
-        'title':       widget.data['title']       ?? '',
-        'price':       widget.data['price']       ?? '',
-        'images':      (widget.data['images'] as List?)?.take(3).toList() ?? [],
-        'condition':   widget.data['condition']   ?? '',
-        'category':    widget.data['category']    ?? '',
-        'location':    widget.data['location']    ?? '',
-        'description': widget.data['description'] ?? '',
-      };
-
-      await FirebaseFirestore.instance
-          .collection('chats')
-          .doc(chatId)
-          .set(
-        {
-          'intent': {
-            'type':          'sell',
-            'listedProduct': productForDb,
-            'swapProducts':  [],
-            'updatedAt':     FieldValue.serverTimestamp(),
-          }
-        },
-        SetOptions(merge: true),
-      );
-
-      if (!mounted) return;
-
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => ChatScreen(
-            chatId:        chatId,
-            receiverId:    adminUid,
-            receiverName:  adminName,
-            receiverImage: adminImage,
+                  return ListTile(
+                    leading: const Icon(Icons.swap_horiz_rounded, color: _T.purple),
+                    title: Text('Exchange with $otherName'),
+                    subtitle: Text(data['listedProduct']?['title'] ?? ''),
+                    trailing: ElevatedButton(
+                      style: ElevatedButton.styleFrom(backgroundColor: _T.teal),
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        await _confirmMarkExchange(
+                          requestId: doc.id,
+                          otherUserId: otherId,
+                          otherUserName: otherName ?? 'User',
+                          listedProduct: Map<String, dynamic>.from(data['listedProduct'] ?? {}),
+                          offeredProducts: ((data['offeredProducts'] as List?) ?? [])
+                              .map((e) => Map<String, dynamic>.from(e as Map))
+                              .toList(),
+                          chatId: data['chatId'],
+                        );
+                      },
+                      child: const Text('Mark done'),
+                    ),
+                  );
+                },
+              );
+            },
           ),
         ),
+      ),
+    );
+  }
+
+  Future<void> _confirmMarkExchange({
+    required String requestId,
+    required String otherUserId,
+    required String otherUserName,
+    required Map<String, dynamic> listedProduct,
+    required List<Map<String, dynamic>> offeredProducts,
+    String? chatId,
+  }) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Confirm exchange'),
+        content: Text('Mark your exchange with $otherUserName as successfully completed?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Confirm')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      await _swapRequestService.markExchangeSuccessful(
+        requestId: requestId,
+        otherUserId: otherUserId,
+        otherUserName: otherUserName,
+        listedProduct: listedProduct,
+        offeredProducts: offeredProducts,
+        chatId: chatId,
       );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Row(children: const [
+          Icon(Icons.celebration_rounded, color: Colors.white, size: 18),
+          SizedBox(width: 10),
+          Text('Exchange marked as successful! 🎉',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+        ]),
+        backgroundColor: const Color(0xFF1B8A4C),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ));
     } catch (e) {
-      if (mounted) _showErrorSnack("Something went wrong. Try again.");
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) _showErrorSnack('Could not mark exchange: $e');
     }
   }
 
   // ── SNACKBARS ─────────────────────────────────────────────────────────────
-  void _showSuccessSnack(String message) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Row(children: [
-          const Icon(Icons.check_circle_outline, color: Colors.white, size: 18),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(message,
-                style: const TextStyle(
-                    fontSize: 13,
-                    color: Colors.white,
-                    fontWeight: FontWeight.w500)),
-          ),
-        ]),
-        backgroundColor: const Color(0xFF1B8A4C),
-        behavior:        SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        margin:   const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        duration: const Duration(seconds: 2),
-      ));
-  }
-
   void _showErrorSnack(String message) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
@@ -218,7 +247,7 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
             if (images.length > 1) _buildDots(images.length),
             const SizedBox(height: 16),
 
-            // ── Info Card (title + price + badges) ────────────────────────
+            // ── Info Card (title + badges) ──────────────────────────────
             _buildInfoCard(rl),
 
             const SizedBox(height: 12),
@@ -240,13 +269,17 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                   targetAdSize: 'Large Banner (320×100)'),
             ),
 
-            const SizedBox(height: 100), // room above FAB
+            const SizedBox(height: 20),
+
+            // NEW: "Swap Successful" banner at the very bottom of the
+            // page, shown only once this listing's status is 'exchanged'
+            // (set by the onSwapCompleted Cloud Function).
+            if (_isExchanged) _buildSwapSuccessBanner(rl),
+
+            const SizedBox(height: 24),
           ],
         ),
       ),
-
-      // ── Bottom Button ─────────────────────────────────────────────────
-      bottomNavigationBar: _buildBottomBar(rl),
     );
   }
 
@@ -276,6 +309,18 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
         ),
       ),
     ),
+    actions: [
+      // NEW: hidden once the listing is already exchanged — re-opening
+      // the mark-exchange sheet on a completed swap has nothing left to
+      // resolve, and would surface a confusing "no accepted swap" empty
+      // state instead.
+      if (!_isExchanged)
+        IconButton(
+          icon: const Icon(Icons.verified_rounded, color: _T.teal),
+          tooltip: 'Mark exchange successful',
+          onPressed: _showMarkExchangeSheet,
+        ),
+    ],
     bottom: PreferredSize(
       preferredSize: const Size.fromHeight(1),
       child: Divider(height: 1, color: Colors.grey.shade200),
@@ -355,7 +400,6 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
   // ─── INFO CARD ────────────────────────────────────────────────────────────
   Widget _buildInfoCard(_RL rl) {
     final title     = widget.data['title']     ?? 'No title';
-    final price     = widget.data['price'];
     final condition = widget.data['condition'] ?? '';
 
     return Padding(
@@ -364,63 +408,23 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
         width: double.infinity,
         padding: const EdgeInsets.all(18),
         decoration: _cardDecor(),
-        child: Column(
+        child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Title + condition badge on same row
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  child: Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize:   20,
-                      fontWeight: FontWeight.w600,
-                      color:      _T.textDark,
-                      height:     1.25,
-                      letterSpacing: -0.4,
-                    ),
-                  ),
+            Expanded(
+              child: Text(
+                title,
+                style: const TextStyle(
+                  fontSize:   20,
+                  fontWeight: FontWeight.w600,
+                  color:      _T.textDark,
+                  height:     1.25,
+                  letterSpacing: -0.4,
                 ),
-                const SizedBox(width: 10),
-                if (condition.isNotEmpty) _conditionBadge(condition),
-              ],
+              ),
             ),
-            const SizedBox(height: 14),
-
-            // Price row
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 14, vertical: 8),
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [_T.purple, _T.deepPurple],
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                    boxShadow: [
-                      BoxShadow(
-                        color:      _T.purple.withOpacity(0.3),
-                        blurRadius: 10,
-                        offset:     const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: Text(
-                    '₹ ${_formatPrice(price)}',
-                    style: const TextStyle(
-                      fontSize:   16,
-                      fontWeight: FontWeight.w600,
-                      color:      Colors.white,
-                      letterSpacing: -0.3,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            const SizedBox(width: 10),
+            if (condition.isNotEmpty) _conditionBadge(condition),
           ],
         ),
       ),
@@ -599,6 +603,52 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
     );
   }
 
+  // ─── SWAP SUCCESS BANNER ───────────────────────────────────────────────────
+  // NEW: shown at the bottom of the page once this listing's status is
+  // 'exchanged'. Purely informational — there's no action to take here,
+  // the swap that led to this is already resolved and logged in
+  // ExchangeHistoryPage.
+  Widget _buildSwapSuccessBanner(_RL rl) {
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: rl.hPad),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 18),
+        decoration: BoxDecoration(
+          color: _T.tealLight,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: _T.teal.withOpacity(0.25)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: _T.teal.withOpacity(0.15),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.check_circle_rounded,
+                  color: _T.teal, size: 22),
+            ),
+            const SizedBox(width: 14),
+            const Expanded(
+              child: Text(
+                'Swap Successful',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: _T.teal,
+                  letterSpacing: -0.2,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // ─── CARD DECORATION ─────────────────────────────────────────────────────
   BoxDecoration _cardDecor() => BoxDecoration(
     color:        _T.cardBg,
@@ -611,90 +661,4 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
       ),
     ],
   );
-
-  // ─── BOTTOM BAR ───────────────────────────────────────────────────────────
-  Widget _buildBottomBar(_RL rl) => SafeArea(
-    child: Container(
-      padding: EdgeInsets.symmetric(
-          horizontal: rl.hPad, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        boxShadow: [
-          BoxShadow(
-            color:      Colors.black.withOpacity(0.06),
-            blurRadius: 16,
-            offset:     const Offset(0, -4),
-          ),
-        ],
-      ),
-      child: SizedBox(
-        width:  double.infinity,
-        height: 54,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            gradient: _isLoading
-                ? LinearGradient(colors: [
-              Colors.grey.shade400,
-              Colors.grey.shade500,
-            ])
-                : const LinearGradient(
-              colors: [Color(0xFFD84315), Color(0xFFBF360C)],
-              begin:  Alignment.centerLeft,
-              end:    Alignment.centerRight,
-            ),
-            borderRadius: BorderRadius.circular(16),
-            boxShadow: _isLoading
-                ? []
-                : [
-              BoxShadow(
-                color:      const Color(0xFFD84315).withOpacity(0.35),
-                blurRadius: 14,
-                offset:     const Offset(0, 6),
-              ),
-            ],
-          ),
-          child: ElevatedButton.icon(
-            onPressed: _isLoading ? null : _sellToCompany,
-            icon: _isLoading
-                ? const SizedBox(
-              width: 18, height: 18,
-              child: CircularProgressIndicator(
-                  strokeWidth: 2, color: Colors.white),
-            )
-                : const Icon(Icons.storefront_outlined,
-                color: Colors.white, size: 22),
-            label: Text(
-              _isLoading ? 'Opening chat...' : 'Swap to Sell Company',
-              style: const TextStyle(
-                fontWeight:    FontWeight.w600,
-                fontSize:      16,
-                color:         Colors.white,
-                letterSpacing: 0.3,
-              ),
-            ),
-            style: ElevatedButton.styleFrom(
-              backgroundColor:         Colors.transparent,
-              shadowColor:             Colors.transparent,
-              disabledBackgroundColor: Colors.transparent,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16)),
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
-  String _formatPrice(dynamic price) {
-    if (price == null) return '0';
-    final num p     = price is num ? price : num.tryParse(price.toString()) ?? 0;
-    final String s  = p.toStringAsFixed(0);
-    if (s.length <= 3) return s;
-    final String lastThree  = s.substring(s.length - 3);
-    final String rest       = s.substring(0, s.length - 3);
-    final String withCommas =
-    rest.replaceAllMapped(RegExp(r'\B(?=(\d{2})+(?!\d))'), (m) => ',');
-    return '$withCommas,$lastThree';
-  }
 }

@@ -7,6 +7,8 @@ import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:media_kit/media_kit.dart';
 import 'chats/chatscreen.dart';
+import 'chats/swap_requests_page.dart'; // NEW — adjust path if this file lives elsewhere
+import 'chats/exchange_history_page.dart'; // NEW — adjust path if this file lives elsewhere
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -154,7 +156,7 @@ class SwapNowApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SwapNow',
+      title: 'Amoeba',
       debugShowCheckedModeBanner: false,
       navigatorKey: navigatorKey,
       theme: ThemeData(
@@ -176,6 +178,24 @@ class SwapNowApp extends StatelessWidget {
             ),
           );
         }
+
+        // NEW: swap request notifications (sent / accepted / declined)
+        // deep-link here, landing on the matching tab.
+        //   tab 0 = Incoming, tab 1 = Active, tab 2 = Sent
+        if (settings.name == '/swap-requests') {
+          final args = settings.arguments as Map<String, dynamic>? ?? {};
+          return MaterialPageRoute(
+            builder: (_) => SwapRequestsPage(
+              initialTab: (args['tab'] as int?) ?? 0,
+            ),
+          );
+        }
+
+        // NEW: exchange completed/cancelled notifications deep-link here.
+        if (settings.name == '/exchange-history') {
+          return MaterialPageRoute(builder: (_) => const ExchangeHistoryPage());
+        }
+
         return null;
       },
     );

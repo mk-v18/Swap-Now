@@ -6,29 +6,33 @@ import 'product_detail_page.dart';
 
 class MyProductsPage extends StatelessWidget {
   const MyProductsPage({super.key});
-
   Future<void> _confirmDelete(BuildContext context, String docId) async {
     final screenWidth = MediaQuery.of(context).size.width;
     final isSmall = screenWidth < 360;
 
+    const Color purple = Color(0xFF6A00FF);
+    const Color danger = Color(0xFFE0392C);
+
     final confirmed = await showModalBottomSheet<bool>(
       context: context,
       backgroundColor: Colors.white,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
       builder: (_) => SafeArea(
         top: false,
         child: Padding(
           padding: EdgeInsets.fromLTRB(
-            isSmall ? 16 : 24,
-            20,
-            isSmall ? 16 : 24,
-            isSmall ? 24 : 36,
+            isSmall ? 20 : 28,
+            14,
+            isSmall ? 20 : 28,
+            isSmall ? 20 : 28,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // Drag handle
               Container(
                 width: 40,
                 height: 4,
@@ -37,69 +41,113 @@ class MyProductsPage extends StatelessWidget {
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 22),
+
+              // Icon badge — soft ring instead of flat shadowed circle
               Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(4),
                 decoration: BoxDecoration(
-                  color: Colors.red.shade50,
                   shape: BoxShape.circle,
+                  border: Border.all(
+                    color: danger.withOpacity(0.18),
+                    width: 1.2,
+                  ),
                 ),
-                child: Icon(Icons.delete_outline_rounded,
-                    color: Colors.red.shade400, size: 32),
+                child: Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: danger.withOpacity(0.08),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(Icons.delete_outline_rounded,
+                      color: danger, size: 30),
+                ),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 18),
+
+              // Title
               Text(
                 'Delete Product?',
                 style: TextStyle(
-                    fontSize: isSmall ? 16 : 18,
-                    fontWeight: FontWeight.w700),
+                  fontSize: isSmall ? 17 : 19,
+                  fontWeight: FontWeight.w800,
+                  color: const Color(0xFF1A1A1A),
+                  letterSpacing: -0.2,
+                ),
               ),
               const SizedBox(height: 8),
+
+              // Subtitle
               Text(
-                'This action cannot be undone. The product will be permanently removed.',
+                'This action cannot be undone. The product\nwill be permanently removed from listings.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                    fontSize: isSmall ? 12 : 13,
-                    color: Colors.grey.shade500,
-                    height: 1.5),
+                  fontSize: isSmall ? 12.5 : 13.5,
+                  color: Colors.grey.shade500,
+                  height: 1.5,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
               const SizedBox(height: 28),
+
+              // Buttons
               Row(
                 children: [
                   Expanded(
-                    child: OutlinedButton(
-                      onPressed: () => Navigator.pop(context, false),
-                      style: OutlinedButton.styleFrom(
-                        padding: EdgeInsets.symmetric(
-                            vertical: isSmall ? 12 : 14),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14)),
-                        side: BorderSide(color: Colors.grey.shade300),
-                      ),
-                      child: Text('Cancel',
+                    child: SizedBox(
+                      height: isSmall ? 46 : 50,
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        style: OutlinedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          side: BorderSide(
+                            color: Colors.grey.shade300,
+                            width: 1.2,
+                          ),
+                        ),
+                        child: Text(
+                          'Cancel',
                           style: TextStyle(
-                              fontWeight: FontWeight.w600,
-                              fontSize: isSmall ? 13 : 14,
-                              color: Colors.black54)),
+                            fontWeight: FontWeight.w600,
+                            fontSize: isSmall ? 13.5 : 14.5,
+                            color: Colors.black87,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
-                    child: ElevatedButton(
-                      onPressed: () => Navigator.pop(context, true),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.red.shade400,
-                        padding: EdgeInsets.symmetric(
-                            vertical: isSmall ? 12 : 14),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14)),
-                        elevation: 0,
+                    child: SizedBox(
+                      height: isSmall ? 46 : 50,
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.pop(context, true),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: danger,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          elevation: 0,
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(Icons.delete_outline_rounded, size: 17),
+                            const SizedBox(width: 6),
+                            Text(
+                              'Delete',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: isSmall ? 13.5 : 14.5,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                      child: Text('Delete',
-                          style: TextStyle(
-                              fontWeight: FontWeight.w700,
-                              fontSize: isSmall ? 13 : 14,
-                              color: Colors.white)),
                     ),
                   ),
                 ],
@@ -252,11 +300,18 @@ class MyProductsPage extends StatelessWidget {
               final doc = products[index];
               final data = doc.data() as Map<String, dynamic>;
               final images = List<String>.from(data['images'] ?? []);
+              // NEW: once a swap for this listing is marked successful, the
+              // onSwapCompleted Cloud Function sets status: 'exchanged' on
+              // this doc. Once exchanged, the owner can only View it —
+              // Edit/Delete no longer make sense for a listing that's
+              // already been swapped away.
+              final isExchanged = (data['status'] ?? '') == 'exchanged';
 
               return _ProductCard(
                 doc: doc,
                 data: data,
                 images: images,
+                isExchanged: isExchanged,
                 onView: () => Navigator.push(
                   context,
                   MaterialPageRoute(
@@ -292,6 +347,7 @@ class _ProductCard extends StatelessWidget {
   final QueryDocumentSnapshot doc;
   final Map<String, dynamic> data;
   final List<String> images;
+  final bool isExchanged;
   final VoidCallback onView;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
@@ -300,6 +356,7 @@ class _ProductCard extends StatelessWidget {
     required this.doc,
     required this.data,
     required this.images,
+    required this.isExchanged,
     required this.onView,
     required this.onEdit,
     required this.onDelete,
@@ -312,7 +369,10 @@ class _ProductCard extends StatelessWidget {
     final isTablet = screenWidth >= 600;
 
     final titleFontSize = isSmall ? 13.0 : (isTablet ? 15.0 : 14.0);
-    final priceFontSize = isSmall ? 13.0 : (isTablet ? 15.0 : 14.0);
+
+    const Color borderColor = Color(0xFFECEAFF);
+    const Color purple = Color(0xFF6A00FF);
+    const Color exchangedColor = Color(0xFF00796B);
 
     return GestureDetector(
       onTap: onView,
@@ -320,23 +380,20 @@ class _ProductCard extends StatelessWidget {
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.07),
-              blurRadius: 16,
-              offset: const Offset(0, 4),
-            ),
-          ],
+          border: Border.all(
+            color: borderColor,
+            width: 1.2,
+          ),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.max,
           children: [
 
-            // ── Image with padding ─────────────────────────────
+            // ── Image with padding (tightened) ─────────────────
             Expanded(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(10, 10, 10, 0),
+                padding: const EdgeInsets.fromLTRB(6, 6, 6, 0),
                 child: Stack(
                   children: [
                     ClipRRect(
@@ -345,156 +402,216 @@ class _ProductCard extends StatelessWidget {
                         width: double.infinity,
                         height: double.infinity,
                         color: const Color(0xFFEEEEEE), // always solid bg
-                        child: images.isNotEmpty
-                            ? Image.network(
-                          images[0],
-                          fit: BoxFit.cover,
-                          width: double.infinity,
-                          height: double.infinity,
-                          errorBuilder: (_, __, ___) => Center(
-                            child: Icon(
-                              Icons.image_not_supported,
-                              color: Colors.grey.shade400,
-                              size: isSmall ? 24 : 30,
-                            ),
-                          ),
-                        )
-                            : Center(
-                          child: Icon(
-                            Icons.image_not_supported,
-                            color: Colors.grey.shade400,
-                            size: isSmall ? 24 : 30,
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    // Delete button — top right
-                    Positioned(
-                      top: 8,
-                      right: 8,
-                      child: GestureDetector(
-                        onTap: onDelete,
-                        child: Container(
-                          width: 34,
-                          height: 34,
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            shape: BoxShape.circle,
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.12),
-                                blurRadius: 8,
-                                offset: const Offset(0, 2),
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            images.isNotEmpty
+                                ? Image.network(
+                              images[0],
+                              fit: BoxFit.cover,
+                              width: double.infinity,
+                              height: double.infinity,
+                              // NOTE: no color/colorBlendMode here anymore — that combo
+                              // was causing the image to render upside-down on some
+                              // devices (a GPU shader compositing issue with blended
+                              // Image widgets). Dimming is now done via a plain overlay
+                              // below instead, which avoids the bug entirely.
+                              errorBuilder: (_, __, ___) => Center(
+                                child: Icon(
+                                  Icons.image_not_supported,
+                                  color: Colors.grey.shade400,
+                                  size: isSmall ? 24 : 30,
+                                ),
                               ),
-                            ],
-                          ),
-                          child: Center(
-                            child: Icon(
-                              Icons.delete_outline_rounded,
-                              size: 17,
-                              color: Colors.red.shade400,
+                            )
+                                : Center(
+                              child: Icon(
+                                Icons.image_not_supported,
+                                color: Colors.grey.shade400,
+                                size: isSmall ? 24 : 30,
+                              ),
+                            ),
+
+                            // NEW: dim overlay for exchanged listings — replaces the old
+                            // color/colorBlendMode tint on Image.network.
+                            if (isExchanged)
+                              Container(color: Colors.black.withOpacity(0.35)),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                    // Delete button — top right (minimized). Hidden once
+                    // exchanged: a swapped-away listing shouldn't be
+                    // editable/deletable, only viewable as a record.
+                    if (!isExchanged)
+                      Positioned(
+                        top: 6,
+                        right: 6,
+                        child: GestureDetector(
+                          onTap: onDelete,
+                          child: Container(
+                            width: 28,
+                            height: 28,
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: borderColor,
+                                width: 1,
+                              ),
+                            ),
+                            child: Center(
+                              child: Icon(
+                                Icons.delete_outline_rounded,
+                                size: 15,
+                                color: Colors.red.shade400,
+                              ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
 
-            // ── Info + actions (fixed height, no Spacer) ───────
-            Padding(
-              padding: EdgeInsets.fromLTRB(
-                isSmall ? 10 : 12,
-                8,
-                isSmall ? 10 : 12,
-                isSmall ? 10 : 12,
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min, // wraps tightly
-                children: [
-                  // Title
-                  Text(
-                    data['title'] ?? '',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: titleFontSize,
-                      color: const Color(0xFF1A1A1A),
-                    ),
-                  ),
-
-                  const SizedBox(height: 5),
-
-                  // Price + Condition pill
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Flexible(
-                        child: Text(
-                          '₹ ${data['price'] ?? ''}',
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontWeight: FontWeight.w800,
-                            fontSize: priceFontSize,
-                            color: const Color(0xFF6A00FF),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      if ((data['condition'] ?? '').toString().isNotEmpty)
-                        Container(
+                    // NEW: "Exchanged" pill replaces the condition pill
+                    // once the swap is successful, so the owner can tell
+                    // at a glance why Edit/Delete are gone.
+                    if (isExchanged)
+                      Positioned(
+                        left: 8,
+                        bottom: 8,
+                        child: Container(
                           padding: const EdgeInsets.symmetric(
                               horizontal: 8, vertical: 3),
                           decoration: BoxDecoration(
-                            color: const Color(0xFFF0E8FF),
+                            color: Colors.white.withOpacity(0.92),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.check_circle_rounded,
+                                  size: 11, color: exchangedColor),
+                              const SizedBox(width: 3),
+                              Text(
+                                'Exchanged',
+                                style: TextStyle(
+                                  fontSize: isSmall ? 8 : 10,
+                                  fontWeight: FontWeight.w600,
+                                  color: exchangedColor,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      )
+                    else if ((data['condition'] ?? '').toString().isNotEmpty)
+                      Positioned(
+                        left: 8,
+                        bottom: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.92),
                             borderRadius: BorderRadius.circular(20),
                           ),
                           child: Text(
                             data['condition'],
                             style: TextStyle(
-                              fontSize: isSmall ? 10 : 11,
+                              fontSize: isSmall ? 8 : 10,
                               fontWeight: FontWeight.w600,
-                              color: const Color(0xFF6A00FF),
+                              color: purple,
                             ),
                           ),
                         ),
-                    ],
-                  ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
 
-                  const SizedBox(height: 10),
+            // ── Info ─────────────────────────────────────────
+            Padding(
+              padding: EdgeInsets.fromLTRB(
+                isSmall ? 10 : 12,
+                8,
+                isSmall ? 10 : 12,
+                0,
+              ),
+              child: Text(
+                data['title'] ?? '',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: titleFontSize,
+                  color: const Color(0xFF1A1A1A),
+                ),
+              ),
+            ),
 
-                  // View | Edit buttons
-                  Row(
+            // ── Action row — attached footer ─────────────────────
+            // NEW: once exchanged, only "View" is shown (full width, no
+            // divider) — Edit/Delete are removed rather than just
+            // disabled, since they no longer apply to this listing.
+            Padding(
+              padding: EdgeInsets.fromLTRB(
+                isSmall ? 10 : 12,
+                8,
+                isSmall ? 10 : 12,
+                isSmall ? 8 : 10,
+              ),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF7F7F9),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: borderColor, width: 1),
+                ),
+                child: IntrinsicHeight(
+                  child: isExchanged
+                      ? Row(
                     children: [
                       Expanded(
                         child: _ActionButton(
                           label: 'View',
                           icon: Icons.visibility_outlined,
-                          foreground: const Color(0xFF6A00FF),
-                          background: const Color(0xFFF0E8FF),
+                          color: purple,
                           onTap: onView,
                           isSmall: isSmall,
                         ),
                       ),
-                      const SizedBox(width: 8),
+                    ],
+                  )
+                      : Row(
+                    children: [
+                      Expanded(
+                        child: _ActionButton(
+                          label: 'View',
+                          icon: Icons.visibility_outlined,
+                          color: purple,
+                          onTap: onView,
+                          isSmall: isSmall,
+                        ),
+                      ),
+                      VerticalDivider(
+                        width: 1,
+                        thickness: 1,
+                        indent: 8,
+                        endIndent: 8,
+                        color: borderColor,
+                      ),
                       Expanded(
                         child: _ActionButton(
                           label: 'Edit',
                           icon: Icons.edit_outlined,
-                          foreground: const Color(0xFF0055CC),
-                          background: const Color(0xFFDEEAFF),
+                          color: const Color(0xFF0055CC),
                           onTap: onEdit,
                           isSmall: isSmall,
                         ),
                       ),
                     ],
                   ),
-                ],
+                ),
               ),
             ),
           ],
@@ -504,23 +621,20 @@ class _ProductCard extends StatelessWidget {
   }
 }
 
-
 // ─────────────────────────────────────────────────────────────
-// Labelled action button (View / Edit)
+// Flat, icon+label action button used inside the split footer
 // ─────────────────────────────────────────────────────────────
 class _ActionButton extends StatelessWidget {
   final String label;
   final IconData icon;
-  final Color foreground;
-  final Color background;
+  final Color color;
   final VoidCallback onTap;
   final bool isSmall;
 
   const _ActionButton({
     required this.label,
     required this.icon,
-    required this.foreground,
-    required this.background,
+    required this.color,
     required this.onTap,
     required this.isSmall,
   });
@@ -528,26 +642,26 @@ class _ActionButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: background,
-      borderRadius: BorderRadius.circular(10),
+      color: Colors.transparent,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
-        splashColor: foreground.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(12),
+        splashColor: color.withOpacity(0.10),
+        highlightColor: color.withOpacity(0.05),
         child: Padding(
           padding: EdgeInsets.symmetric(
-              vertical: isSmall ? 7 : 8, horizontal: 4),
+              vertical: isSmall ? 8 : 9, horizontal: 4),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: isSmall ? 13 : 14, color: foreground),
+              Icon(icon, size: isSmall ? 14 : 15, color: color),
               const SizedBox(width: 5),
               Text(
                 label,
                 style: TextStyle(
                   fontSize: isSmall ? 11 : 12,
                   fontWeight: FontWeight.w600,
-                  color: foreground,
+                  color: color,
                 ),
               ),
             ],

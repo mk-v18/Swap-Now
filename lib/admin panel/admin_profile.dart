@@ -667,7 +667,6 @@ class _LogoutDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final screenWidth = MediaQuery.of(context).size.width;
 
@@ -681,8 +680,20 @@ class _LogoutDialog extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 360),
         child: Container(
           decoration: BoxDecoration(
-            color: scheme.surface,
-            borderRadius: BorderRadius.circular(20),
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.08),
+                blurRadius: 32,
+                offset: const Offset(0, 12),
+              ),
+              BoxShadow(
+                color: Colors.black.withOpacity(0.04),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
+              ),
+            ],
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -694,54 +705,57 @@ class _LogoutDialog extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Container(
-                      width: 48,
-                      height: 48,
+                      width: 52,
+                      height: 52,
                       decoration: BoxDecoration(
-                        color: scheme.errorContainer,
-                        borderRadius: BorderRadius.circular(14),
+                        color: const Color(0xFFFEE2E2),
+                        borderRadius: BorderRadius.circular(16),
                       ),
-                      child: Icon(
+                      child: const Icon(
                         Icons.logout_rounded,
-                        color: scheme.onErrorContainer,
-                        size: 22,
+                        color: Color(0xFFDC2626),
+                        size: 24,
                       ),
                     ),
-                    const SizedBox(height: 18),
+                    const SizedBox(height: 20),
                     Text(
                       'Sign out',
                       style: textTheme.titleLarge?.copyWith(
-                        fontWeight: FontWeight.w600,
-                        color: scheme.onSurface,
+                        fontWeight: FontWeight.w700,
+                        color: const Color(0xFF111827),
+                        fontSize: 20,
                       ),
                     ),
                     const SizedBox(height: 8),
                     Text(
                       "You'll need to verify your phone number again to access your account.",
                       style: textTheme.bodyMedium?.copyWith(
-                        color: scheme.onSurfaceVariant,
-                        height: 1.6,
+                        color: const Color(0xFF6B7280),
+                        height: 1.5,
+                        fontSize: 14,
                       ),
                     ),
-                    const SizedBox(height: 24),
+                    const SizedBox(height: 26),
                   ],
                 ),
               ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(24, 0, 24, 28),
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
                 child: Column(
                   children: [
                     SizedBox(
                       width: double.infinity,
+                      height: 50,
                       child: FilledButton(
                         style: FilledButton.styleFrom(
-                          backgroundColor: scheme.errorContainer,
-                          foregroundColor: scheme.onErrorContainer,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          backgroundColor: const Color(0xFFDC2626),
+                          foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
+                            borderRadius: BorderRadius.circular(14),
                           ),
-                          textStyle: textTheme.labelLarge?.copyWith(
-                            fontWeight: FontWeight.w500,
+                          textStyle: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            fontSize: 15,
                           ),
                           elevation: 0,
                         ),
@@ -752,19 +766,18 @@ class _LogoutDialog extends StatelessWidget {
                     const SizedBox(height: 10),
                     SizedBox(
                       width: double.infinity,
-                      child: OutlinedButton(
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: scheme.onSurfaceVariant,
-                          side: BorderSide(
-                            color: scheme.outlineVariant,
-                            width: 0.5,
-                          ),
-                          padding: const EdgeInsets.symmetric(vertical: 14),
+                      height: 50,
+                      child: TextButton(
+                        style: TextButton.styleFrom(
+                          foregroundColor: const Color(0xFF374151),
+                          backgroundColor: const Color(0xFFF9FAFB),
                           shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
+                            borderRadius: BorderRadius.circular(14),
                           ),
-                          textStyle: textTheme.labelLarge,
-                          elevation: 0,
+                          textStyle: const TextStyle(
+                            fontWeight: FontWeight.w600,
+                            fontSize: 15,
+                          ),
                         ),
                         onPressed: () => Navigator.pop(context, false),
                         child: const Text('Cancel'),

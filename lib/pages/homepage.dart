@@ -80,6 +80,9 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final Map<String, double> _distanceCache = {};
+  // Hard cap so a long session with many distinct locations can't let this
+  // map grow unbounded — cheap perf/memory guardrail.
+  static const int _distanceCacheCap = 500;
 
   String userLocation = "";
   double? userLat;
@@ -104,6 +107,17 @@ class _HomePageState extends State<HomePage> {
   final ScrollController _scrollController = ScrollController();
   bool _showPinnedSearch = false;
 
+  // Single wishlist listener shared by every card — replaces N per-card
+  // StreamBuilders, which were opening one Firestore listener per visible
+  // product (huge overhead at scale, and the main mobile jank source).
+  //
+  // Favourites are held in a ValueNotifier rather than plain state so that
+  // toggling a heart icon repaints only the cards that read it (via
+  // ValueListenableBuilder) instead of rebuilding the entire HomePage tree
+  // on every wishlist change.
+  StreamSubscription<QuerySnapshot>? _wishlistSub;
+  final ValueNotifier<Set<String>> _favoriteIds = ValueNotifier({});
+
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   @override
@@ -114,6 +128,7 @@ class _HomePageState extends State<HomePage> {
     // in (header text, distance sorting, avatar) whenever it's ready,
     // without blocking the first frame or the product grid.
     _fetchUserData();
+    _listenWishlist();
     _searchController.addListener(_onSearchChanged);
     _scrollController.addListener(_onScroll);
   }
@@ -122,6 +137,8 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _debounce?.cancel();
     _distanceCache.clear();
+    _wishlistSub?.cancel();
+    _favoriteIds.dispose();
     _searchController
       ..removeListener(_onSearchChanged)
       ..dispose();
@@ -129,6 +146,22 @@ class _HomePageState extends State<HomePage> {
       ..removeListener(_onScroll)
       ..dispose();
     super.dispose();
+  }
+
+  void _listenWishlist() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    _wishlistSub = FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .collection('wishlist')
+        .snapshots()
+        .listen((snap) {
+      // Notifier update — no setState, so this no longer rebuilds the
+      // whole HomePage (header, search bar, filter row, grid) every time
+      // a single item is (un)favourited.
+      _favoriteIds.value = snap.docs.map((d) => d.id).toSet();
+    });
   }
 
   void _onScroll() {
@@ -166,6 +199,24 @@ class _HomePageState extends State<HomePage> {
         });
       }
     });
+  }
+
+  // ─── Refresh ──────────────────────────────────────────────────────────────
+
+  /// Pull-to-refresh handler. The product grid is already live via a
+  /// Firestore stream, so refreshing mainly means: re-check the user's
+  /// location (in case it changed), clear stale distance/geocode caching,
+  /// and recompute + re-sort the currently loaded docs against it.
+  Future<void> _handleRefresh() async {
+    _distanceCache.clear();
+    _lastDocsFingerprint = ''; // force _fingerprint to look "stale" too
+    await _fetchUserData();
+    if (_lastDocs != null) {
+      await _processItems(_lastDocs!);
+    }
+    if (mounted) {
+      setState(() => _visibleCount = _pageSize);
+    }
   }
 
   // ─── Location ─────────────────────────────────────────────────────────────
@@ -240,6 +291,15 @@ class _HomePageState extends State<HomePage> {
   double _calcDistance(double lat1, double lon1, double lat2, double lon2) =>
       Geolocator.distanceBetween(lat1, lon1, lat2, lon2) / 1000;
 
+  void _cacheDistance(String key, double value) {
+    if (_distanceCache.length >= _distanceCacheCap) {
+      // Cheap eviction: drop the oldest entry (first key) rather than
+      // paying for an LRU structure for what's just a soft memory guard.
+      _distanceCache.remove(_distanceCache.keys.first);
+    }
+    _distanceCache[key] = value;
+  }
+
   // ─── Item processing ──────────────────────────────────────────────────────
 
   Future<void> _processItems(List<QueryDocumentSnapshot> docs) async {
@@ -248,17 +308,27 @@ class _HomePageState extends State<HomePage> {
 
     final currentUser = FirebaseAuth.instance.currentUser;
     final query = _searchQuery;
-    final filters = List<String>.from(_selectedFilters);
-    final List<Map<String, dynamic>> withDistances = [];
+    // Set instead of List: filter membership checks below go from O(n) to
+    // O(1) per candidate, which matters once categories list grows.
+    final filters = Set<String>.from(_selectedFilters);
+
+    final List<Map<String, dynamic>> candidates = [];
+    // address string -> every candidate entry waiting on that address.
+    // Multiple items sharing a location string only pay for one geocode.
+    final Map<String, List<Map<String, dynamic>>> pendingGeocode = {};
 
     try {
       for (final doc in docs) {
         final raw = doc.data();
-        if (raw == null) continue;
-        if (raw is! Map<String, dynamic>) continue;
+        if (raw == null || raw is! Map<String, dynamic>) continue;
         final data = raw;
 
         if (currentUser != null && data['userId'] == currentUser.uid) continue;
+
+        // NEW: once a swap for this listing is marked successful, the
+        // onSwapCompleted Cloud Function sets status: 'exchanged' on the
+        // UserProductList doc — hide it from the homepage from that point on.
+        if (data['status'] == 'exchanged') continue;
 
         if (filters.isNotEmpty) {
           final cat = (data['category'] as String?) ?? '';
@@ -271,47 +341,64 @@ class _HomePageState extends State<HomePage> {
           if (!title.contains(query) && !desc.contains(query)) continue;
         }
 
-        double distance = 9999;
+        final entry = <String, dynamic>{'distance': 9999.0, 'doc': doc};
+        candidates.add(entry);
 
-        if (userLat != null && userLng != null) {
-          final lat = data['lat'];
-          final lng = data['lng'];
-          if (lat != null && lng != null) {
-            final key =
-                '${(lat as num).toStringAsFixed(5)}_${(lng as num).toStringAsFixed(5)}';
-            distance = _distanceCache[key] ??= _calcDistance(
+        if (userLat == null || userLng == null) continue;
+
+        final lat = data['lat'];
+        final lng = data['lng'];
+        if (lat != null && lng != null) {
+          final key =
+              '${(lat as num).toStringAsFixed(5)}_${(lng as num).toStringAsFixed(5)}';
+          final cached = _distanceCache[key];
+          if (cached != null) {
+            entry['distance'] = cached;
+          } else {
+            final d = _calcDistance(
               userLat!,
               userLng!,
-              (lat as num).toDouble(),
+              lat.toDouble(),
               (lng as num).toDouble(),
             );
+            _cacheDistance(key, d);
+            entry['distance'] = d;
+          }
+        } else {
+          final locStr = (data['location'] as String?) ?? '';
+          if (locStr.isEmpty) continue;
+          if (_distanceCache.containsKey(locStr)) {
+            entry['distance'] = _distanceCache[locStr]!;
           } else {
-            final locStr = (data['location'] as String?) ?? '';
-            if (locStr.isNotEmpty) {
-              if (_distanceCache.containsKey(locStr)) {
-                distance = _distanceCache[locStr]!;
-              } else {
-                try {
-                  final geo = await locationFromAddress(locStr);
-                  if (geo.isNotEmpty) {
-                    distance = _calcDistance(
-                      userLat!,
-                      userLng!,
-                      geo.first.latitude,
-                      geo.first.longitude,
-                    );
-                    _distanceCache[locStr] = distance;
-                  }
-                } catch (_) {}
-              }
-            }
+            pendingGeocode.putIfAbsent(locStr, () => []).add(entry);
           }
         }
-
-        withDistances.add({'distance': distance, 'doc': doc});
       }
 
-      withDistances.sort(
+      // Resolve every uncached address concurrently instead of one at a
+      // time — this was the biggest latency sink: N products with no
+      // stored lat/lng meant N sequential network round-trips.
+      if (pendingGeocode.isNotEmpty) {
+        await Future.wait(pendingGeocode.entries.map((e) async {
+          try {
+            final geo = await locationFromAddress(e.key);
+            if (geo.isNotEmpty) {
+              final d = _calcDistance(
+                userLat!,
+                userLng!,
+                geo.first.latitude,
+                geo.first.longitude,
+              );
+              _cacheDistance(e.key, d);
+              for (final entry in e.value) {
+                entry['distance'] = d;
+              }
+            }
+          } catch (_) {}
+        }));
+      }
+
+      candidates.sort(
             (a, b) =>
             (a['distance'] as double).compareTo(b['distance'] as double),
       );
@@ -323,7 +410,7 @@ class _HomePageState extends State<HomePage> {
 
     if (mounted) {
       setState(() {
-        _processedItems = withDistances;
+        _processedItems = candidates;
         if (_visibleCount < _pageSize) _visibleCount = _pageSize;
       });
     }
@@ -339,76 +426,83 @@ class _HomePageState extends State<HomePage> {
         top: false,
         child: Stack(
           children: [
-            // Product grid renders immediately — no gate on user/location
-            // data. Distance sorting and location text simply update in
-            // place once that data streams in.
-            CustomScrollView(
-              controller: _scrollController,
-              slivers: [
-                SliverAppBar(
-                  automaticallyImplyLeading: false,
-                  pinned: true,
-                  floating: false,
-                  snap: false,
-                  elevation: 0,
-                  expandedHeight: _BP.headerHeight(context),
-                  backgroundColor: _kPrimary,
-                  foregroundColor: Colors.white,
-                  // When collapsed: show "SwapNow" + icons in the title row.
-                  // When expanded: title is hidden — _buildHeader owns everything.
-                  title: _showPinnedSearch
-                      ? Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text(
-                        'SwapNow',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 24,
+            RefreshIndicator(
+              onRefresh: _handleRefresh,
+              color: _kPrimaryDark,
+              child: CustomScrollView(
+                controller: _scrollController,
+                // Ensures the refresh gesture still works even when
+                // content is shorter than the viewport (e.g. empty state).
+                physics: const AlwaysScrollableScrollPhysics(
+                  parent: BouncingScrollPhysics(),
+                ),
+                // Builds a little ahead of/behind the viewport so cards
+                // are ready before they're visible instead of popping in.
+                cacheExtent: 600,
+                slivers: [
+                  SliverAppBar(
+                    automaticallyImplyLeading: false,
+                    pinned: true,
+                    floating: false,
+                    snap: false,
+                    elevation: 0,
+                    expandedHeight: _BP.headerHeight(context),
+                    backgroundColor: _kPrimary,
+                    foregroundColor: Colors.white,
+                    // When collapsed: show "SwapNow" + icons in the title row.
+                    // When expanded: title is hidden — _buildHeader owns everything.
+                    title: _showPinnedSearch
+                        ? Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Amoeba',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 24,
+                          ),
                         ),
-                      ),
-                      Row(
-                        children: [
-                          _iconBtn(context, 'assets/icons/favourite.svg',
-                              const WishlistPage()),
-                          SizedBox(
-                              width: _BP.isTablet(context) ? 10 : 8),
-                          _profileAvatar(context),
-                          SizedBox(
-                              width: _BP.isTablet(context) ? 10 : 8),
-                        ],
-                      ),
-                    ],
-                  )
-                      : null,
-                  // No actions — all icons are owned by _buildHeader (expanded)
-                  // or the title row above (collapsed). Zero duplication.
-                  actions: const [],
-                  flexibleSpace: FlexibleSpaceBar(
-                    collapseMode: CollapseMode.pin,
-                    background: _buildHeader(context),
+                        Row(
+                          children: [
+                            _iconBtn(context, 'assets/icons/favourite.svg',
+                                const WishlistPage()),
+                            SizedBox(
+                                width: _BP.isTablet(context) ? 10 : 8),
+                            _profileAvatar(context),
+                            SizedBox(
+                                width: _BP.isTablet(context) ? 10 : 8),
+                          ],
+                        ),
+                      ],
+                    )
+                        : null,
+                    actions: const [],
+                    flexibleSpace: FlexibleSpaceBar(
+                      collapseMode: CollapseMode.pin,
+                      background: _buildHeader(context),
+                    ),
                   ),
-                ),
-                SliverToBoxAdapter(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SizedBox(height: 15),
-                      _buildFilterRow(context),
-                      _buildProductList(context),
-                      const SizedBox(height: 28),
-                    ],
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 15),
+                      child: _buildFilterRow(context),
+                    ),
                   ),
-                ),
-                SliverToBoxAdapter(
-                  child: _buildTrustBanner(context),
-                ),
-              ],
+                  // Real sliver-based product list — cards are built lazily
+                  // as they scroll into view, instead of the old
+                  // shrinkWrap GridView which built all ~200 cards eagerly
+                  // on every rebuild regardless of what was on screen.
+                  _buildProductStream(context),
+                  const SliverToBoxAdapter(child: SizedBox(height: 28)),
+                  SliverToBoxAdapter(
+                    child: _buildTrustBanner(context),
+                  ),
+                ],
+              ),
             ),
 
             // Pinned search bar — only the search bar slides in/out.
-            // Icons stay in SliverAppBar actions above, so no duplication.
             AnimatedPositioned(
               duration: const Duration(milliseconds: 200),
               top: _showPinnedSearch
@@ -469,20 +563,17 @@ class _HomePageState extends State<HomePage> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Icons only render here (expanded header). When header
-              // collapses the SliverAppBar title row takes over — never both.
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Text(
-                    "SwapNow",
+                    "Amoeba",
                     style: TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.w700,
                       fontSize: _BP.fontSize(context, 24),
                     ),
                   ),
-                  // Only visible while the header is expanded.
                   if (!_showPinnedSearch)
                     Row(
                       children: [
@@ -720,8 +811,9 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildFilterRow(BuildContext context) {
     final hPad = _BP.hPad(context);
+    final hasFilters = _selectedFilters.isNotEmpty;
     return Padding(
-      padding: EdgeInsets.only(left: hPad, right: 8),
+      padding: EdgeInsets.only(left: hPad, right: hPad - 8),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -734,7 +826,7 @@ class _HomePageState extends State<HomePage> {
                   fontSize: _BP.fontSize(context, 16),
                 ),
               ),
-              if (_selectedFilters.isNotEmpty) ...[
+              if (hasFilters) ...[
                 const SizedBox(width: 6),
                 Container(
                   padding:
@@ -752,16 +844,38 @@ class _HomePageState extends State<HomePage> {
               ],
             ],
           ),
-          IconButton(
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
-            visualDensity: VisualDensity.compact,
-            icon: Icon(
-              Icons.filter_list,
-              color: _selectedFilters.isNotEmpty ? _kPrimaryDark : Colors.grey,
-              size: _BP.isTablet(context) ? 26 : 24,
+          // Now shows a "Filter" label alongside the icon, so the control
+          // reads clearly instead of relying on the icon alone.
+          Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: _showFilterSheet,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 6),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.filter_list,
+                      color: hasFilters ? _kPrimaryDark : Colors.grey,
+                      size: _BP.isTablet(context) ? 22 : 20,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      "Filter",
+                      style: TextStyle(
+                        color: hasFilters ? _kPrimaryDark : Colors.grey[700],
+                        fontWeight: FontWeight.w600,
+                        fontSize: _BP.fontSize(context, 13),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-            onPressed: _showFilterSheet,
           ),
         ],
       ),
@@ -927,14 +1041,30 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // ─── Product list ─────────────────────────────────────────────────────────
+  // ─── Product list (sliver-based) ───────────────────────────────────────────
 
+  /// Includes each doc's status alongside its id, not just list shape —
+  /// a plain count+first+last-id fingerprint doesn't change when a
+  /// listing's status flips to 'exchanged' in the middle of the list
+  /// (e.g. via the onSwapCompleted Cloud Function), so that update was
+  /// silently never triggering a re-run of _processItems and the sold
+  /// item kept showing on the homepage.
   static String _fingerprint(List<QueryDocumentSnapshot> docs) {
     if (docs.isEmpty) return '';
-    return '${docs.length}_${docs.first.id}_${docs.last.id}';
+    final buffer = StringBuffer('${docs.length}');
+    for (final doc in docs) {
+      final raw = doc.data();
+      final status =
+      (raw is Map<String, dynamic>) ? (raw['status'] ?? '') : '';
+      buffer.write('_${doc.id}:$status');
+    }
+    return buffer.toString();
   }
 
-  Widget _buildProductList(BuildContext context) {
+  /// Returns a single sliver (via [SliverMainAxisGroup]) that plugs
+  /// directly into the outer CustomScrollView. Cards are only built when
+  /// they scroll into view.
+  Widget _buildProductStream(BuildContext context) {
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance
           .collection('UserProductList')
@@ -944,19 +1074,23 @@ class _HomePageState extends State<HomePage> {
       builder: (context, snapshot) {
         if (snapshot.hasError) {
           if (kDebugMode) debugPrint('Firestore error: ${snapshot.error}');
-          return _buildStatePlaceholder(
-            context,
-            asset: 'assets/images/error_state.png',
-            fallbackIcon: Icons.error_outline,
+          return SliverToBoxAdapter(
+            child: _buildStatePlaceholder(
+              context,
+              asset: 'assets/images/error_state.png',
+              fallbackIcon: Icons.error_outline,
+            ),
           );
         }
 
         if (snapshot.connectionState == ConnectionState.waiting &&
             _processedItems.isEmpty) {
-          return const Center(
-            child: Padding(
-              padding: EdgeInsets.all(40),
-              child: CircularProgressIndicator(color: _kPrimaryDark),
+          return const SliverToBoxAdapter(
+            child: Center(
+              child: Padding(
+                padding: EdgeInsets.all(40),
+                child: CircularProgressIndicator(color: _kPrimaryDark),
+              ),
             ),
           );
         }
@@ -974,31 +1108,37 @@ class _HomePageState extends State<HomePage> {
         }
 
         if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-          return _buildStatePlaceholder(
-            context,
-            asset: 'assets/images/no_items.png',
-            fallbackIcon: Icons.inventory_2_outlined,
+          return SliverToBoxAdapter(
+            child: _buildStatePlaceholder(
+              context,
+              asset: 'assets/images/no_items.png',
+              fallbackIcon: Icons.inventory_2_outlined,
+            ),
           );
         }
 
         if (_isProcessingItems && _processedItems.isEmpty) {
-          return const Center(
-            child: Padding(
-              padding: EdgeInsets.all(40),
-              child: CircularProgressIndicator(color: _kPrimaryDark),
+          return const SliverToBoxAdapter(
+            child: Center(
+              child: Padding(
+                padding: EdgeInsets.all(40),
+                child: CircularProgressIndicator(color: _kPrimaryDark),
+              ),
             ),
           );
         }
 
         if (_processedItems.isEmpty) {
-          return _buildStatePlaceholder(
-            context,
-            asset: _searchQuery.isNotEmpty
-                ? 'assets/images/no_search_results.png'
-                : 'assets/images/no_nearby_items.png',
-            fallbackIcon: _searchQuery.isNotEmpty
-                ? Icons.search_off
-                : Icons.location_off_outlined,
+          return SliverToBoxAdapter(
+            child: _buildStatePlaceholder(
+              context,
+              asset: _searchQuery.isNotEmpty
+                  ? 'assets/images/no_search_results.png'
+                  : 'assets/images/no_nearby_items.png',
+              fallbackIcon: _searchQuery.isNotEmpty
+                  ? Icons.search_off
+                  : Icons.location_off_outlined,
+            ),
           );
         }
 
@@ -1015,38 +1155,40 @@ class _HomePageState extends State<HomePage> {
 
         final hasMore = _visibleCount < _processedItems.length;
 
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (nearby.isNotEmpty) _buildGrid(context, nearby),
+        return SliverMainAxisGroup(
+          slivers: [
+            if (nearby.isNotEmpty) _buildGridSliver(context, nearby),
             if (midRange.isNotEmpty) ...[
-              Padding(
-                padding: EdgeInsets.only(
-                  left: _BP.hPad(context),
-                  top: 12,
-                  bottom: 5,
-                ),
-                child: Text(
-                  "Nearby Products",
-                  style: TextStyle(
-                    fontSize: _BP.fontSize(context, 16),
-                    fontWeight: FontWeight.w600,
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: EdgeInsets.only(
+                    left: _BP.hPad(context),
+                    top: 12,
+                    bottom: 5,
+                  ),
+                  child: Text(
+                    "Nearby Products",
+                    style: TextStyle(
+                      fontSize: _BP.fontSize(context, 16),
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
               ),
-              _buildGrid(context, midRange),
+              _buildGridSliver(context, midRange),
             ],
             if (hasMore)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 16),
-                child: Center(
-                  child: SizedBox(
-                    width: 22,
-                    height: 22,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: _kPrimaryDark,
+              const SliverToBoxAdapter(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 16),
+                  child: Center(
+                    child: SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: _kPrimaryDark,
+                      ),
                     ),
                   ),
                 ),
@@ -1080,29 +1222,41 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ─── Grid ─────────────────────────────────────────────────────────────────
+  // ─── Grid (real sliver, lazily built) ──────────────────────────────────────
 
-  Widget _buildGrid(
+  Widget _buildGridSliver(
       BuildContext context, List<Map<String, dynamic>> items) {
     final cols = _BP.gridCols(context);
     final hPad = _BP.isTablet(context) ? 16.0 : 12.0;
+    final spacing = _BP.isTablet(context) ? 14.0 : 12.0;
 
-    return Padding(
+    return SliverPadding(
       padding: EdgeInsets.symmetric(horizontal: hPad),
-      child: GridView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        padding: EdgeInsets.zero,
-        itemCount: items.length,
+      sliver: SliverGrid(
         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: cols,
-          mainAxisSpacing: _BP.isTablet(context) ? 14 : 12,
-          crossAxisSpacing: _BP.isTablet(context) ? 14 : 12,
+          mainAxisSpacing: spacing,
+          crossAxisSpacing: spacing,
           childAspectRatio: _BP.cardAspectRatio(context),
         ),
-        itemBuilder: (context, index) => _ProductCard(
-          key: ValueKey((items[index]['doc'] as QueryDocumentSnapshot).id),
-          doc: items[index]['doc'] as QueryDocumentSnapshot,
+        delegate: SliverChildBuilderDelegate(
+              (context, index) {
+            final doc = items[index]['doc'] as QueryDocumentSnapshot;
+            // Cards are stateless and cheap to rebuild, so we don't need
+            // Flutter to keep them alive off-screen — disabling that
+            // bookkeeping saves work on large grids. RepaintBoundary is
+            // still on (the default) so scrolling doesn't repaint the
+            // whole grid every frame, just the cards that changed.
+            return _ProductCard(
+              key: ValueKey(doc.id),
+              doc: doc,
+              favoriteIdsListenable: _favoriteIds,
+            );
+          },
+          childCount: items.length,
+          addAutomaticKeepAlives: false,
+          addRepaintBoundaries: true,
+          addSemanticIndexes: false,
         ),
       ),
     );
@@ -1110,11 +1264,18 @@ class _HomePageState extends State<HomePage> {
 }
 
 // ─── Product card ──────────────────────────────────────────────────────────
+// Listens to the shared favourites ValueNotifier directly, so toggling a
+// heart only rebuilds this one card instead of the whole HomePage tree.
 
 class _ProductCard extends StatelessWidget {
   final QueryDocumentSnapshot doc;
+  final ValueListenable<Set<String>> favoriteIdsListenable;
 
-  const _ProductCard({super.key, required this.doc});
+  const _ProductCard({
+    super.key,
+    required this.doc,
+    required this.favoriteIdsListenable,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1128,31 +1289,10 @@ class _ProductCard extends StatelessWidget {
         ? images[0].toString()
         : 'https://via.placeholder.com/150';
 
-    final user = FirebaseAuth.instance.currentUser;
-
-    if (user == null) {
-      return UserProductListing(
-        imageUrl: imageUrl,
-        title: (data['title'] as String? ?? 'Unnamed Product'),
-        price: data['price'],
-        condition: data['condition'],
-        location: data['location'],
-        isFavorite: false,
-        onPressed: () => _openDetail(context, data),
-        onFavoriteToggle: () {},
-      );
-    }
-
-    return StreamBuilder<DocumentSnapshot>(
-      stream: FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .collection('wishlist')
-          .doc(doc.id)
-          .snapshots(),
-      builder: (context, snapshot) {
-        final isFavorite = snapshot.hasData && snapshot.data!.exists;
-
+    return ValueListenableBuilder<Set<String>>(
+      valueListenable: favoriteIdsListenable,
+      builder: (context, favoriteIds, _) {
+        final isFavorite = favoriteIds.contains(doc.id);
         return UserProductListing(
           imageUrl: imageUrl,
           title: (data['title'] as String? ?? 'Unnamed Product'),
@@ -1161,7 +1301,7 @@ class _ProductCard extends StatelessWidget {
           location: data['location'],
           isFavorite: isFavorite,
           onPressed: () => _openDetail(context, data),
-          onFavoriteToggle: () => _toggleWishlist(context, user, isFavorite),
+          onFavoriteToggle: () => _toggleWishlist(context, isFavorite),
         );
       },
     );
@@ -1171,16 +1311,18 @@ class _ProductCard extends StatelessWidget {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => UserProductDetailsPage(productData: data),
+        builder: (_) => UserProductDetailsPage(
+          productId: doc.id,
+          productData: data,
+        ),
       ),
     );
   }
 
-  Future<void> _toggleWishlist(
-      BuildContext context,
-      User user,
-      bool isFavorite,
-      ) async {
+  Future<void> _toggleWishlist(BuildContext context, bool isFavorite) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
     final ref = FirebaseFirestore.instance
         .collection('users')
         .doc(user.uid)

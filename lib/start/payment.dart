@@ -44,8 +44,11 @@ class _Resp {
     required this.isLarge,
   });
 
+  // FIX(perf): MediaQuery.sizeOf() instead of MediaQuery.of().size — scopes
+  // the InheritedWidget dependency to just the `size` aspect, so unrelated
+  // MediaQuery changes (text scale, padding, etc.) don't trigger a rebuild.
   factory _Resp.of(BuildContext ctx) {
-    final s = MediaQuery.of(ctx).size;
+    final s = MediaQuery.sizeOf(ctx);
     return _Resp(
       w: s.width,
       h: s.height,
@@ -81,11 +84,21 @@ class PaymentPage extends StatefulWidget {
 class _PaymentPageState extends State<PaymentPage>
     with SingleTickerProviderStateMixin {
   late final Razorpay _razorpay;
-  bool _isProcessing = false;
+
+  // FIX(perf): isolated into a ValueNotifier — see build() below. Flipping
+  // this used to rebuild the ENTIRE page (background image, SVG
+  // illustration, feature list, everything) just to swap the CTA button
+  // between "Get Started" and a spinner.
+  final ValueNotifier<bool> _isProcessingNotifier = ValueNotifier<bool>(false);
+
   Timer? _processingTimeoutTimer;
 
   // Resolved once in initState — either the Remote Config value or the
   // hardcoded fallback. Never read _kRazorpayKeyFallback directly elsewhere.
+  // FIX(perf/bug): plain field, no setState — nothing in build() reads this
+  // value (it's only used later inside _openCheckout), so wrapping its
+  // assignment in setState was rebuilding the whole page for zero visual
+  // change every time Remote Config resolved.
   String _razorpayKey = _kRazorpayKeyFallback;
 
   // Initialized in initState — AnimationController requires vsync (this),
@@ -129,7 +142,8 @@ class _PaymentPageState extends State<PaymentPage>
 
       final fetched = remoteConfig.getString('razorpay_key_id');
       if (fetched.isNotEmpty && mounted) {
-        setState(() => _razorpayKey = fetched);
+        // FIX(perf/bug): no setState — this value isn't read by build().
+        _razorpayKey = fetched;
       }
     } catch (e) {
       debugPrint('Remote Config fetch failed, using fallback key: $e');
@@ -142,6 +156,7 @@ class _PaymentPageState extends State<PaymentPage>
     _processingTimeoutTimer?.cancel();
     _razorpay.clear();
     _fadeCtrl?.dispose();
+    _isProcessingNotifier.dispose();
     super.dispose();
   }
 
@@ -212,15 +227,15 @@ class _PaymentPageState extends State<PaymentPage>
 
   void _startProcessing() {
     if (!mounted) return;
-    setState(() => _isProcessing = true);
+    _isProcessingNotifier.value = true;
 
     // Safety net: if no Razorpay callback ever fires (process killed,
     // checkout sheet dismissed without an event, etc.), unstick the UI.
     _processingTimeoutTimer?.cancel();
     _processingTimeoutTimer = Timer(_kProcessingTimeout, () {
       if (!mounted) return;
-      if (_isProcessing) {
-        setState(() => _isProcessing = false);
+      if (_isProcessingNotifier.value) {
+        _isProcessingNotifier.value = false;
         _showErrorSnack("Payment timed out. Please try again.");
       }
     });
@@ -229,7 +244,17 @@ class _PaymentPageState extends State<PaymentPage>
   void _stopProcessing() {
     _processingTimeoutTimer?.cancel();
     _processingTimeoutTimer = null;
-    if (mounted) setState(() => _isProcessing = false);
+    if (mounted) _isProcessingNotifier.value = false;
+  }
+
+  // FIX(bug): New helper — cancels the safety-net timeout WITHOUT clearing
+  // _isProcessing. Used at the top of _handlePaymentSuccess so the timeout
+  // can't misfire mid-verification, while the spinner correctly stays up
+  // for the full duration of the server-side verifyPayment call instead of
+  // flashing back to an idle "Get Started" button first.
+  void _cancelProcessingTimeoutOnly() {
+    _processingTimeoutTimer?.cancel();
+    _processingTimeoutTimer = null;
   }
 
   // ── Payment ────────────────────────────────────────────────────────────────
@@ -244,7 +269,7 @@ class _PaymentPageState extends State<PaymentPage>
   // Fix: call the new `createRazorpayOrder` Cloud Function first to get a
   // real order_id from Razorpay's Orders API, then pass that into checkout.
   Future<void> _openCheckout() async {
-    if (_isProcessing) return; // guard against double-tap
+    if (_isProcessingNotifier.value) return; // guard against double-tap
 
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
@@ -312,12 +337,24 @@ class _PaymentPageState extends State<PaymentPage>
   // verify + grant access. Even if someone tampers with this Dart code or
   // calls Firestore directly, they can't grant themselves access without
   // passing verifyPayment's signature check.
+  //
+  // ✅ FIX(bug): This used to call _stopProcessing() as the very first line,
+  // which immediately flipped the button back to its idle "Get Started"
+  // state — while the server-side verifyPayment call (which can take
+  // several seconds) was still in flight. That's the "goes back to the
+  // payment page for a few seconds, then jumps to success" bug: the app
+  // genuinely was showing the idle payment page while waiting on
+  // verification. Now the spinner stays up for the whole verify call —
+  // only the timeout timer is cancelled up front — and _isProcessing is
+  // only cleared in the failure branches (on success the page is replaced
+  // entirely, so there's nothing to reset).
   void _handlePaymentSuccess(PaymentSuccessResponse response) async {
-    _stopProcessing();
+    _cancelProcessingTimeoutOnly();
     if (!mounted) return;
 
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
+      _stopProcessing();
       _showErrorSnack("Session expired. Contact support with payment ID.");
       return;
     }
@@ -377,6 +414,7 @@ class _PaymentPageState extends State<PaymentPage>
       );
     } on FirebaseFunctionsException catch (e) {
       debugPrint('verifyPayment rejected: ${e.code} ${e.message}');
+      _stopProcessing();
       if (!mounted) return;
       // Payment went through on Razorpay's side but server verification
       // failed or the signature didn't match — don't grant access, and
@@ -387,6 +425,7 @@ class _PaymentPageState extends State<PaymentPage>
               "payment ID: $paymentId");
     } catch (e) {
       debugPrint('verifyPayment call error: $e');
+      _stopProcessing();
       if (!mounted) return;
       // Network/timeout — payment likely succeeded but we couldn't confirm.
       // Same reasoning: don't show success, don't lose the payment ID.
@@ -540,16 +579,23 @@ class _PaymentPageState extends State<PaymentPage>
                         SizedBox(height: r.hf(0.045, min: 12, max: 32)),
 
                         // ── Features list ──────────────────────────────────
+                        // FIX(perf): pass the already-computed `r` down
+                        // instead of each _FeatureLabel calling _Resp.of()
+                        // (and therefore MediaQuery.sizeOf()) independently
+                        // — that was 6 redundant lookups + object
+                        // constructions on every single build.
                         Expanded(
                           child: ListView(
                             padding: EdgeInsets.zero,
-                            children: const [
-                              _FeatureLabel("Unlimited access to features"),
-                              _FeatureLabel("Priority customer support"),
-                              _FeatureLabel("All updates included"),
-                              _FeatureLabel("One-time payment, no hidden charges"),
-                              _FeatureLabel("Instant account activation"),
-                              _FeatureLabel("Secure & encrypted transactions"),
+                            children: [
+                              _FeatureLabel("Unlimited access to features", r),
+                              _FeatureLabel("Priority customer support", r),
+                              _FeatureLabel("All updates included", r),
+                              _FeatureLabel(
+                                  "One-time payment, no hidden charges", r),
+                              _FeatureLabel("Instant account activation", r),
+                              _FeatureLabel(
+                                  "Secure & encrypted transactions", r),
                             ],
                           ),
                         ),
@@ -557,75 +603,84 @@ class _PaymentPageState extends State<PaymentPage>
                         SizedBox(height: r.hf(0.015, min: 8, max: 20)),
 
                         // ── CTA button ─────────────────────────────────────
-                        SizedBox(
-                          width: double.infinity,
-                          height: r.btnHeight,
-                          child: ElevatedButton(
-                            onPressed: _isProcessing ? null : _openCheckout,
-                            style: ElevatedButton.styleFrom(
-                              padding: EdgeInsets.zero,
-                              shape: RoundedRectangleBorder(
-                                borderRadius:
-                                BorderRadius.circular(r.btnRadius),
-                              ),
-                              backgroundColor: Colors.transparent,
-                              shadowColor: Colors.transparent,
-                              disabledBackgroundColor: Colors.transparent,
-                              elevation: 0,
-                            ),
-                            child: Ink(
-                              decoration: BoxDecoration(
-                                gradient: const LinearGradient(
-                                  colors: [
-                                    Color(0xFF5800B3),
-                                    Color(0xFF26004D),
-                                  ],
-                                  begin: Alignment.centerLeft,
-                                  end: Alignment.centerRight,
+                        // FIX(perf): isolated to _isProcessingNotifier — only
+                        // this button rebuilds when payment starts/stops
+                        // processing, not the background, illustration, or
+                        // feature list.
+                        ValueListenableBuilder<bool>(
+                          valueListenable: _isProcessingNotifier,
+                          builder: (context, isProcessing, _) => SizedBox(
+                            width: double.infinity,
+                            height: r.btnHeight,
+                            child: ElevatedButton(
+                              onPressed: isProcessing ? null : _openCheckout,
+                              style: ElevatedButton.styleFrom(
+                                padding: EdgeInsets.zero,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius:
+                                  BorderRadius.circular(r.btnRadius),
                                 ),
-                                borderRadius:
-                                BorderRadius.circular(r.btnRadius),
-                                boxShadow: _isProcessing
-                                    ? null
-                                    : [
-                                  BoxShadow(
-                                    color: const Color(0xFF5800B3)
-                                        .withOpacity(0.35),
-                                    blurRadius: 14,
-                                    offset: const Offset(0, 6),
-                                  ),
-                                ],
+                                backgroundColor: Colors.transparent,
+                                shadowColor: Colors.transparent,
+                                disabledBackgroundColor: Colors.transparent,
+                                elevation: 0,
                               ),
-                              child: Container(
-                                alignment: Alignment.center,
-                                child: _isProcessing
-                                    ? const SizedBox(
-                                  height: 22,
-                                  width: 22,
-                                  child: CircularProgressIndicator(
-                                    color: Colors.white,
-                                    strokeWidth: 2,
+                              child: Ink(
+                                decoration: BoxDecoration(
+                                  gradient: const LinearGradient(
+                                    colors: [
+                                      Color(0xFF5800B3),
+                                      Color(0xFF26004D),
+                                    ],
+                                    begin: Alignment.centerLeft,
+                                    end: Alignment.centerRight,
                                   ),
-                                )
-                                    : Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Text(
-                                      "Get Started",
-                                      style: TextStyle(
-                                        fontSize: r.bodySize,
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.w600,
-                                        letterSpacing: 0.3,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    const Icon(
-                                      Icons.arrow_forward_rounded,
-                                      color: Colors.white,
-                                      size: 18,
+                                  borderRadius:
+                                  BorderRadius.circular(r.btnRadius),
+                                  boxShadow: isProcessing
+                                      ? null
+                                      : const [
+                                    BoxShadow(
+                                      // FIX(perf): pre-computed constant
+                                      // colour — no withOpacity()
+                                      // allocation on every build.
+                                      color: Color(0x595800B3),
+                                      blurRadius: 14,
+                                      offset: Offset(0, 6),
                                     ),
                                   ],
+                                ),
+                                child: Container(
+                                  alignment: Alignment.center,
+                                  child: isProcessing
+                                      ? const SizedBox(
+                                    height: 22,
+                                    width: 22,
+                                    child: CircularProgressIndicator(
+                                      color: Colors.white,
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                      : Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        "Get Started",
+                                        style: TextStyle(
+                                          fontSize: r.bodySize,
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.w600,
+                                          letterSpacing: 0.3,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(
+                                        Icons.arrow_forward_rounded,
+                                        color: Colors.white,
+                                        size: 18,
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),
@@ -666,17 +721,17 @@ class _PaymentPageState extends State<PaymentPage>
 }
 
 // ── Feature row ──────────────────────────────────────────────────────────
-// Extracted to a const-friendly StatelessWidget so the ListView in build()
-// doesn't reconstruct identical widget trees every rebuild (e.g. on every
-// fade-animation tick) — cheap win for build performance.
+// FIX(perf): Now takes the parent's already-computed `_Resp` instead of
+// calling `_Resp.of(context)` (MediaQuery.sizeOf + object construction)
+// independently for each of the 6 rows on every build.
 class _FeatureLabel extends StatelessWidget {
-  const _FeatureLabel(this.text);
+  const _FeatureLabel(this.text, this.r);
 
   final String text;
+  final _Resp r;
 
   @override
   Widget build(BuildContext context) {
-    final r = _Resp.of(context);
     return Padding(
       padding: EdgeInsets.symmetric(vertical: r.isSmall ? 7 : 9),
       child: Row(

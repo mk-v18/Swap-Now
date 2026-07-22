@@ -23,27 +23,44 @@ class NotificationService {
   final _localNotifications = FlutterLocalNotificationsPlugin();
   GlobalKey<NavigatorState>? _navigatorKey;
 
-  // FIX: Guard against double-init (hot restart / SplashScreen rebuilds).
   bool _initialized = false;
 
-  // FIX: Active chat suppression — set from ChatScreen via setActiveChatId().
+  // Active chat suppression — set from ChatScreen via setActiveChatId().
   String? _currentChatId;
 
-  // FIX: Reusable HTTP client — avoids creating a new TCP connection per
-  // avatar bitmap load. Closed in dispose().
+  // Reusable HTTP client for avatar bitmap loads. Closed in dispose().
   final _httpClient = http.Client();
 
-  // FIX: Pending cold-start navigation — stores the initial message payload
-  // when getInitialMessage() fires before the widget tree is ready.
+  // Pending cold-start navigation — stores the initial message's data payload
+  // (as JSON) when getInitialMessage() fires before the widget tree is ready.
   // Drained by _drainPendingNavigation() once the navigator is available.
   String? _pendingNavigationPayload;
 
   static const _chatChannelId   = 'chat_messages';
   static const _chatChannelName = 'Chat Messages';
 
-  // FIX: Allowed URL schemes for avatar loading — blocks file://, data://,
-  // and other non-HTTP schemes from a crafted FCM payload (SSRF prevention).
+  // NEW: separate channel for swap-request / accept / decline / exchange
+  // notifications so they don't get grouped visually with chat messages,
+  // and so background/terminated-state deliveries (which use the
+  // channelId set server-side in the FCM payload) land correctly too.
+  static const _swapChannelId   = 'swap_updates';
+  static const _swapChannelName = 'Swap Updates';
+
+  // NEW: the full set of "type" values the swap/exchange Cloud Functions
+  // send. Anything in this set is routed differently from chat messages —
+  // no chatId/senderName/senderPhoto shape, and title/body come from the
+  // FCM `notification` block rather than `data`.
+  static const _swapNotificationTypes = {
+    'swap_request',
+    'swap_accepted',
+    'swap_declined',
+    'exchange_completed',
+    'exchange_cancelled',
+  };
+
   static const _allowedSchemes = {'https', 'http'};
+
+  bool _isSwapType(String type) => _swapNotificationTypes.contains(type);
 
   // ── INIT ──────────────────────────────────────────────────────────────────
   Future<void> init(GlobalKey<NavigatorState> navigatorKey) async {
@@ -51,7 +68,6 @@ class NotificationService {
     _initialized = true;
     _navigatorKey = navigatorKey;
 
-    // ① Request permission
     await _messaging.requestPermission(
       alert:       true,
       badge:       true,
@@ -59,8 +75,7 @@ class NotificationService {
       provisional: false,
     );
 
-    // ② Local notifications plugin
-    const androidSettings = AndroidInitializationSettings('ic_notification'); // was '@mipmap/ic_launcher'
+    const androidSettings = AndroidInitializationSettings('ic_notification');
     const iosSettings     = DarwinInitializationSettings(
       requestAlertPermission: true,
       requestBadgePermission: true,
@@ -72,11 +87,10 @@ class NotificationService {
       onDidReceiveBackgroundNotificationResponse: _onBackgroundNotificationTapped,
     );
 
-    // ③ Android notification channel
-    await _localNotifications
-        .resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(
+    final androidPlugin = _localNotifications
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
+    await androidPlugin?.createNotificationChannel(
       const AndroidNotificationChannel(
         _chatChannelId,
         _chatChannelName,
@@ -88,23 +102,28 @@ class NotificationService {
       ),
     );
 
-    // ④ FCM token — save on init and refresh
+    // NEW: swap/exchange channel.
+    await androidPlugin?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _swapChannelId,
+        _swapChannelName,
+        description:      'Swap request, accept/decline, and exchange notifications',
+        importance:       Importance.max,
+        playSound:        true,
+        enableVibration:  true,
+        showBadge:        true,
+      ),
+    );
+
     await _saveToken();
     _messaging.onTokenRefresh.listen(_updateToken);
 
-    // ⑤ Foreground messages → local notification
     FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
-
-    // ⑥ Background tap (app was running in background)
     FirebaseMessaging.onMessageOpenedApp.listen(_handleNotificationOpen);
 
-    // ⑦ Cold-start tap (app was terminated)
-    // FIX: navigatorKey.currentState is NULL here — the widget tree has not
-    // built yet. Store the payload and drain it once the navigator is ready.
     final initial = await _messaging.getInitialMessage();
     if (initial != null) {
       _pendingNavigationPayload = jsonEncode(initial.data);
-      // Schedule drain after first frame — navigator is guaranteed ready then.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _drainPendingNavigation();
       });
@@ -122,9 +141,6 @@ class NotificationService {
           .collection('users')
           .doc(uid)
           .set({'fcmToken': token}, SetOptions(merge: true));
-      // FIX: use set+merge instead of update — update throws if doc
-      // doesn't exist yet (race on first login before PersonalDetailsPage
-      // writes the doc).
     } catch (e) {
       debugPrint('[Notifications] Token save failed: $e');
     }
@@ -132,7 +148,6 @@ class NotificationService {
 
   Future<void> _updateToken(String token) => _saveToken(token);
 
-  /// Call on logout — removes token so device stops receiving notifications.
   Future<void> clearToken() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
@@ -144,7 +159,6 @@ class NotificationService {
             .update({'fcmToken': FieldValue.delete()}),
         _messaging.deleteToken(),
       ]);
-      // Allow re-init on next login.
       _initialized = false;
     } catch (e) {
       debugPrint('[Notifications] Token clear failed: $e');
@@ -153,21 +167,25 @@ class NotificationService {
 
   // ── FOREGROUND HANDLER ────────────────────────────────────────────────────
   Future<void> _handleForegroundMessage(RemoteMessage message) async {
-    final data        = message.data;
+    final data = message.data;
+    final type = _str(data, 'type', fallback: 'text');
+
+    // NEW: swap/exchange notifications take a completely different shape
+    // (no chatId/senderName — title/body live in message.notification),
+    // so branch them off before touching any of the chat-specific fields.
+    if (_isSwapType(type)) {
+      await _handleSwapForegroundMessage(message, type);
+      return;
+    }
+
     final chatId      = _str(data, 'chatId');
     final senderName  = _str(data, 'senderName',  fallback: 'Someone');
     final senderPhoto = _str(data, 'senderPhoto');
     final body        = _str(data, 'body',         fallback: 'New message');
-    final type        = _str(data, 'type',         fallback: 'text');
 
     if (chatId.isEmpty) return;
-    // Suppress if this chat is already open on screen.
     if (_currentChatId == chatId) return;
 
-    // FIX: Load bitmap in parallel with notification setup — not blocking the
-    // show() call. We fire-and-forget the fetch and show without avatar first,
-    // then update if the image arrives quickly. Simpler: just fetch with a
-    // short timeout so slow avatars don't delay the notification.
     final largeIcon = await _safeFetchBitmap(senderPhoto);
 
     await _showLocalNotification(
@@ -175,25 +193,83 @@ class NotificationService {
       senderName:  senderName,
       senderPhoto: senderPhoto,
       body:        body,
-      type:        type,
       payload:     jsonEncode(data),
       largeIcon:   largeIcon,
     );
   }
 
-  // ── SHOW LOCAL NOTIFICATION ───────────────────────────────────────────────
+  // NEW: shows the local notification for swap_request / swap_accepted /
+  // swap_declined / exchange_completed / exchange_cancelled. Title/body come
+  // from the FCM `notification` block the Cloud Function already set — we
+  // only fall back to a generic title if that's somehow missing (e.g. a
+  // data-only test message).
+  Future<void> _handleSwapForegroundMessage(RemoteMessage message, String type) async {
+    final title = message.notification?.title ?? _swapTitleFor(type);
+    final body  = message.notification?.body  ?? '';
+    final payload = jsonEncode(message.data);
+    final notifId = _swapNotifId(message.data, type);
+
+    final androidDetails = AndroidNotificationDetails(
+      _swapChannelId,
+      _swapChannelName,
+      channelDescription: 'Swap request, accept/decline, and exchange notifications',
+      importance:         Importance.max,
+      priority:           Priority.high,
+      styleInformation:   BigTextStyleInformation(body),
+      color:              const Color(0xFF6A1B9A),
+      icon:               'ic_notification',
+      playSound:          true,
+      enableVibration:    true,
+      when:               DateTime.now().millisecondsSinceEpoch,
+      showWhen:           true,
+    );
+
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert:     true,
+      presentBadge:     true,
+      presentSound:     true,
+      threadIdentifier: 'swap',
+    );
+
+    await _localNotifications.show(
+      notifId,
+      title,
+      body,
+      NotificationDetails(android: androidDetails, iOS: iosDetails),
+      payload: payload,
+    );
+  }
+
+  String _swapTitleFor(String type) {
+    switch (type) {
+      case 'swap_request':        return 'New swap request';
+      case 'swap_accepted':       return 'Request accepted';
+      case 'swap_declined':       return 'Request declined';
+      case 'exchange_completed':  return 'Exchange completed';
+      case 'exchange_cancelled':  return 'Swap cancelled';
+      default:                    return 'Amoeba';
+    }
+  }
+
+  // Stable notif id namespaced by type+id so it can never collide with a
+  // chat notification's chatId-based id, and so e.g. a "declined" and a
+  // later "accepted" push for the same request don't stomp each other.
+  int _swapNotifId(Map<String, dynamic> data, String type) {
+    final id = _str(data, 'requestId').isNotEmpty
+        ? _str(data, 'requestId')
+        : _str(data, 'historyId');
+    return 'swap_${type}_$id'.hashCode & 0x7FFFFFFF;
+  }
+
+  // ── SHOW LOCAL NOTIFICATION (chat) ───────────────────────────────────────
   Future<void> _showLocalNotification({
     required String    chatId,
     required String    senderName,
     required String    senderPhoto,
     required String    body,
-    required String    type,
     required String    payload,
     Uint8List?         largeIcon,
   }) async {
-    // FIX: Use a stable, collision-resistant ID.
-    // hashCode % 100000 has a ~1% collision rate across 10 chats.
-    // Use the full positive hashCode — still fits in a 32-bit int.
     final notifId = chatId.hashCode & 0x7FFFFFFF;
 
     final androidDetails = AndroidNotificationDetails(
@@ -245,13 +321,16 @@ class NotificationService {
     );
   }
 
-  // ── NOTIFICATION TAP → NAVIGATE ───────────────────────────────────────────
+  // ── NOTIFICATION TAP ───────────────────────────────────────────────────────
   void _onNotificationTapped(NotificationResponse response) {
     final payload = response.payload;
     if (payload == null || payload.isEmpty) return;
 
     final actionId = response.actionId;
 
+    // Reply / mark-read actions only ever exist on chat notifications
+    // (swap notifications don't add these actions), so it's safe to check
+    // these first regardless of type.
     if (actionId?.startsWith('reply_') == true) {
       final replyText = response.input?.trim();
       if (replyText != null && replyText.isNotEmpty) {
@@ -265,8 +344,15 @@ class NotificationService {
       return;
     }
 
-    // Default: open the chat screen.
-    _navigateToChat(payload);
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(payload) as Map<String, dynamic>;
+    } catch (e) {
+      debugPrint('[Notifications] Tap payload parse error: $e');
+      return;
+    }
+
+    _routeNotification(data);
   }
 
   void _handleMarkRead(String payload) {
@@ -284,7 +370,7 @@ class NotificationService {
     try {
       final data       = jsonDecode(payload) as Map<String, dynamic>;
       final chatId     = _str(data, 'chatId');
-      final receiverId = _str(data, 'senderId'); // reply TO original sender
+      final receiverId = _str(data, 'senderId');
 
       if (chatId.isEmpty || receiverId.isEmpty) return;
 
@@ -303,11 +389,6 @@ class NotificationService {
           'extra'     : <String, dynamic>{},
           'timestamp' : FieldValue.serverTimestamp(),
           'status'    : 'sent',
-          // FIX: Don't hardcode encrypted:false — omit the field entirely so
-          // the chat screen's own encryption logic applies when it reads it.
-          // A quick reply from the notification shade is unencrypted by design
-          // (no keystore access in the notification handler), so we mark it
-          // explicitly to signal that, rather than silently lying.
           'encrypted' : false,
         }),
         chatRef.update({
@@ -318,7 +399,6 @@ class NotificationService {
         }),
       ]);
 
-      // Cancel the notification we just replied to.
       await cancelChatNotifications(chatId);
     } catch (e) {
       debugPrint('[Notifications] Quick reply error: $e');
@@ -331,14 +411,6 @@ class NotificationService {
       final uid = FirebaseAuth.instance.currentUser?.uid;
       if (uid == null) return;
 
-      // FIX: The original query used where('status', isNotEqualTo: 'seen')
-      // which requires a composite Firestore index that is almost certainly
-      // missing → silent failure on first deploy.
-      //
-      // Safer approach: update the chat-level lastStatus field and use a
-      // Cloud Function or ChatScreen to sweep message statuses.
-      // For the notification action, we only need to clear the badge/tray —
-      // the full status sweep happens when the user opens the chat.
       await FirebaseFirestore.instance
           .collection('chats')
           .doc(chatId)
@@ -352,55 +424,93 @@ class NotificationService {
 
   // ── BACKGROUND / COLD-START OPEN ─────────────────────────────────────────
   void _handleNotificationOpen(RemoteMessage message) {
-    _navigateToChat(jsonEncode(message.data));
+    _routeNotification(message.data);
   }
 
-  // FIX: Drain any navigation that was queued during cold start (when the
-  // navigator was not yet ready). Called from addPostFrameCallback in init().
   void _drainPendingNavigation() {
     final payload = _pendingNavigationPayload;
     if (payload == null) return;
     _pendingNavigationPayload = null;
-    _navigateToChat(payload);
+    try {
+      final data = jsonDecode(payload) as Map<String, dynamic>;
+      _routeNotification(data);
+    } catch (e) {
+      debugPrint('[Notifications] Drain navigation parse error: $e');
+    }
+  }
+
+  // NEW: single entry point that decides where a payload should navigate —
+  // a chat screen for ordinary messages, or the requests/history pages for
+  // swap and exchange updates.
+  void _routeNotification(Map<String, dynamic> data) {
+    final type = _str(data, 'type', fallback: 'text');
+    if (_isSwapType(type)) {
+      _navigateForSwap(type, data);
+    } else {
+      _navigateToChat(data);
+    }
   }
 
   /// Navigate to /chat. Safe to call at any time — guards against null navigator.
-  void _navigateToChat(String payload) {
-    try {
-      final data = jsonDecode(payload) as Map<String, dynamic>;
+  void _navigateToChat(Map<String, dynamic> data) {
+    final chatId      = _str(data, 'chatId');
+    final senderId    = _str(data, 'senderId');
+    final senderName  = _str(data, 'senderName');
+    final senderPhoto = _str(data, 'senderPhoto');
 
-      final chatId      = _str(data, 'chatId');
-      final senderId    = _str(data, 'senderId');
-      final senderName  = _str(data, 'senderName');
-      final senderPhoto = _str(data, 'senderPhoto');
+    if (chatId.isEmpty) {
+      debugPrint('[Notifications] Dropped navigation — chatId missing in payload');
+      return;
+    }
 
-      if (chatId.isEmpty) {
-        debugPrint('[Notifications] Dropped navigation — chatId missing in payload');
-        return;
-      }
+    final nav = _navigatorKey?.currentState;
+    if (nav == null) {
+      _pendingNavigationPayload = jsonEncode(data);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingNavigation());
+      return;
+    }
 
-      final nav = _navigatorKey?.currentState;
-      if (nav == null) {
-        // Navigator not ready yet — queue and retry on next frame.
-        _pendingNavigationPayload = payload;
-        WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingNavigation());
-        return;
-      }
+    nav.pushNamed('/chat', arguments: {
+      'chatId'       : chatId,
+      'receiverId'   : senderId,
+      'receiverName' : senderName,
+      'receiverImage': senderPhoto,
+    });
+  }
 
-      nav.pushNamed('/chat', arguments: {
-        'chatId'       : chatId,
-        'receiverId'   : senderId,
-        'receiverName' : senderName,
-        'receiverImage': senderPhoto,
-      });
-    } catch (e) {
-      debugPrint('[Notifications] Navigate error: $e');
+  // NEW: routes each swap/exchange type to the right screen+tab. We don't
+  // have a receiverId/receiverName/receiverImage in these payloads (only
+  // chatId on the 'accepted' case), so rather than opening ChatScreen with
+  // incomplete data, we land on the Requests page's matching tab — the
+  // user can tap into the chat from there.
+  void _navigateForSwap(String type, Map<String, dynamic> data) {
+    final nav = _navigatorKey?.currentState;
+    if (nav == null) {
+      _pendingNavigationPayload = jsonEncode(data);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingNavigation());
+      return;
+    }
+
+    switch (type) {
+      case 'swap_request':
+        nav.pushNamed('/swap-requests', arguments: {'tab': 0}); // Incoming
+        break;
+      case 'swap_accepted':
+        nav.pushNamed('/swap-requests', arguments: {'tab': 1}); // Active
+        break;
+      case 'swap_declined':
+        nav.pushNamed('/swap-requests', arguments: {'tab': 2}); // Sent
+        break;
+      case 'exchange_completed':
+      case 'exchange_cancelled':
+        nav.pushNamed('/exchange-history');
+        break;
+      default:
+        debugPrint('[Notifications] Unknown swap notification type: $type');
     }
   }
 
   // ── ACTIVE CHAT MANAGEMENT ────────────────────────────────────────────────
-  /// Call from ChatScreen.initState / dispose to suppress notifications
-  /// while the user has that chat open.
   void setActiveChatId(String? chatId) => _currentChatId = chatId;
 
   // ── CANCEL NOTIFICATIONS ──────────────────────────────────────────────────
@@ -412,14 +522,10 @@ class NotificationService {
   }
 
   // ── BITMAP LOADER ─────────────────────────────────────────────────────────
-  /// FIX: Validates URL scheme before making any network request.
-  /// Blocks file://, data://, ftp://, and other non-HTTP schemes from a
-  /// crafted FCM payload. Uses the shared _httpClient for connection reuse.
   Future<Uint8List?> _safeFetchBitmap(String url) async {
     if (url.isEmpty) return null;
     try {
       final uri = Uri.parse(url);
-      // Security: only allow http/https — block file://, data://, etc.
       if (!_allowedSchemes.contains(uri.scheme.toLowerCase())) {
         debugPrint('[Notifications] Blocked non-HTTP avatar URL: ${uri.scheme}');
         return null;
@@ -435,14 +541,12 @@ class NotificationService {
   }
 
   // ── DISPOSE ───────────────────────────────────────────────────────────────
-  /// Call on app shutdown / sign-out to release resources.
   void dispose() {
     _httpClient.close();
     _initialized = false;
   }
 
   // ── HELPERS ───────────────────────────────────────────────────────────────
-  /// Safe string extraction from FCM data map. Never throws.
   String _str(Map<String, dynamic> data, String key, {String fallback = ''}) {
     try {
       final v = data[key];
@@ -452,23 +556,7 @@ class NotificationService {
   }
 }
 
-// ── Background notification tap handler — top-level required ─────────────────
-// FIX: The original was empty — tapping a notification when the app is
-// terminated did nothing. Now we store the payload in a shared preference
-// so _drainPendingNavigation() can pick it up when the app starts.
-//
-// NOTE: This handler runs in a SEPARATE ISOLATE with no access to the
-// singleton's state. The correct pattern is:
-//   1. Store payload to shared_preferences here.
-//   2. In NotificationService.init(), check shared_preferences for a
-//      stored payload and navigate if found.
-//
-// For simplicity — and because getInitialMessage() already covers the
-// FCM-tap-from-terminated case — this handler just logs. The notification
-// tap from a fully-terminated app is handled by getInitialMessage() in init().
 @pragma('vm:entry-point')
 void _onBackgroundNotificationTapped(NotificationResponse response) {
-  // Intentionally minimal — this isolate cannot access singletons.
-  // getInitialMessage() in init() handles the terminated-app tap case.
   debugPrint('[Notifications] Background tap: ${response.payload}');
 }

@@ -1,3 +1,5 @@
+import 'package:credbro/chats/exchange_history_page.dart';
+import 'package:credbro/chats/swap_requests_page.dart';
 import 'package:credbro/pages/chatspage.dart';
 import 'package:credbro/pages/homepage.dart';
 import 'package:credbro/pages/profilepage_screen.dart';
@@ -114,6 +116,7 @@ class _BottomNavigationState extends State<BottomNavigation> {
     "assets/icons/home.svg",
     "assets/icons/chat.svg",
     "assets/icons/add.svg",
+    "assets/icons/request.svg",
     "assets/icons/user.svg",
   ];
 
@@ -121,6 +124,7 @@ class _BottomNavigationState extends State<BottomNavigation> {
     "Home",
     "Chats",
     "Add",
+    "Requests",
     "Profile",
   ];
 
@@ -134,6 +138,7 @@ class _BottomNavigationState extends State<BottomNavigation> {
       const HomePage(),
       ChatsPage(),
       const UserProductListingPage(),
+      const SwapRequestsPage(),
       const ProfilePageScreen(),
     ];
   }

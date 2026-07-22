@@ -34,6 +34,11 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
   OverlayEntry?    _overlayEntry;
 
   List<String> _suggestions           = [];
+  // FIX(gap): suggestion taps previously discarded coordinates entirely
+  // (nulled them out), even though this page otherwise stores lat/lng.
+  // That meant only GPS-detected ads had coordinates — anything picked
+  // from the autocomplete list silently lost them.
+  List<Map<String, double>?> _suggestionCoords = [];
   Timer?       _debounce;
   bool         _isFetchingSuggestions = false;
 
@@ -118,7 +123,7 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
                     top:    isFirst ? const Radius.circular(12) : Radius.zero,
                     bottom: isLast  ? const Radius.circular(12) : Radius.zero,
                   ),
-                  onTap: () => _selectSuggestion(_suggestions[i]),
+                  onTap: () => _selectSuggestion(i),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 14, vertical: 11),
@@ -149,6 +154,9 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
 
   // ── Nominatim autocomplete ─────────────────────────────────────────────────
   void _onLocationChanged(String value) {
+    // FIX(gap): manual edits invalidate previously captured coordinates.
+    _latitude = null;
+    _longitude = null;
     _debounce?.cancel();
     if (value.trim().length < 3) {
       setState(() => _suggestions = []);
@@ -174,27 +182,38 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
         setState(() {
           _suggestions =
               data.map<String>((e) => e['display_name'] as String).toList();
+          // FIX(gap): capture each suggestion's coordinates from Nominatim.
+          _suggestionCoords = data.map<Map<String, double>?>((e) {
+            final lat = double.tryParse(e['lat']?.toString() ?? '');
+            final lon = double.tryParse(e['lon']?.toString() ?? '');
+            if (lat == null || lon == null) return null;
+            return {'lat': lat, 'lng': lon};
+          }).toList();
         });
         _showOverlay();
       } else {
-        setState(() => _suggestions = []);
+        setState(() { _suggestions = []; _suggestionCoords = []; });
         _removeOverlay();
       }
     } catch (_) {
-      setState(() => _suggestions = []);
+      setState(() { _suggestions = []; _suggestionCoords = []; });
       _removeOverlay();
     } finally {
       setState(() => _isFetchingSuggestions = false);
     }
   }
 
-  void _selectSuggestion(String suggestion) {
+  void _selectSuggestion(int index) {
+    if (index < 0 || index >= _suggestions.length) return;
+    final suggestion = _suggestions[index];
     final parts = suggestion.split(',').map((s) => s.trim()).toList();
+    final coords = index < _suggestionCoords.length ? _suggestionCoords[index] : null;
     _locationController.text = parts.take(3).join(', ');
-    _latitude  = null;
-    _longitude = null;
+    // FIX(gap): keep the coordinates instead of nulling them on selection.
+    _latitude  = coords?['lat'];
+    _longitude = coords?['lng'];
     _locationFocusNode.unfocus();
-    setState(() => _suggestions = []);
+    setState(() { _suggestions = []; _suggestionCoords = []; });
     _removeOverlay();
   }
 
@@ -230,6 +249,7 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
           _locationController.text =
           '${p.locality}, ${p.administrativeArea}, ${p.country}';
           _suggestions = [];
+          _suggestionCoords = [];
         });
       }
     } catch (_) {
@@ -390,6 +410,8 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
         initialAdSize: data['adSize'] as String?,
         initialLocation: data['location'] as String? ?? '',
         initialDuration: data['duration'] as String? ?? '7 days',
+        initialLatitude: (data['latitude'] as num?)?.toDouble(),
+        initialLongitude: (data['longitude'] as num?)?.toDouble(),
         adSizeOptions: adSizeOptions,
         durationDays: _durationDays,
         onSave: _saveEditedAd,
@@ -415,9 +437,13 @@ class _AdvertisementPageState extends State<AdvertisementPage> {
         'location': location,
         'duration': duration,
         'expiresAt': expiresAt,
+        // FIX(gap): write coordinates (including clearing them to null when
+        // the user manually edited the text without reselecting) instead of
+        // only conditionally including them, which used to leave stale
+        // lat/lng from a previous location attached to the new text.
+        'latitude': latitude,
+        'longitude': longitude,
       };
-      if (latitude != null) updateData['latitude'] = latitude;
-      if (longitude != null) updateData['longitude'] = longitude;
 
       await FirebaseFirestore.instance.collection('ads').doc(doc.id).update(updateData);
       _showSnack('Ad updated');
@@ -1219,6 +1245,13 @@ class _EditAdSheet extends StatefulWidget {
   final String? initialAdSize;
   final String initialLocation;
   final String initialDuration;
+  // FIX(gap): the edit sheet never received the ad's existing coordinates,
+  // so re-saving an ad without touching location silently wiped lat/lng
+  // (previously they simply weren't included in the update at all, which
+  // masked this — now that the parent always writes lat/lng, the sheet
+  // needs to know the starting values to avoid nulling them by default).
+  final double? initialLatitude;
+  final double? initialLongitude;
   final List<Map<String, dynamic>> adSizeOptions;
   final Map<String, int> durationDays;
   final Future<void> Function({
@@ -1235,6 +1268,8 @@ class _EditAdSheet extends StatefulWidget {
     required this.initialAdSize,
     required this.initialLocation,
     required this.initialDuration,
+    this.initialLatitude,
+    this.initialLongitude,
     required this.adSizeOptions,
     required this.durationDays,
     required this.onSave,
@@ -1257,6 +1292,7 @@ class _EditAdSheetState extends State<_EditAdSheet> {
   OverlayEntry? _overlayEntry;
   Timer? _debounce;
   List<String> _suggestions = [];
+  List<Map<String, double>?> _suggestionCoords = [];
   bool _isFetchingSuggestions = false;
   bool _isDetectingLocation = false;
   double? _latitude;
@@ -1268,6 +1304,10 @@ class _EditAdSheetState extends State<_EditAdSheet> {
     _adSize = widget.initialAdSize;
     _duration = widget.initialDuration;
     _locationController = TextEditingController(text: widget.initialLocation);
+    // FIX(gap): preload the ad's existing coordinates so an unrelated edit
+    // (e.g. just changing the ad size) doesn't erase them on save.
+    _latitude = widget.initialLatitude;
+    _longitude = widget.initialLongitude;
     _locationFocusNode.addListener(() {
       if (!_locationFocusNode.hasFocus) _removeOverlay();
     });
@@ -1317,7 +1357,7 @@ class _EditAdSheetState extends State<_EditAdSheet> {
                     top: isFirst ? const Radius.circular(12) : Radius.zero,
                     bottom: isLast ? const Radius.circular(12) : Radius.zero,
                   ),
-                  onTap: () => _selectSuggestion(_suggestions[i]),
+                  onTap: () => _selectSuggestion(i),
                   child: Padding(
                     padding:
                     const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
@@ -1347,6 +1387,9 @@ class _EditAdSheetState extends State<_EditAdSheet> {
   }
 
   void _onLocationChanged(String value) {
+    // FIX(gap): manual edits invalidate previously loaded/selected coordinates.
+    _latitude = null;
+    _longitude = null;
     _debounce?.cancel();
     if (value.trim().length < 3) {
       setState(() => _suggestions = []);
@@ -1373,28 +1416,39 @@ class _EditAdSheetState extends State<_EditAdSheet> {
         setState(() {
           _suggestions =
               data.map<String>((e) => e['display_name'] as String).toList();
+          // FIX(gap): capture each suggestion's coordinates.
+          _suggestionCoords = data.map<Map<String, double>?>((e) {
+            final lat = double.tryParse(e['lat']?.toString() ?? '');
+            final lon = double.tryParse(e['lon']?.toString() ?? '');
+            if (lat == null || lon == null) return null;
+            return {'lat': lat, 'lng': lon};
+          }).toList();
         });
         _showOverlay();
       } else {
-        setState(() => _suggestions = []);
+        setState(() { _suggestions = []; _suggestionCoords = []; });
         _removeOverlay();
       }
     } catch (_) {
       if (!mounted) return;
-      setState(() => _suggestions = []);
+      setState(() { _suggestions = []; _suggestionCoords = []; });
       _removeOverlay();
     } finally {
       if (mounted) setState(() => _isFetchingSuggestions = false);
     }
   }
 
-  void _selectSuggestion(String suggestion) {
+  void _selectSuggestion(int index) {
+    if (index < 0 || index >= _suggestions.length) return;
+    final suggestion = _suggestions[index];
     final parts = suggestion.split(',').map((s) => s.trim()).toList();
+    final coords = index < _suggestionCoords.length ? _suggestionCoords[index] : null;
     _locationController.text = parts.take(3).join(', ');
-    _latitude = null;
-    _longitude = null;
+    // FIX(gap): keep the coordinates instead of nulling them on selection.
+    _latitude = coords?['lat'];
+    _longitude = coords?['lng'];
     _locationFocusNode.unfocus();
-    setState(() => _suggestions = []);
+    setState(() { _suggestions = []; _suggestionCoords = []; });
     _removeOverlay();
   }
 
@@ -1429,6 +1483,7 @@ class _EditAdSheetState extends State<_EditAdSheet> {
           _locationController.text =
           '${p.locality}, ${p.administrativeArea}, ${p.country}';
           _suggestions = [];
+          _suggestionCoords = [];
         });
       }
     } catch (_) {

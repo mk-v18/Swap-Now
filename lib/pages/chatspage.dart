@@ -3,6 +3,7 @@ import 'package:credbro/chats/chatservice.dart';
 import 'package:credbro/custom_loader.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/svg.dart';
 import 'package:intl/intl.dart';
 import '../chats/chatscreen.dart';
 
@@ -234,7 +235,7 @@ class _ChatsPageState extends State<ChatsPage> {
     final rl = _RL(MediaQuery.of(context).size.width);
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF7F7F7),
+      backgroundColor: const Color(0xFFF8F8F8),
       appBar: AppBar(
         scrolledUnderElevation: 0,
         backgroundColor: Colors.white,
@@ -267,13 +268,27 @@ class _ChatsPageState extends State<ChatsPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.chat_bubble_outline,
-                      size: rl.emptyIconSize, color: Colors.grey[300]),
-                  const SizedBox(height: 10),
-                  Text('No chats yet',
-                      style: TextStyle(
-                          color: Colors.grey[400],
-                          fontSize: rl.emptyFontSize)),
+                  SvgPicture.asset(
+                    'assets/images/empty_chats.svg',
+                    width: rl.emptyIconSize,
+                    height: rl.emptyIconSize,
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'No chats yet',
+                    style: TextStyle(
+                      color: Colors.grey[400],
+                      fontSize: rl.emptyFontSize,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Start a conversation to see it here',
+                    style: TextStyle(
+                      color: Colors.grey[350] ?? Colors.grey[300],
+                      fontSize: (rl.emptyFontSize ?? 14) * 0.75,
+                    ),
+                  ),
                 ],
               ),
             );

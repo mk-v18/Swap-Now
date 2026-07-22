@@ -337,7 +337,7 @@ class _WishlistPageState extends State<WishlistPage> {
                         context,
                         MaterialPageRoute(
                           builder: (_) =>
-                              UserProductDetailsPage(productData: data),
+                              UserProductDetailsPage(productId: productId, productData: data),
                         ),
                       ),
                       // RELIABILITY: no-op when already removing (VoidCallback

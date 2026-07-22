@@ -16,6 +16,8 @@ rules_version = '2';
 //   help_queries/{id}                  support tickets, userId
 //   referrals/{code}                   referral codes, joinedUsers counter
 //   reports/{id}                       user-submitted reports on other users
+//   swapRequests/{id}                  fromUserId/toUserId + participants: [both]
+//   exchangeHistory/{id}               participants: [both]
 //
 // CHANGE LOG:
 //   - Added `hasPaid` to the users/{uid} update guard, alongside the
@@ -25,6 +27,72 @@ rules_version = '2';
 //     compromised app build. onboardingStep is left untouched since it may
 //     still be written from other onboarding screens — revisit once that's
 //     confirmed.
+//   - swapRequests now stores a `participants: [fromUserId, toUserId]` array
+//     on create, and the read/update rules key off that array instead of
+//     fromUserId/toUserId directly. This is required because
+//     acceptedRequestsForProduct() queries by listedProduct.id + status only
+//     (it can't OR two different-field equality filters), and Firestore can
+//     only authorize a list query when the rule's condition is provable from
+//     the query's own filters. A rule based on fromUserId==uid||toUserId==uid
+//     is not provable from a query that doesn't filter on either field, so it
+//     was rejected outright with PERMISSION_DENIED. The query now includes
+//     `.where('participants', arrayContains: uid)`, and the rule below checks
+//     `request.auth.uid in resource.data.participants` — same field on both
+//     sides, so Firestore can verify it upfront.
+//
+//   - SECURITY FIXES (previous revision):
+//     1. swapRequests.update: previously either participant could set
+//        `status` to anything, including fromUserId "self-accepting" their
+//        own request. Now only toUserId may move a pending request to
+//        accepted/declined; once accepted, status itself is frozen and only
+//        chatId/respondedAt/completedAt-style metadata may still change.
+//     2. chats.update: previously participants[] itself was writable via the
+//        same rule that allows lastMessage/timestamp updates, so a
+//        participant could rewrite the array (e.g. drop the other user, or
+//        add a third party). participants[] is now frozen after create.
+//     3. messages.update: previously any participant could rewrite ANY field
+//        of ANY message in the chat, including ones sent by the other
+//        person (text, fileUrl, senderId, encrypted — everything). This is
+//        now restricted to only ever touching the `status` field, which is
+//        all markMessagesAsSeen()/admin seen-tracking actually needs.
+//     4. UserProductList.update/delete: banned users could still edit or
+//        delete their own existing listings even though they're blocked
+//        from creating new ones. Added the same !isBanned() guard.
+//     5. referrals.update: NOTE — the joinedUsers += 1 transaction still has
+//        no replay protection (nothing stops one account from re-running
+//        the increment). A proper fix needs a companion
+//        referrals/{code}/joinedBy/{uid} doc that's created once per user
+//        and checked for non-existence before allowing the increment — left
+//        as a follow-up since it requires a matching client-side change to
+//        write that doc, which isn't visible from these rules alone.
+//
+//   - ADMIN CHAT ACCESS (this revision):
+//     The app reuses ChatScreen for the admin panel to open and moderate any
+//     user-to-user chat (see getAllChats(), getUnseenCountAdmin(),
+//     markAllMessagesAsSeenAdmin() in ChatService — none of that makes sense
+//     unless admins can also read/update chats they aren't a participant of).
+//     Previously chats.read, messages.read, and messages.update all required
+//     request.auth.uid to be in participants, with no admin branch — so an
+//     admin opening a chat from the moderation panel hit PERMISSION_DENIED on
+//     the chat doc listener, the messages listener, AND the plain
+//     markMessagesAsSeen() query that ChatScreen.initState() always fires.
+//     Added `|| isAdmin()` to:
+//       - chats.read
+//       - chats.update (still can't touch participants[], see below)
+//       - messages.read
+//       - messages.update (still status-only, see below)
+//     Deliberately NOT added to:
+//       - chats.create / chats.delete — admins shouldn't be originating chats
+//         from this rule set, and deleting a chat out from under two users is
+//         a bigger action than moderation needs; add isAdmin() here too if a
+//         "delete chat" admin action gets built.
+//       - messages.create / messages.delete — same reasoning; admins acting
+//         as a participant (sending/deleting messages) isn't a modeled use
+//         case here.
+//     chats.update keeps the participants[]-frozen guard for BOTH branches
+//     (participant and admin), so this doesn't reopen the fix from item 2
+//     above. messages.update keeps the status-only guard for both branches
+//     too, so it doesn't reopen the fix from item 3 above.
 // ============================================================================
 
 service cloud.firestore {
@@ -44,12 +112,13 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isSignedIn() && userData(request.auth.uid).role == 'admin';
+      return isSignedIn() && userData(request.auth.uid).get('role', '') == 'admin';
     }
 
     function isBanned() {
       return isSignedIn() && userData(request.auth.uid).get('banned', false) == true;
     }
+
 
     // ---------------- users ----------------
     match /users/{uid} {
@@ -91,40 +160,57 @@ service cloud.firestore {
         && !isBanned()
         && request.resource.data.userId == request.auth.uid;
 
+      // FIX: banned users could previously still edit/delete their own
+      // existing listings even though blocked from creating new ones.
+      // Admins are unaffected by the ban check (they need to be able to
+      // moderate/remove listings regardless of the owner's ban status).
       allow update, delete: if isAdmin()
-        || (isSignedIn() && resource.data.userId == request.auth.uid);
+        || (isSignedIn() && !isBanned() && resource.data.userId == request.auth.uid);
     }
 
     // ---------------- chats ----------------
-    match /chats/{chatId} {
-      allow read, update: if isSignedIn()
-        && request.auth.uid in resource.data.participants;
+// ---------------- chats ----------------
+match /chats/{chatId} {
+  // resource == null covers the "doc doesn't exist yet" case — e.g.
+  // ChatService.getOrCreateChat()'s initial ref.get() check, or a
+  // presence/typing listener that attaches before the chat doc is
+  // written. Without this, reading a not-yet-created doc was reported
+  // as PERMISSION_DENIED (rules have no separate "not found" outcome),
+  // which is what broke Accept.
+  allow read: if isSignedIn()
+    && (resource == null
+        || request.auth.uid in resource.data.participants
+        || isAdmin());
 
-      allow create: if isSignedIn()
-        && request.auth.uid in request.resource.data.participants
-        && request.resource.data.participants.size() == 2;
+  allow create: if isSignedIn()
+    && request.auth.uid in request.resource.data.participants
+    && request.resource.data.participants.size() == 2;
 
-      // Either participant can delete the chat (matches deleteChat()).
-      allow delete: if isSignedIn()
-        && request.auth.uid in resource.data.participants;
+  allow update: if isSignedIn()
+    && (request.auth.uid in resource.data.participants || isAdmin())
+    && request.resource.data.participants == resource.data.participants;
 
-      match /messages/{messageId} {
-        function inChat() {
-          return request.auth.uid in
-            get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
-        }
+  allow delete: if isSignedIn()
+    && request.auth.uid in resource.data.participants;
 
-        allow read: if isSignedIn() && inChat();
-
-        allow create: if isSignedIn() && inChat()
-          && request.resource.data.senderId == request.auth.uid;
-
-        // Needed for markMessagesAsSeen()/status updates by the other participant.
-        allow update: if isSignedIn() && inChat();
-
-        allow delete: if isSignedIn() && inChat();
-      }
+  match /messages/{messageId} {
+    function inChat() {
+      return request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
     }
+
+    allow read: if isSignedIn() && (inChat() || isAdmin());
+
+    allow create: if isSignedIn()
+      && inChat()
+      && request.resource.data.senderId == request.auth.uid;
+
+    allow update: if isSignedIn()
+      && (inChat() || isAdmin())
+      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
+
+    allow delete: if isSignedIn() && inChat();
+  }
+}
 
     // ---------------- payments ----------------
     // NOTE: these are written directly by the client after a Razorpay
@@ -149,26 +235,36 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // ---------------- AdRequests (user-submitted ad requests) ----------------
-    match /AdRequests/{uid} {
-      allow read, write: if false; // parent doc is never written directly
+// ---------------- AdRequests (user-submitted ad requests) ----------------
+match /AdRequests/{uid} {
+  allow read, write: if false; // parent doc is never written directly
 
-      match /ads/{adId} {
-        allow read: if isAdmin() || isOwner(uid);
+  match /ads/{adId} {
+    allow read: if isAdmin() || isOwner(uid);
 
-        allow create: if isOwner(uid)
-          && request.resource.data.uid == uid
-          && request.resource.data.status == 'pending';
+    allow create: if isOwner(uid)
+      && request.resource.data.uid == uid
+      && request.resource.data.status == 'pending';
 
-        // Owner can edit their own pending request; only admin can change status.
-        allow update: if isAdmin()
-          || (isOwner(uid)
-              && request.resource.data.uid == resource.data.uid
-              && request.resource.data.status == resource.data.status);
+    allow update: if isAdmin()
+      || (isOwner(uid)
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.status == resource.data.status);
 
-        allow delete: if isAdmin() || isOwner(uid);
-      }
-    }
+    allow delete: if isAdmin() || isOwner(uid);
+  }
+}
+
+// Collection-group access: AdResponsesPage's admin view runs
+// collectionGroup('ads'), which scans every ads subcollection regardless
+// of parent path. The nested rule above only applies to reads scoped to
+// one exact AdRequests/{uid}/ads path — it does NOT cover a
+// collectionGroup query. This rule exists purely to authorize that scan.
+// Kept read-only and admin-only: writes still only ever happen through
+// the nested path above, so this doesn't loosen anything else.
+match /{path=**}/ads/{adId} {
+  allow read: if isAdmin();
+}
 
     // ---------------- help_queries ----------------
     match /help_queries/{id} {
@@ -195,6 +291,13 @@ service cloud.firestore {
 
       // Allow the signup flow's counter-increment transaction, but lock down
       // every other field so a user can't rewrite the referral itself.
+      //
+      // KNOWN LIMITATION (see CHANGE LOG above): this does not stop the same
+      // account from replaying the increment multiple times. Proper replay
+      // protection needs a companion referrals/{code}/joinedBy/{uid} doc
+      // written once per user and checked here for non-existence — not
+      // added yet since it requires a matching client-side change to write
+      // that doc.
       allow update: if isAdmin()
         || (
           isSignedIn()
@@ -208,6 +311,78 @@ service cloud.firestore {
     match /reports/{id} {
       allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
       allow read, update, delete: if isAdmin();
+    }
+
+// ---------------- swapRequests ----------------
+    match /swapRequests/{requestId} {
+      // Three different client queries hit this collection, each filtering
+      // on a different field (incomingRequests: toUserId+status,
+      // sentRequests: fromUserId, acceptedRequestsForProduct: participants
+      // arrayContains). Firestore can only authorize a list query when the
+      // rule is provable from that query's own filter, so each of the three
+      // is OR'd in here as its own branch — the query then proves itself via
+      // whichever branch matches its filter. Don't collapse this back down
+      // to just the participants check, even though participants always
+      // contains both fromUserId and toUserId — the OR-branches are what
+      // make fromUserId==uid and toUserId==uid queries provable on their own.
+      allow read: if request.auth != null &&
+        (resource.data.fromUserId == request.auth.uid ||
+         resource.data.toUserId == request.auth.uid ||
+         request.auth.uid in resource.data.participants);
+
+      allow create: if request.auth != null &&
+        request.resource.data.fromUserId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.participants ==
+          [request.resource.data.fromUserId, request.resource.data.toUserId];
+
+      // FIX: previously either participant could set `status` to anything,
+      // which let fromUserId "self-accept" their own request. Status
+      // transitions are now an explicit whitelist:
+      //   pending    -> accepted / declined   (toUserId only — the actual
+      //                                         decision-maker)
+      //   accepted   -> accepted              (either participant, metadata
+      //                                         only — chatId/respondedAt)
+      //   accepted   -> completed / cancelled (either participant — this is
+      //                                         the "Successful" / "Cancel
+      //                                         Swap" actions from the
+      //                                         Active tab; previously
+      //                                         missing entirely, which is
+      //                                         what caused
+      //                                         markExchangeSuccessful() and
+      //                                         cancelSwap() to fail with
+      //                                         PERMISSION_DENIED)
+      // Server-authoritative fields (fromUserId/toUserId/listedProduct/
+      // participants) remain locked across every branch, same as before.
+      allow update: if request.auth != null &&
+        request.auth.uid in resource.data.participants &&
+        request.resource.data.fromUserId == resource.data.fromUserId &&
+        request.resource.data.toUserId == resource.data.toUserId &&
+        request.resource.data.participants == resource.data.participants &&
+        (
+          (request.auth.uid == resource.data.toUserId
+            && resource.data.status == 'pending'
+            && request.resource.data.status in ['accepted', 'declined'])
+          || (resource.data.status == 'accepted'
+              && request.resource.data.status == 'accepted')
+          || (resource.data.status == 'accepted'
+              && request.resource.data.status in ['completed', 'cancelled'])
+        );
+
+      allow delete: if false;
+    }
+
+    match /exchangeHistory/{historyId} {
+      allow read: if request.auth != null &&
+        request.auth.uid in resource.data.participants;
+
+      allow create: if request.auth != null &&
+        request.auth.uid in request.resource.data.participants &&
+        request.resource.data.completedBy == request.auth.uid;
+
+      // Immutable once written — it's a factual record.
+      allow update: if false;
+      allow delete: if false;
     }
 
     // ---------------- default deny ----------------

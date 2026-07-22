@@ -1,6 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:credbro/admin%20panel/ad_response.dart';
-import 'package:credbro/custom_loader.dart';
+import 'package:credbro/chats/exchange_history_page.dart';
 import 'package:credbro/help/help_center.dart';
 import 'package:credbro/pages/payments_details.dart';
 import 'package:credbro/pages/profilepage.dart';
@@ -56,8 +56,118 @@ class _ProfilePageScreenState extends State<ProfilePageScreen> {
       );
   }
 
+  Future<void> _confirmLogout() async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      barrierColor: Colors.black.withOpacity(0.45),
+      builder: (dialogContext) {
+        return Dialog(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.white,
+          elevation: 8,
+          insetPadding: const EdgeInsets.symmetric(horizontal: 32),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 28, 24, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF3B30).withOpacity(0.09),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.logout_rounded,
+                      color: Color(0xFFFF3B30), size: 26),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  "Logout",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: Color(0xFF1A1A2E),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  "Are you sure you want to logout of your account?",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    color: Colors.grey.shade600,
+                    fontWeight: FontWeight.w400,
+                    height: 1.4,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () =>
+                            Navigator.of(dialogContext).pop(false),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF1A1A2E),
+                          backgroundColor: Colors.white,
+                          side: BorderSide(color: Colors.grey.shade300),
+                          padding: const EdgeInsets.symmetric(vertical: 13),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        child: const Text(
+                          "Cancel",
+                          style: TextStyle(
+                              fontWeight: FontWeight.w600, fontSize: 14),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () =>
+                            Navigator.of(dialogContext).pop(true),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFFF3B30),
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          padding: const EdgeInsets.symmetric(vertical: 13),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        child: const Text(
+                          "Logout",
+                          style: TextStyle(
+                              fontWeight: FontWeight.w600, fontSize: 14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (confirmed == true) {
+      await _logout();
+    }
+  }
+
   Future<void> _logout() async {
     await FirebaseAuth.instance.signOut();
+    if (!mounted) return;
     _showSuccessSnack("Logout successful");
     await Future.delayed(const Duration(milliseconds: 1500));
     if (!mounted) return;
@@ -208,13 +318,13 @@ class _ProfilePageScreenState extends State<ProfilePageScreen> {
                               context,
                               MaterialPageRoute(
                                   builder: (_) => const ProfilePage()))),
-                      _tile(Icons.shopping_cart_outlined, "Want to Advertise?",
+                      _tile(Icons.campaign_outlined, "Want to Advertise?",
                           size: size,
                           onTap: () => Navigator.push(
                               context,
                               MaterialPageRoute(
                                   builder: (_) => const WantToAdvertisePage()))),
-                      _tile(Icons.shopping_cart_outlined, "Advertisement Responses",
+                      _tile(Icons.inventory_2_outlined, "Advertisements",
                           size: size,
                           onTap: () => Navigator.push(
                               context,
@@ -234,6 +344,13 @@ class _ProfilePageScreenState extends State<ProfilePageScreen> {
                               MaterialPageRoute(
                                   builder: (_) =>
                                   const MyProductsPage()))),
+                      _tile(Icons.history_outlined, "Exchange History",
+                          size: size,
+                          onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) =>
+                                  const ExchangeHistoryPage()))),
                       _tile(Icons.favorite_outline, "Wishlist",
                           size: size,
                           onTap: () => Navigator.push(
@@ -276,7 +393,7 @@ class _ProfilePageScreenState extends State<ProfilePageScreen> {
                       _tile(Icons.logout, "Logout",
                           size: size,
                           isDestructive: true,
-                          onTap: _logout),
+                          onTap: _confirmLogout),
 
                       const SizedBox(height: 16),
                     ],

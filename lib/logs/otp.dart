@@ -26,6 +26,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   static const _purpleShadow    = Color(0x4D5800B3); // ~30% opacity
   static const _purpleBoxShadow = Color(0x0F5800B3); // ~6%  opacity
 
+  // FIX(perf): compiled once instead of on every call to _sendOtp /
+  // _fillBoxesVisually (each of which can fire multiple times per OTP flow).
+  static final RegExp _nonDigits = RegExp(r'\D');
+
   // ── Firebase ──────────────────────────────────────────────────────────────
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
@@ -47,8 +51,14 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   bool   _isVerifying    = false;
   bool   _otpSent        = false;
   int?   _resendToken;
-  int    _resendCooldown = 0;
   Timer? _resendTimer;
+
+  // FIX(perf): This used to be a plain int updated via setState() every
+  // second from the resend-cooldown Timer, which reran the ENTIRE page
+  // build() (MediaQuery reads, layout math, hero image, every text widget)
+  // once a second for up to 30 seconds after every OTP send. Now it's a
+  // ValueNotifier so only the tiny "Resend OTP in Ns" text rebuilds.
+  final ValueNotifier<int> _resendCooldownNotifier = ValueNotifier<int>(0);
 
   bool _verificationInFlight = false;
 
@@ -118,6 +128,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     _resendTimer?.cancel();
     _slideCtrl.dispose();
     _codeNotifier.dispose();
+    _resendCooldownNotifier.dispose();
     TextInput.finishAutofillContext(shouldSave: false);
     super.dispose();
   }
@@ -220,7 +231,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   /// verification afterwards.
   void _fillBoxesVisually(String digits) {
     if (!mounted) return;
-    final clean = digits.replaceAll(RegExp(r'\D'), '');
+    final clean = digits.replaceAll(_nonDigits, '');
     if (clean.length != 6) return;
     for (int i = 0; i < 6; i++) {
       _otpControllers[i].value = TextEditingValue(
@@ -232,19 +243,24 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     TextInput.finishAutofillContext();
   }
 
+  // FIX(perf): Ticks a ValueNotifier instead of calling setState() every
+  // second. Previously this rebuilt the entire page (MediaQuery lookups,
+  // layout math, hero image, all text) once a second for up to 30 seconds
+  // straight — by far the biggest perf cost in this screen.
   void _startResendTimer() {
-    _resendCooldown = 30;
+    _resendCooldownNotifier.value = 30;
     _resendTimer?.cancel();
     _resendTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       if (!mounted) {
         t.cancel();
         return;
       }
-      if (_resendCooldown <= 1) {
+      final next = _resendCooldownNotifier.value - 1;
+      if (next <= 0) {
         t.cancel();
-        setState(() => _resendCooldown = 0);
+        _resendCooldownNotifier.value = 0;
       } else {
-        setState(() => _resendCooldown--);
+        _resendCooldownNotifier.value = next;
       }
     });
   }
@@ -271,7 +287,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   // ── Send OTP ──────────────────────────────────────────────────────────────
   Future<void> _sendOtp({bool isResend = false}) async {
-    final phone = _phoneController.text.trim().replaceAll(RegExp(r'\D'), '');
+    final phone = _phoneController.text.trim().replaceAll(_nonDigits, '');
 
     if (!_isValidIndianNumber(phone)) {
       _showErrorSnack('Please enter a valid 10-digit Indian mobile number.');
@@ -422,7 +438,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   // ── Resend OTP ────────────────────────────────────────────────────────────
   Future<void> _resendOtp() async {
-    if (_resendCooldown > 0) return;
+    if (_resendCooldownNotifier.value > 0) return;
     for (final c in _otpControllers) c.clear();
     _lastAttemptedCode = '';
     _focusNodes[0].requestFocus();
@@ -432,7 +448,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   // ── Back to phone screen ──────────────────────────────────────────────────
   void _goBackToPhone() {
     _resendTimer?.cancel();
-    _resendCooldown = 0;
+    _resendCooldownNotifier.value = 0;
 
     _slideCtrl.reverse().then((_) {
       if (!mounted) return;
@@ -504,7 +520,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
               // get out of sync with what the controllers actually contain.
               onChanged: (value) {
                 if (value.length > 1) {
-                  final digits = value.replaceAll(RegExp(r'\D'), '');
+                  final digits = value.replaceAll(_nonDigits, '');
                   if (digits.length == 6) {
                     _fillBoxesVisually(digits);
                     return;
@@ -537,9 +553,17 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   // ── Build ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final mq      = MediaQuery.of(context);
-    final screenW = mq.size.width;
-    final screenH = mq.size.height;
+    // FIX(perf): Split MediaQuery.of(context) into scoped aspect accessors.
+    // MediaQuery.of() ties this whole build() to EVERY MediaQuery field
+    // (size, viewInsets, padding, textScale, gestureSettings, ...), so any
+    // unrelated change (e.g. system text-scale, a padding tweak from a
+    // status-bar animation) would rebuild this whole page. The `*Of()`
+    // accessors scope the dependency to just that one field.
+    final screenSize        = MediaQuery.sizeOf(context);
+    final screenW           = screenSize.width;
+    final screenH           = screenSize.height;
+    final viewInsetsBottom  = MediaQuery.viewInsetsOf(context).bottom;
+    final devicePixelRatio  = MediaQuery.devicePixelRatioOf(context);
 
     final hPad  = screenW < 380 ? 16.0 : 22.0;
     final heroH = screenH < 680
@@ -594,7 +618,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                       child: Image.asset(
                         'assets/images/signup-image.png',
                         height:     heroH,
-                        cacheWidth: (screenW * mq.devicePixelRatio).toInt(),
+                        cacheWidth: (screenW * devicePixelRatio).toInt(),
                       ),
                     ),
 
@@ -834,6 +858,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
                             const SizedBox(height: 20),
 
+                            // FIX(perf): This used to rebuild the whole page
+                            // every second via setState(). Now the tick is
+                            // isolated to just this small ValueListenableBuilder.
                             Center(
                               child: _isSendingOtp
                                   ? const SizedBox(
@@ -843,36 +870,42 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                                     color:       _purple,
                                     strokeWidth: 2),
                               )
-                                  : _resendCooldown > 0
-                                  ? RichText(
-                                text: TextSpan(
-                                  text:  'Resend OTP in ',
-                                  style: const TextStyle(
-                                      color:      Colors.grey,
-                                      fontSize:   13,
-                                      fontWeight: FontWeight.w500),
-                                  children: [
-                                    TextSpan(
-                                      text: '${_resendCooldown}s',
-                                      style: const TextStyle(
-                                          color:      _purple,
-                                          fontWeight: FontWeight.bold),
+                                  : ValueListenableBuilder<int>(
+                                valueListenable: _resendCooldownNotifier,
+                                builder: (context, cooldown, _) {
+                                  if (cooldown > 0) {
+                                    return RichText(
+                                      text: TextSpan(
+                                        text:  'Resend OTP in ',
+                                        style: const TextStyle(
+                                            color:      Colors.grey,
+                                            fontSize:   13,
+                                            fontWeight: FontWeight.w500),
+                                        children: [
+                                          TextSpan(
+                                            text: '${cooldown}s',
+                                            style: const TextStyle(
+                                                color:      _purple,
+                                                fontWeight: FontWeight.bold),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  }
+                                  return GestureDetector(
+                                    onTap: _resendOtp,
+                                    child: const Text(
+                                      'Resend OTP',
+                                      style: TextStyle(
+                                        decoration:
+                                        TextDecoration.underline,
+                                        color:      _purple,
+                                        fontWeight: FontWeight.w600,
+                                        fontSize:   14,
+                                      ),
                                     ),
-                                  ],
-                                ),
-                              )
-                                  : GestureDetector(
-                                onTap: _resendOtp,
-                                child: const Text(
-                                  'Resend OTP',
-                                  style: TextStyle(
-                                    decoration:
-                                    TextDecoration.underline,
-                                    color:      _purple,
-                                    fontWeight: FontWeight.w600,
-                                    fontSize:   14,
-                                  ),
-                                ),
+                                  );
+                                },
                               ),
                             ),
                           ],
@@ -886,7 +919,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
             ),
 
             // ── FIXED TERMS ─────────────────────────────────────────────────
-            if (mq.viewInsets.bottom == 0)
+            if (viewInsetsBottom == 0)
               Padding(
                 padding:
                 const EdgeInsets.only(left: 20, right: 20, bottom: 20),

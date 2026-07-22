@@ -40,28 +40,40 @@ class Wrapper extends StatelessWidget {
 
   Future<Widget> _checkUser(User user) async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-
-      final cachedUid = prefs.getString('cached_uid');
-      if (cachedUid != null && cachedUid != user.uid) {
-        await prefs.remove('role');
-        await prefs.remove('cached_uid');
-        await prefs.remove('onboarding_step');
-      }
-
-      // Fast path: only trust the cache once onboarding is fully 'done' —
-      // any earlier checkpoint must always re-read Firestore so payment/
-      // profile/skip changes made elsewhere are picked up immediately.
-      final cachedRole = prefs.getString('role');
-      final cachedStep = prefs.getString('onboarding_step');
-      if (cachedRole != null && cachedUid == user.uid && cachedStep == 'done') {
-        return _routeByRole(cachedRole, user.uid);
-      }
-
-      final doc = await FirebaseFirestore.instance
+      // FIX(perf): Kick off the SharedPreferences load and the Firestore
+      // read at the same time instead of awaiting them one after another.
+      // They don't depend on each other — the old code paid for two full
+      // sequential round trips (a platform-channel hop for prefs, then a
+      // network hop for Firestore) on every single app start / auth event,
+      // when it only needed to pay for whichever one is slower.
+      final prefsFuture = SharedPreferences.getInstance();
+      final docFuture = FirebaseFirestore.instance
           .collection('users')
           .doc(user.uid)
           .get();
+
+      final prefs = await prefsFuture;
+      final doc = await docFuture;
+
+      final cachedUid = prefs.getString('cached_uid');
+      if (cachedUid != null && cachedUid != user.uid) {
+        // FIX(perf): three independent key removals — run them concurrently
+        // instead of three sequential awaits.
+        await Future.wait([
+          prefs.remove('role'),
+          prefs.remove('cached_uid'),
+          prefs.remove('onboarding_step'),
+        ]);
+      }
+
+      // NOTE: we intentionally do NOT short-circuit on a cached role here
+      // anymore. Role can be changed out-of-band (e.g. an admin flips a
+      // user's `role` field directly in the Firestore console), and a
+      // cached-role fast path would keep routing the user based on stale
+      // data until the cache was manually cleared — which is exactly the
+      // bug that caused a Firestore-promoted admin to keep landing on the
+      // regular BottomNavigation instead of AdminBottomNavigation. Role
+      // must always come from a fresh Firestore read.
 
       if (!doc.exists) return const PersonalDetailsPage();
 
@@ -79,9 +91,12 @@ class Wrapper extends StatelessWidget {
 
       // Admins skip the consumer onboarding flow entirely.
       if (role == 'admin') {
-        await prefs.setString('role', role);
-        await prefs.setString('cached_uid', user.uid);
-        await prefs.setString('onboarding_step', 'done');
+        // FIX(perf): three independent writes — fire together, await once.
+        await Future.wait([
+          prefs.setString('role', role),
+          prefs.setString('cached_uid', user.uid),
+          prefs.setString('onboarding_step', 'done'),
+        ]);
         return const AdminBottomNavigation();
       }
 
@@ -95,9 +110,12 @@ class Wrapper extends StatelessWidget {
       if (!hasPaid) return const PaymentPage();
       if (step != 'done') return const StartingPage();
 
-      await prefs.setString('role', role);
-      await prefs.setString('cached_uid', user.uid);
-      await prefs.setString('onboarding_step', 'done');
+      // FIX(perf): same three-writes-in-parallel treatment here.
+      await Future.wait([
+        prefs.setString('role', role),
+        prefs.setString('cached_uid', user.uid),
+        prefs.setString('onboarding_step', 'done'),
+      ]);
       return BannedGate(uid: user.uid, child: const BottomNavigation());
     } catch (e) {
       debugPrint("Wrapper error: $e");
@@ -117,22 +135,15 @@ class Wrapper extends StatelessWidget {
     }
   }
 
-  Widget _routeByRole(String role, String uid) {
-    switch (role) {
-      case 'admin':
-        return const AdminBottomNavigation();
-      case 'user':
-      default:
-        return BannedGate(uid: uid, child: const BottomNavigation());
-    }
-  }
-
   Future<void> _clearCache() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.remove('role');
-      await prefs.remove('cached_uid');
-      await prefs.remove('onboarding_step');
+      // FIX(perf): concurrent removals instead of sequential.
+      await Future.wait([
+        prefs.remove('role'),
+        prefs.remove('cached_uid'),
+        prefs.remove('onboarding_step'),
+      ]);
     } catch (_) {}
   }
 

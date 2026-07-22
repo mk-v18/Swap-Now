@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import '../chats/chatscreen.dart';
 import '../chats/chatservice.dart';
+import '../chats/swap_request_service.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DESIGN TOKENS
@@ -49,16 +50,30 @@ class _RL {
 // MAIN PAGE
 // ─────────────────────────────────────────────────────────────────────────────
 class UserProductDetailsPage extends StatefulWidget {
+  /// The Firestore doc id of this listing (from `UserProductList/{id}`).
+  ///
+  /// REQUIRED — this is what ties a swap request back to the correct
+  /// product for `ProductDetailPage`'s "mark exchange successful" lookup.
+  /// Passing `productData` alone is not enough because `productData` is
+  /// typically just `doc.data()`, which never includes the doc's own id.
+  ///
+  /// Update the call site that opens this page to:
+  ///   UserProductDetailsPage(productId: doc.id, productData: doc.data()!)
+  final String productId;
   final Map<String, dynamic> productData;
-  const UserProductDetailsPage({super.key, required this.productData});
+
+  const UserProductDetailsPage({
+    super.key,
+    required this.productId,
+    required this.productData,
+  });
 
   @override
   State<UserProductDetailsPage> createState() => _UserProductDetailsPageState();
 }
 
 class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
-  int _currentImageIndex = 0;
-  final PageController _pageController = PageController();
+  final SwapRequestService _swapRequestService = SwapRequestService();
 
   String? _sellerName;
   String? _sellerImage;
@@ -69,10 +84,20 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   String? _selectedSwapProductId;
   bool _myProductsLoaded = false;
 
+  // FIX(dedup): the current user's own pending/accepted swap request for
+  // THIS product, if any — null until the initial check finishes, then
+  // either null (no existing request) or the request's data map.
+  // This is what lets the bottom bar reflect "already sent" / "accepted"
+  // immediately on open, instead of only catching the duplicate after the
+  // user re-runs the whole select-product + safety-sheet flow.
+  Map<String, dynamic>? _existingRequest;
+  bool _existingRequestChecked = false;
+
   @override
   void initState() {
     super.initState();
     _loadSeller();
+    _checkExistingRequest();
   }
 
   void _loadSeller() {
@@ -94,6 +119,24 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     });
   }
 
+  // FIX(dedup): runs once on open. If the current user already has a
+  // pending or accepted request for this exact product, store it so the
+  // bottom bar can show "Request already sent" / "Continue chat" instead
+  // of the normal "Send swap request" button.
+  Future<void> _checkExistingRequest() async {
+    if (FirebaseAuth.instance.currentUser == null) {
+      if (mounted) setState(() => _existingRequestChecked = true);
+      return;
+    }
+    final existing = await _swapRequestService
+        .getMyActiveRequestForProduct(widget.productId);
+    if (!mounted) return;
+    setState(() {
+      _existingRequest = existing;
+      _existingRequestChecked = true;
+    });
+  }
+
   Future<void> _loadMyProducts() async {
     if (_myProductsLoaded) return;
     final uid  = FirebaseAuth.instance.currentUser!.uid;
@@ -103,7 +146,14 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
         .get();
     if (mounted) {
       setState(() {
-        _myProducts       = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+        _myProducts = snap.docs
+            .map((d) => {'id': d.id, ...d.data()})
+        // NEW: don't offer a product that's already been swapped away —
+        // it no longer belongs to the user in any meaningful sense, and
+        // offering it here would let it be picked as the offered item
+        // in a second, invalid swap request.
+            .where((p) => (p['status'] ?? '') != 'exchanged')
+            .toList();
         _myProductsLoaded = true;
       });
     }
@@ -111,7 +161,6 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
 
   @override
   void dispose() {
-    _pageController.dispose();
     super.dispose();
   }
 
@@ -128,11 +177,15 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // ── Image Carousel ────────────────────────────────────────────
-            _buildCarousel(rl, images),
-
-            // ── Dot Indicators ────────────────────────────────────────────
-            if (images.length > 1) _buildDots(images.length),
+            // ── Image Carousel + Dots ─────────────────────────────────────
+            // FIX(perf): carousel owns its own swipe-index state now
+            // (see _ImageCarousel below). Previously _currentImageIndex
+            // lived on this page's State, so every swipe rebuilt the
+            // entire scroll view — info card, meta card, description,
+            // the ad banner, and the bottom bar — instead of just the
+            // dots. The ad widget in particular is expensive to rebuild
+            // repeatedly, which was the main source of swipe jank.
+            _ImageCarousel(images: images, height: rl.carouselH),
             const SizedBox(height: 16),
 
             // ── Info Card (title + price + badges) ────────────────────────
@@ -153,8 +206,10 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
             // ── Ad ────────────────────────────────────────────────────────
             Padding(
               padding: EdgeInsets.symmetric(horizontal: rl.hPad),
-              child: const LocationAdWidget(
-                  targetAdSize: 'Large Banner (320×100)'),
+              child: const RepaintBoundary(
+                child: LocationAdWidget(
+                    targetAdSize: 'Large Banner (320×100)'),
+              ),
             ),
 
             const SizedBox(height: 100), // room above FAB
@@ -199,80 +254,9 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     ),
   );
 
-  // ─── IMAGE CAROUSEL ───────────────────────────────────────────────────────
-  Widget _buildCarousel(_RL rl, List images) {
-    return Padding(
-      padding: EdgeInsets.fromLTRB(rl.hPad, 12, rl.hPad, 0),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(20),
-        child: SizedBox(
-          height: rl.carouselH,
-          width:  double.infinity,
-          child: images.isEmpty
-              ? Container(
-            color: Colors.grey[200],
-            child: const Center(
-              child: Icon(Icons.image_not_supported,
-                  size: 60, color: Colors.grey),
-            ),
-          )
-              : PageView.builder(
-            controller:  _pageController,
-            itemCount:   images.length,
-            onPageChanged: (i) =>
-                setState(() => _currentImageIndex = i),
-            itemBuilder: (_, i) => Image.network(
-              images[i],
-              fit:   BoxFit.cover,
-              width: double.infinity,
-              frameBuilder: (ctx, child, frame, _) {
-                if (frame == null) {
-                  return Container(
-                    color: Colors.grey[200],
-                    child: const Center(
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2, color: _T.purple),
-                    ),
-                  );
-                }
-                return child;
-              },
-              errorBuilder: (_, __, ___) => const Center(
-                child: Icon(Icons.broken_image,
-                    size: 48, color: Colors.grey),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ─── DOT INDICATORS ──────────────────────────────────────────────────────
-  Widget _buildDots(int count) => Padding(
-    padding: const EdgeInsets.only(top: 10),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: List.generate(count, (i) {
-        final active = i == _currentImageIndex;
-        return AnimatedContainer(
-          duration: const Duration(milliseconds: 250),
-          margin:   const EdgeInsets.symmetric(horizontal: 3),
-          width:    active ? 22 : 7,
-          height:   5,
-          decoration: BoxDecoration(
-            color:        active ? _T.purple : Colors.grey[300],
-            borderRadius: BorderRadius.circular(4),
-          ),
-        );
-      }),
-    ),
-  );
-
   // ─── INFO CARD ────────────────────────────────────────────────────────────
   Widget _buildInfoCard(_RL rl) {
     final title     = widget.productData['title']     ?? 'No title';
-    final price     = widget.productData['price'];
     final condition = widget.productData['condition'] ?? '';
 
     return Padding(
@@ -307,37 +291,10 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
             ),
             const SizedBox(height: 14),
 
-            // Price row
+            // Swap-available pill (price removed)
             Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 14, vertical: 8),
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF5800B3), Color(0xFF26004D)],
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                    boxShadow: [
-                      BoxShadow(
-                        color:      const Color(0xFF5800B3).withOpacity(0.3),
-                        blurRadius: 10,
-                        offset:     const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: Text(
-                    '₹ ${_formatPrice(price)}',
-                    style: const TextStyle(
-                      fontSize:   16,
-                      fontWeight: FontWeight.w600,
-                      color:      Colors.white,
-                      letterSpacing: -0.3,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
                 Container(
                   padding: const EdgeInsets.symmetric(
                       horizontal: 10, vertical: 6),
@@ -556,83 +513,153 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   );
 
   // ─── BOTTOM BAR — Swap only ───────────────────────────────────────────────
-  Widget _buildBottomBar(_RL rl) => SafeArea(
-    child: Container(
-      padding: EdgeInsets.symmetric(
-          horizontal: rl.hPad, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        boxShadow: [
-          BoxShadow(
-            color:      Colors.black.withOpacity(0.06),
-            blurRadius: 16,
-            offset:     const Offset(0, -4),
-          ),
-        ],
-      ),
-      child: SizedBox(
-        width:  double.infinity,
-        height: 54,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            gradient: _isMessaging
-                ? LinearGradient(colors: [
-              _T.teal.withOpacity(0.5),
-              _T.teal.withOpacity(0.4),
-            ])
-                : const LinearGradient(
-              colors: [Color(0xFF5800B3), Color(0xFF26004D)],
-              begin:  Alignment.centerLeft,
-              end:    Alignment.centerRight,
+  // FIX(dedup): now three states instead of one:
+  //   1. still checking (_existingRequestChecked == false) → normal button,
+  //      but disabled so a fast tap can't slip through before the check
+  //      resolves.
+  //   2. existing pending request found → disabled "Request already sent".
+  //   3. existing accepted request found → "Continue chat", jumps straight
+  //      into the existing chat instead of restarting the swap flow.
+  //   4. no existing request → normal "Send swap request" flow.
+  Widget _buildBottomBar(_RL rl) {
+    final status = _existingRequest?['status'] as String?;
+
+    String label;
+    IconData icon;
+    VoidCallback? onTap;
+    bool isNeutralDisabled = false;
+
+    if (!_existingRequestChecked) {
+      label = 'Send swap request';
+      icon = Icons.swap_horiz_rounded;
+      onTap = null;
+      isNeutralDisabled = true;
+    } else if (status == 'pending') {
+      label = 'Request already sent';
+      icon = Icons.hourglass_top_rounded;
+      onTap = null;
+      isNeutralDisabled = true;
+    } else if (status == 'accepted') {
+      label = 'Continue chat';
+      icon = Icons.chat_bubble_outline_rounded;
+      onTap = _isMessaging ? null : _continueExistingChat;
+    } else {
+      label = _isMessaging ? 'Sending swap request...' : 'Send swap request';
+      icon = Icons.swap_horiz_rounded;
+      onTap = _isMessaging ? null : _initiateSwap;
+    }
+
+    final disabled = onTap == null;
+
+    return SafeArea(
+      child: Container(
+        padding: EdgeInsets.symmetric(
+            horizontal: rl.hPad, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          boxShadow: [
+            BoxShadow(
+              color:      Colors.black.withOpacity(0.06),
+              blurRadius: 16,
+              offset:     const Offset(0, -4),
             ),
-            borderRadius: BorderRadius.circular(16),
-            boxShadow: _isMessaging
-                ? []
-                : [
-              BoxShadow(
-                color:      _T.teal.withOpacity(0.35),
-                blurRadius: 14,
-                offset:     const Offset(0, 6),
+          ],
+        ),
+        child: SizedBox(
+          width:  double.infinity,
+          height: 54,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: (disabled || _isMessaging)
+                  ? LinearGradient(colors: isNeutralDisabled
+                  ? [Colors.grey.shade400, Colors.grey.shade500]
+                  : [_T.teal.withOpacity(0.6), _T.teal.withOpacity(0.5)])
+                  : const LinearGradient(
+                colors: [Color(0xFF5800B3), Color(0xFF26004D)],
+                begin:  Alignment.centerLeft,
+                end:    Alignment.centerRight,
               ),
-            ],
-          ),
-          child: ElevatedButton.icon(
-            onPressed: _isMessaging ? null : _initiateSwap,
-            icon: _isMessaging
-                ? const SizedBox(
-              width: 18, height: 18,
-              child: CircularProgressIndicator(
-                  strokeWidth: 2, color: Colors.white),
-            )
-                : const Icon(Icons.swap_horiz_rounded,
-                color: Colors.white, size: 22),
-            label: Text(
-              _isMessaging ? 'Opening chat...' : 'Message',
-              style: const TextStyle(
-                fontWeight:    FontWeight.w600,
-                fontSize:      16,
-                color:         Colors.white,
-                letterSpacing: 0.3,
-              ),
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: disabled
+                  ? []
+                  : [
+                BoxShadow(
+                  color:      _T.teal.withOpacity(0.35),
+                  blurRadius: 14,
+                  offset:     const Offset(0, 6),
+                ),
+              ],
             ),
-            style: ElevatedButton.styleFrom(
-              backgroundColor:         Colors.transparent,
-              shadowColor:             Colors.transparent,
-              disabledBackgroundColor: Colors.transparent,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16)),
+            child: ElevatedButton.icon(
+              onPressed: onTap,
+              icon: _isMessaging
+                  ? const SizedBox(
+                width: 18, height: 18,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Colors.white),
+              )
+                  : Icon(icon, color: Colors.white, size: 22),
+              label: Text(
+                label,
+                style: const TextStyle(
+                  fontWeight:    FontWeight.w600,
+                  fontSize:      16,
+                  color:         Colors.white,
+                  letterSpacing: 0.3,
+                ),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor:         Colors.transparent,
+                shadowColor:             Colors.transparent,
+                disabledBackgroundColor: Colors.transparent,
+                disabledForegroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16)),
+              ),
             ),
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
+
+  // FIX(dedup): jumps straight back into the chat for an already-accepted
+  // request, using the data captured when the request was first checked —
+  // no need to re-run the swap/safety flow for a swap that's already
+  // underway.
+  void _continueExistingChat() {
+    final req = _existingRequest;
+    if (req == null) return;
+    final chatId = req['chatId'] as String?;
+    if (chatId == null) {
+      _showSnack('Chat is not ready yet. Try again shortly.');
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: chatId,
+          receiverId: req['toUserId'] as String,
+          receiverName: (req['toUserName'] as String?) ?? 'Seller',
+          receiverImage: (req['toUserImage'] as String?) ?? '',
+        ),
+      ),
+    );
+  }
 
   // ─── INITIATE SWAP (guard → swap sheet → safety → chat) ──────────────────
   Future<void> _initiateSwap() async {
     final currentUser = FirebaseAuth.instance.currentUser;
     if (currentUser == null) {
       _showSnack('Please login to propose a swap.');
+      return;
+    }
+    // FIX(dedup): belt-and-suspenders guard — if a request slipped in
+    // (e.g. sent from another device) between the initial check and this
+    // tap, don't reopen the flow; refresh state instead.
+    if (_existingRequest != null) {
+      await _checkExistingRequest();
       return;
     }
     final sellerId = widget.productData['userId'] as String?;
@@ -690,78 +717,155 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
       builder: (_) => _SafetyCautionSheet(
         onConfirm: () {
           Navigator.pop(context);
-          _openChat(swapProducts);
+          _sendSwapRequest(swapProducts);
         },
       ),
     );
   }
 
-  // ─── OPEN CHAT ────────────────────────────────────────────────────────────
-  Future<void> _openChat(List<Map<String, dynamic>> swapProducts) async {
+  // ─── SEND SWAP REQUEST ────────────────────────────────────────────────────
+  Future<void> _sendSwapRequest(List<Map<String, dynamic>> swapProducts) async {
     setState(() => _isMessaging = true);
-    final sellerId    = widget.productData['userId'] as String;
-    final currentUser = FirebaseAuth.instance.currentUser!;
+    final sellerId = widget.productData['userId'] as String;
     try {
       if (!_sellerLoaded) {
-        final doc = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(sellerId)
-            .get();
+        final doc = await FirebaseFirestore.instance.collection('users').doc(sellerId).get();
         if (!doc.exists) { _showSnack('Seller not found.'); return; }
-        final d   = doc.data()!;
-        _sellerName   = d['name']         ?? 'Seller';
-        _sellerImage  = d['profileImage'] ?? '';
+        final d = doc.data()!;
+        _sellerName = d['name'] ?? 'Seller';
+        _sellerImage = d['profileImage'] ?? '';
         _sellerLoaded = true;
       }
 
-      final chatService = ChatService();
-      final chatId = await chatService.getOrCreateChat(
-          currentUser.uid, sellerId);
+      // widget.productId is the real Firestore doc id (passed in explicitly
+      // by the caller) — this is what lets ProductDetailPage's "mark
+      // exchange successful" lookup match this request back to the listing.
+      final listedProduct = {
+        'id': widget.productId,
+        'title': widget.productData['title'] ?? '',
+        'price': widget.productData['price'] ?? '',
+        'images': ((widget.productData['images'] as List?)?.take(1).toList()) ?? [],
+      };
 
-      final swapForDb = swapProducts.map((p) => {
-        'id':          p['id'],
-        'title':       p['title']       ?? '',
-        'price':       p['price']       ?? '',
-        'images':      (p['images'] as List?) ?? [],
-        'condition':   p['condition']   ?? '',
-        'category':    p['category']    ?? '',
-        'location':    p['location']    ?? '',
+      final offeredProducts = swapProducts.map((p) => {
+        'id': p['id'],
+        'title': p['title'] ?? '',
+        'price': p['price'] ?? '',
+        'images': (p['images'] as List?) ?? [],
+        'condition': p['condition'] ?? '',
+        'category': p['category'] ?? '',
+        'location': p['location'] ?? '',
         'description': p['description'] ?? '',
       }).toList();
 
-      await FirebaseFirestore.instance
-          .collection('chats')
-          .doc(chatId)
-          .set({
-        'intent': {
-          'type':          'swap',
-          'listedProduct': {
-            'title':  widget.productData['title']  ?? '',
-            'price':  widget.productData['price']  ?? '',
-            'images': ((widget.productData['images'] as List?)
-                ?.take(1)
-                .toList()) ??
-                [],
-          },
-          'swapProducts': swapForDb,
-          'updatedAt':    FieldValue.serverTimestamp(),
-        }
-      }, SetOptions(merge: true));
+      await _swapRequestService.createSwapRequest(
+        toUserId: sellerId,
+        toUserName: _sellerName!,
+        toUserImage: _sellerImage!,
+        listedProduct: listedProduct,
+        offeredProducts: offeredProducts,
+      );
 
       if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => ChatScreen(
-            chatId:        chatId,
-            receiverId:    sellerId,
-            receiverName:  _sellerName!,
-            receiverImage: _sellerImage!,
+
+      // FIX(dedup): refresh the existing-request check right after a
+      // successful send, so the bottom bar flips to "Request already
+      // sent" immediately — without this, the button stayed on "Send
+      // swap request" until the page was reopened, which is exactly
+      // the bug being fixed here.
+      await _checkExistingRequest();
+      if (!mounted) return;
+
+      await showDialog(
+        context: context,
+        barrierColor: Colors.black.withOpacity(0.45),
+        builder: (_) => Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(24, 32, 24, 20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(24),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.12),
+                  blurRadius: 24,
+                  offset: const Offset(0, 8),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Icon in a soft circular badge instead of a bare icon
+                Container(
+                  width: 72,
+                  height: 72,
+                  decoration: BoxDecoration(
+                    color: _T.teal.withOpacity(0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    Icons.check_circle_rounded,
+                    color: _T.teal,
+                    size: 40,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                const Text(
+                  'Request sent',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 19,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: -0.2,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  "$_sellerName will be notified. If they accept, you'll be able to chat.",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 14.5,
+                    height: 1.4,
+                    color: Colors.grey.shade600,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.pop(context),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _T.teal,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      elevation: 0,
+                    ),
+                    child: const Text(
+                      'Got it',
+                      style: TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
     } catch (e) {
-      _showSnack('Error: $e');
+      // Strip the "Exception: " prefix Dart adds automatically so the
+      // dedup message (and any other thrown message) reads cleanly.
+      _showSnack(e.toString().replaceFirst('Exception: ', ''));
+      // FIX(dedup): if this failed specifically because a request already
+      // existed (e.g. sent moments ago from another tab/device), refresh
+      // state so the button reflects that instead of staying on "Send
+      // swap request" and inviting another failed attempt.
+      await _checkExistingRequest();
     } finally {
       if (mounted) setState(() => _isMessaging = false);
     }
@@ -789,6 +893,109 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IMAGE CAROUSEL — isolated so swiping doesn't rebuild the rest of the page
+// ─────────────────────────────────────────────────────────────────────────────
+class _ImageCarousel extends StatefulWidget {
+  final List images;
+  final double height;
+  const _ImageCarousel({required this.images, required this.height});
+
+  @override
+  State<_ImageCarousel> createState() => _ImageCarouselState();
+}
+
+class _ImageCarouselState extends State<_ImageCarousel> {
+  int _currentImageIndex = 0;
+  final PageController _pageController = PageController();
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rl = _RL.of(context);
+    final dpr = MediaQuery.of(context).devicePixelRatio;
+    // FIX(perf): cap decode target to the box's actual on-screen pixel
+    // height instead of letting each Image.network decode at full native
+    // resolution before Flutter scales it down for display.
+    final cacheH = (widget.height * dpr).round();
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(rl.hPad, 12, rl.hPad, 0),
+      child: Column(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: SizedBox(
+              height: widget.height,
+              width:  double.infinity,
+              child: widget.images.isEmpty
+                  ? Container(
+                color: Colors.grey[200],
+                child: const Center(
+                  child: Icon(Icons.image_not_supported,
+                      size: 60, color: Colors.grey),
+                ),
+              )
+                  : PageView.builder(
+                controller:  _pageController,
+                itemCount:   widget.images.length,
+                onPageChanged: (i) =>
+                    setState(() => _currentImageIndex = i),
+                itemBuilder: (_, i) => Image.network(
+                  widget.images[i],
+                  fit:   BoxFit.cover,
+                  width: double.infinity,
+                  cacheHeight: cacheH,
+                  frameBuilder: (ctx, child, frame, _) {
+                    if (frame == null) {
+                      return Container(
+                        color: Colors.grey[200],
+                        child: const Center(
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: _T.purple),
+                        ),
+                      );
+                    }
+                    return child;
+                  },
+                  errorBuilder: (_, __, ___) => const Center(
+                    child: Icon(Icons.broken_image,
+                        size: 48, color: Colors.grey),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (widget.images.length > 1) ...[
+            const SizedBox(height: 10),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: List.generate(widget.images.length, (i) {
+                final active = i == _currentImageIndex;
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 250),
+                  margin:   const EdgeInsets.symmetric(horizontal: 3),
+                  width:    active ? 22 : 7,
+                  height:   5,
+                  decoration: BoxDecoration(
+                    color:        active ? _T.purple : Colors.grey[300],
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                );
+              }),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SWAP SHEET
 // ─────────────────────────────────────────────────────────────────────────────
 class _SwapSheet extends StatelessWidget {
@@ -807,6 +1014,8 @@ class _SwapSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final rl       = _RL.of(context);
+    final dpr      = MediaQuery.of(context).devicePixelRatio;
+    final thumbCache = (rl.swapThumb * dpr).round();
     final hasSelection = selectedId != null;
 
     return DraggableScrollableSheet(
@@ -927,7 +1136,16 @@ class _SwapSheet extends StatelessWidget {
                           height: rl.swapThumb,
                           color:  Colors.grey[200],
                           child: imgUrl != null
-                              ? Image.network(imgUrl, fit: BoxFit.cover)
+                              ? Image.network(
+                            imgUrl,
+                            fit: BoxFit.cover,
+                            // FIX(perf): same fix as the carousel — cap
+                            // decode size to the actual thumbnail pixels
+                            // instead of decoding the full photo for a
+                            // ~60dp box, repeated for every row.
+                            cacheWidth: thumbCache,
+                            cacheHeight: thumbCache,
+                          )
                               : const Icon(Icons.image_not_supported,
                               color: Colors.grey),
                         ),
@@ -943,14 +1161,9 @@ class _SwapSheet extends StatelessWidget {
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
                                     fontSize:   14,
-                                    fontWeight: FontWeight.w700,
+                                    fontWeight: FontWeight.w600,
                                     color:      _T.textDark)),
                             const SizedBox(height: 4),
-                            Text('₹ ${p['price'] ?? '—'}',
-                                style: const TextStyle(
-                                    fontSize:   13,
-                                    color:      _T.purple,
-                                    fontWeight: FontWeight.w700)),
                             if ((p['condition'] ?? '').isNotEmpty)
                               Padding(
                                 padding: const EdgeInsets.only(top: 4),
@@ -1055,9 +1268,6 @@ class _SwapSheet extends StatelessWidget {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SAFETY CAUTION SHEET
-// ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 // SAFETY CAUTION SHEET
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1289,7 +1499,7 @@ class _SafetyCautionSheetState extends State<_SafetyCautionSheet> {
                     icon: const Icon(Icons.chat_bubble_outline_rounded,
                         color: Colors.white, size: 18),
                     label: const Text(
-                      'Start chatting',
+                      'Send Request',
                       style: TextStyle(
                           color:         Colors.white,
                           fontSize:      15,

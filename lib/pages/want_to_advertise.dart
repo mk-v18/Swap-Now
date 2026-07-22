@@ -293,11 +293,6 @@ class _WantToAdvertisePageState extends State<WantToAdvertisePage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const SizedBox(height: 4),
-
-              // ── Hero info banner ────────────────────────────────────────
-              _infoBanner(sw),
-              SizedBox(height: gap),
-
               // ── Ad Title ────────────────────────────────────────────────
               _card(cardRadius, Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -554,46 +549,6 @@ class _WantToAdvertisePageState extends State<WantToAdvertisePage> {
       preferredSize: Size.fromHeight(1),
       child: Divider(height: 1, thickness: 1, color: Color(0xFFF0ECFF)),
     ),
-  );
-
-  // ── Info banner ───────────────────────────────────────────────────────────
-  Widget _infoBanner(double sw) => Container(
-    width: double.infinity,
-    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-    decoration: BoxDecoration(
-      gradient: const LinearGradient(
-        colors: [Color(0xFF7B2FFF), Color(0xFF2D0050)],
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-      ),
-      borderRadius: BorderRadius.circular(_cl(sw * 0.04, 12.0, 18.0)),
-    ),
-    child: Row(children: [
-      Container(
-        padding: const EdgeInsets.all(8),
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.15),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: const Icon(Icons.campaign_outlined, color: Colors.white, size: 24),
-      ),
-      const SizedBox(width: 12),
-      Expanded(
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Reach thousands of buyers',
-              style: TextStyle(
-                  color: Colors.white,
-                  fontSize: _cl(sw * 0.04, 13.0, 15.5),
-                  fontWeight: FontWeight.w700)),
-          const SizedBox(height: 2),
-          Text('Fill in the details below and our team will set up your ad.',
-              style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: _cl(sw * 0.032, 11.0, 13.0),
-                  height: 1.4)),
-        ]),
-      ),
-    ]),
   );
 
   // ── Banner preview ────────────────────────────────────────────────────────

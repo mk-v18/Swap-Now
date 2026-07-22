@@ -27,7 +27,6 @@ class _AdminBottomNavigationState extends State<AdminBottomNavigation> {
     "assets/icons/shared.svg",
     "assets/icons/advertisement.svg",
     "assets/icons/add-1.svg",
-    "assets/icons/chat.svg",
     "assets/icons/user.svg",
   ];
 
@@ -35,7 +34,6 @@ class _AdminBottomNavigationState extends State<AdminBottomNavigation> {
     "Refer",
     "Ads",
     "Queries",
-    "Chats",
     "Profile",
   ];
 
@@ -49,7 +47,6 @@ class _AdminBottomNavigationState extends State<AdminBottomNavigation> {
       const AdminReferralPage(),
       const AdvertisementPage(),
       AdminCategoriesPage(),
-      AdminChatPage(),
       const AdminProfilePage(),
     ];
   }

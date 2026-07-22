@@ -44,9 +44,15 @@ class EncryptionService {
   // calls and racing on the secure storage write.
   Future<void>? _initFuture;
 
+  /// True once [ensureReady] has completed successfully. Callers (e.g.
+  /// ChatScreen) can use this to gate UI instead of guessing.
+  bool get isReady => _encrypter != null;
+
   /// Must be awaited once before first use (e.g. in chat screen initState,
   /// or app startup). Safe to call multiple times — subsequent calls
-  /// return immediately once initialised.
+  /// return immediately once initialised. If a previous attempt failed,
+  /// calling this again will retry (it does NOT get stuck replaying the
+  /// same failed future forever).
   Future<void> ensureReady() {
     if (_encrypter != null) return Future.value();
     return _initFuture ??= _init();
@@ -63,6 +69,9 @@ class EncryptionService {
       _key = enc.Key(base64.decode(rawKey));
       _encrypter = enc.Encrypter(enc.AES(_key!, mode: enc.AESMode.cbc));
     } catch (e) {
+      // Reset _initFuture so the NEXT call to ensureReady() actually
+      // retries instead of re-awaiting this same failed future forever.
+      _initFuture = null;
       // Surface the failure — callers should show a retry state rather
       // than silently sending unencrypted messages.
       throw EncryptionInitException('Failed to initialise chat encryption: $e');
@@ -94,9 +103,12 @@ class EncryptionService {
 
   /// Decrypt base64 ciphertext back to plaintext.
   /// Returns the original string unchanged if decryption fails
-  /// (handles legacy unencrypted messages already stored in Firestore).
+  /// (handles legacy unencrypted messages already stored in Firestore),
+  /// AND if the service simply isn't ready yet (avoids crashing message
+  /// rendering — caller should prefer checking [isReady] first where UX
+  /// matters, e.g. to show a "decrypting…" placeholder instead).
   String decrypt(String ciphertext) {
-    _requireReady();
+    if (!isReady) return ciphertext;
     try {
       final combined = base64.decode(ciphertext);
       if (combined.length < 17) return ciphertext; // too short to be valid

@@ -9,24 +9,32 @@ class ChatService {
   final _storage = FirebaseStorage.instance;
 
   // ── CREATE / GET CHAT ─────────────────────────────────────────────────────
+  // PERF: previously this queried every chat where `participants` contained
+  // user1, downloaded them all, then looped client-side checking for user2.
+  // That's O(n) reads + a full round trip every single time a chat screen
+  // opened. A deterministic ID (sorted uid pair) turns "find or create" into
+  // ONE direct document read — no query, no loop, no scanning.
+  // Existing chats (created before this change) keep their old auto-IDs and
+  // are unaffected — this only changes how *new* chats get their ID.
+  String _chatIdFor(String user1, String user2) {
+    final sorted = [user1, user2]..sort();
+    return '${sorted[0]}_${sorted[1]}';
+  }
+
   Future<String> getOrCreateChat(String user1, String user2) async {
-    final query = await _firestore
-        .collection('chats')
-        .where('participants', arrayContains: user1)
-        .get();
+    final chatId = _chatIdFor(user1, user2);
+    final ref = _firestore.collection('chats').doc(chatId);
+    final snap = await ref.get();
 
-    for (var doc in query.docs) {
-      final participants = List<String>.from(doc['participants'] ?? []);
-      if (participants.contains(user2)) return doc.id;
+    if (!snap.exists) {
+      await ref.set({
+        'participants': [user1, user2],
+        'lastMessage': '',
+        'timestamp': FieldValue.serverTimestamp(),
+        'typing': {},
+      });
     }
-
-    final newChat = await _firestore.collection('chats').add({
-      'participants': [user1, user2],
-      'lastMessage': '',
-      'timestamp': FieldValue.serverTimestamp(),
-      'typing': {},
-    });
-    return newChat.id;
+    return chatId;
   }
 
   // ── UPLOAD FILE ───────────────────────────────────────────────────────────
@@ -55,6 +63,10 @@ class ChatService {
   }
 
   // ── SEND MESSAGE ──────────────────────────────────────────────────────────
+  // PERF: previously this awaited two sequential writes (message doc, then
+  // chat doc update) — two network round trips. Batched into one atomic
+  // commit: one round trip, and the message + chat preview can never end up
+  // out of sync if one write fails.
   Future<void> sendMessage({
     required String chatId,
     required String receiverId,
@@ -66,23 +78,8 @@ class ChatService {
     String? plainTextPreview,
   }) async {
     final currentUser = _auth.currentUser!;
-    final messageRef = _firestore
-        .collection('chats')
-        .doc(chatId)
-        .collection('messages')
-        .doc();
-
-    await messageRef.set({
-      'senderId': currentUser.uid,
-      'receiverId': receiverId,
-      'type': type,
-      'text': text ?? '',
-      'fileUrl': fileUrl ?? '',
-      'extra': extra ?? {},
-      'timestamp': FieldValue.serverTimestamp(),
-      'status': 'sent',
-      'encrypted': encrypted,
-    });
+    final chatRef = _firestore.collection('chats').doc(chatId);
+    final messageRef = chatRef.collection('messages').doc();
 
     String preview;
     switch (type) {
@@ -105,54 +102,86 @@ class ChatService {
         preview = '';
     }
 
-    await _firestore.collection('chats').doc(chatId).update({
+    final batch = _firestore.batch();
+    batch.set(messageRef, {
+      'senderId': currentUser.uid,
+      'receiverId': receiverId,
+      'type': type,
+      'text': text ?? '',
+      'fileUrl': fileUrl ?? '',
+      'extra': extra ?? {},
+      'timestamp': FieldValue.serverTimestamp(),
+      'status': 'sent',
+      'encrypted': encrypted,
+    });
+    batch.update(chatRef, {
       'lastMessage': preview,
       'lastSenderId': currentUser.uid,
       'lastStatus': 'sent',
       'timestamp': FieldValue.serverTimestamp(),
     });
+    await batch.commit();
   }
 
   // ── MARK SEEN ─────────────────────────────────────────────────────────────
   Future<void> markMessagesAsSeen(String chatId) async {
     final currentUser = _auth.currentUser!;
-    final query = await _firestore
-        .collection('chats')
-        .doc(chatId)
-        .collection('messages')
-        .where('receiverId', isEqualTo: currentUser.uid)
-        .where('status', isNotEqualTo: 'seen')
-        .get();
+    try {
+      final query = await _firestore
+          .collection('chats')
+          .doc(chatId)
+          .collection('messages')
+          .where('receiverId', isEqualTo: currentUser.uid)
+          .where('status', isNotEqualTo: 'seen')
+          .get();
 
-    if (query.docs.isEmpty) return;
+      if (query.docs.isEmpty) return;
 
-    // Firestore batch is limited to 500 ops — chunk if needed
-    final chunks = <List<QueryDocumentSnapshot>>[];
-    for (var i = 0; i < query.docs.length; i += 499) {
-      chunks.add(query.docs.sublist(
-          i, i + 499 > query.docs.length ? query.docs.length : i + 499));
-    }
-    for (final chunk in chunks) {
-      final batch = _firestore.batch();
-      for (var doc in chunk) {
-        batch.update(doc.reference, {'status': 'seen'});
+      final chunks = <List<QueryDocumentSnapshot>>[];
+      for (var i = 0; i < query.docs.length; i += 499) {
+        chunks.add(query.docs.sublist(
+            i, i + 499 > query.docs.length ? query.docs.length : i + 499));
       }
-      await batch.commit();
-    }
+      for (final chunk in chunks) {
+        final batch = _firestore.batch();
+        for (var doc in chunk) {
+          batch.update(doc.reference, {'status': 'seen'});
+        }
+        await batch.commit();
+      }
 
-    await _firestore.collection('chats').doc(chatId).update({
-      'lastStatus': 'seen',
-    });
+      await _firestore.collection('chats').doc(chatId).update({
+        'lastStatus': 'seen',
+      });
+    } on FirebaseException catch (e) {
+      // Chat was deleted out from under us (e.g. other participant deleted
+      // it, or we're mid-teardown after deleting it ourselves) — nothing to do.
+      if (e.code != 'permission-denied' && e.code != 'not-found') rethrow;
+    }
   }
 
   // ── STREAMS ───────────────────────────────────────────────────────────────
-  Stream<QuerySnapshot> getMessages(String chatId) {
+  // PERF: capped with `limit` — an open-ended chat previously re-downloaded
+  // and re-rendered its ENTIRE message history on every snapshot, which is
+  // the single biggest cause of "chat feels slow" on long-running chats.
+  // Most recent [limit] messages is enough for the default view; raise the
+  // limit (or add real pagination via startAfterDocument) only if older
+  // history needs to be reachable by scrolling up.
+  Stream<QuerySnapshot> getMessages(String chatId, {int limit = 50}) {
     return _firestore
         .collection('chats')
         .doc(chatId)
         .collection('messages')
         .orderBy('timestamp', descending: true)
-        .snapshots();
+        .limit(limit)
+        .snapshots()
+        .handleError((e) {
+      if (e is FirebaseException &&
+          (e.code == 'permission-denied' || e.code == 'not-found')) {
+        return; // chat deleted — let the StreamBuilder's snapshot.hasError path handle UI
+      }
+      throw e;
+    });
   }
 
   Stream<QuerySnapshot> getUserChats() {

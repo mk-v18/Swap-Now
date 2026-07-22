@@ -373,13 +373,13 @@ class _SplashScreenState extends State<SplashScreen>
               ),
             ),
           ),
-          SizedBox(height: size.height * 0.03),
+          SizedBox(height: size.height * 0.01),
           FadeTransition(
             opacity: _taglineOpacity,
             child: SlideTransition(
               position: _taglineSlide,
               child: _buildShimmerText(
-                'SwapNow',
+                'Amoeba',
                 fontSize: taglineFontSize,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 0,

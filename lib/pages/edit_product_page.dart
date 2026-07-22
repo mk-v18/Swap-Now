@@ -79,13 +79,13 @@ const List<String> _kCategories = [
 ];
 
 const List<String> _kConditions = [
-  'New', 'Like New', 'Good', 'Fair', 'For Parts',
+  'New', 'Like New', 'Good', 'Fair', 'Poor',
 ];
 
 const int    _kMaxImages      = 3;
 const String _kNominatimBase  = 'https://nominatim.openstreetmap.org/search';
-const int    _kCompressQuality= 72;
-const int    _kCompressMaxDim = 1280;
+const int    _kCompressQuality= 65;
+const int    _kCompressMaxDim = 1024;
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 class EditProductPage extends StatefulWidget {
@@ -106,7 +106,6 @@ class _EditProductPageState extends State<EditProductPage> {
   // ── Controllers ──────────────────────────────────────────────────────────
   late final TextEditingController _titleController;
   late final TextEditingController _descriptionController;
-  late final TextEditingController _priceController;
   late final TextEditingController _locationController;
 
   final FocusNode _locationFocusNode = FocusNode();
@@ -118,9 +117,18 @@ class _EditProductPageState extends State<EditProductPage> {
   String? _condition;
   String  _location = '';
 
+  // FIX(gap): same gap as the listing page — GPS coordinates were fetched
+  // and then discarded, so edited products never got lat/lng persisted and
+  // home_page.dart had to fall back to a live (and failure-prone) geocode
+  // of the location string, silently dropping products that failed to
+  // resolve. We now capture and carry coordinates through to the save.
+  double? _latitude;
+  double? _longitude;
+
   // ── Images ───────────────────────────────────────────────────────────────
   List<String> _existingImages = [];
   List<XFile>  _newImages      = [];
+  final Map<String, Uint8List> _compressedCache = {};
 
   // ── Flags ────────────────────────────────────────────────────────────────
   bool _isSubmitting        = false;
@@ -128,6 +136,8 @@ class _EditProductPageState extends State<EditProductPage> {
 
   // ── Autocomplete ─────────────────────────────────────────────────────────
   List<String> _suggestions          = [];
+  // FIX(gap): parallel coordinates for each suggestion, same as listing page.
+  List<Map<String, double>?> _suggestionCoords = [];
   Timer?       _debounce;
   bool         _isFetchingSuggestions= false;
 
@@ -141,10 +151,17 @@ class _EditProductPageState extends State<EditProductPage> {
     super.initState();
     _titleController       = TextEditingController(text: (widget.data['title'] as String?) ?? '');
     _descriptionController = TextEditingController(text: (widget.data['description'] as String?) ?? '');
-    _priceController       = TextEditingController(
-        text: widget.data['price'] != null ? '${widget.data['price']}' : '');
     _location              = (widget.data['location'] as String?) ?? '';
     _locationController    = TextEditingController(text: _location);
+
+    // FIX(gap): preload existing coordinates if this product already has
+    // them (e.g. it was created after the listing-page fix, or backfilled).
+    // If the doc predates the fix, these will be null, which is exactly
+    // what forces the "please reselect your location" validation below.
+    final savedLat = widget.data['lat'];
+    final savedLng = widget.data['lng'];
+    _latitude  = savedLat is num ? savedLat.toDouble() : null;
+    _longitude = savedLng is num ? savedLng.toDouble() : null;
 
     // Safe category/condition — only assign if value exists in the new list
     final savedCat  = widget.data['category'] as String?;
@@ -174,7 +191,6 @@ class _EditProductPageState extends State<EditProductPage> {
       ..dispose();
     _titleController.dispose();
     _descriptionController.dispose();
-    _priceController.dispose();
     _locationController.dispose();
     super.dispose();
   }
@@ -221,7 +237,8 @@ class _EditProductPageState extends State<EditProductPage> {
                       top:    isFirst ? Radius.circular(rl.fieldRadius + 2) : Radius.zero,
                       bottom: isLast  ? Radius.circular(rl.fieldRadius + 2) : Radius.zero,
                     ),
-                    onTap: () => _selectSuggestion(_suggestions[i]),
+                    // FIX(gap): select by index so coordinates travel with the tap.
+                    onTap: () => _selectSuggestion(i),
                     child: Padding(
                       padding: EdgeInsets.symmetric(
                           horizontal: 14, vertical: rl.isMobile ? 10 : 12),
@@ -258,6 +275,10 @@ class _EditProductPageState extends State<EditProductPage> {
   // ── Autocomplete ─────────────────────────────────────────────────────────
   void _onLocationChanged(String value, _RL rl) {
     _location = value;
+    // FIX(gap): manual edits invalidate previously captured coordinates —
+    // whether they came from the preloaded doc or a prior selection.
+    _latitude = null;
+    _longitude = null;
     _debounce?.cancel();
     if (value.trim().length < 3) {
       if (_suggestions.isNotEmpty) setState(() => _suggestions = []);
@@ -288,34 +309,52 @@ class _EditProductPageState extends State<EditProductPage> {
         // as fallback, which garbles Indian/non-ASCII place names.
         final List<dynamic> data =
         json.decode(utf8.decode(response.bodyBytes)) as List<dynamic>;
+        final filtered = data
+            .whereType<Map<String, dynamic>>()
+            .where((e) => (e['display_name'] as String? ?? '').trim().isNotEmpty)
+            .take(5)
+            .toList();
         setState(() {
-          _suggestions = data
-              .whereType<Map<String, dynamic>>()
-              .map<String>((e) => (e['display_name'] as String? ?? '').trim())
-              .where((s) => s.isNotEmpty)
-              .take(5)
+          _suggestions = filtered
+              .map<String>((e) => (e['display_name'] as String).trim())
               .toList();
+          // FIX(gap): capture each suggestion's lat/lon from Nominatim.
+          _suggestionCoords = filtered.map<Map<String, double>?>((e) {
+            final lat = double.tryParse(e['lat']?.toString() ?? '');
+            final lon = double.tryParse(e['lon']?.toString() ?? '');
+            if (lat == null || lon == null) return null;
+            return {'lat': lat, 'lng': lon};
+          }).toList();
         });
         _showOverlay(rl);
       } else {
-        setState(() => _suggestions = []);
+        setState(() { _suggestions = []; _suggestionCoords = []; });
         _removeOverlay();
       }
     } on TimeoutException {
-      if (mounted) { setState(() => _suggestions = []); _removeOverlay(); }
+      if (mounted) { setState(() { _suggestions = []; _suggestionCoords = []; }); _removeOverlay(); }
     } catch (_) {
-      if (mounted) { setState(() => _suggestions = []); _removeOverlay(); }
+      if (mounted) { setState(() { _suggestions = []; _suggestionCoords = []; }); _removeOverlay(); }
     } finally {
       if (mounted) setState(() => _isFetchingSuggestions = false);
     }
   }
 
-  void _selectSuggestion(String suggestion) {
+  void _selectSuggestion(int index) {
+    if (index < 0 || index >= _suggestions.length) return;
+    final suggestion = _suggestions[index];
     final trimmed = suggestion.split(',').map((s) => s.trim()).take(3).join(', ');
+    final coords = index < _suggestionCoords.length ? _suggestionCoords[index] : null;
     _locationController.text = trimmed;
     _location = trimmed;
+    // FIX(gap): persist the coordinates that came with this suggestion.
+    _latitude = coords?['lat'];
+    _longitude = coords?['lng'];
     _locationFocusNode.unfocus();
-    setState(() => _suggestions = []);
+    setState(() {
+      _suggestions = [];
+      _suggestionCoords = [];
+    });
     _removeOverlay();
   }
 
@@ -354,6 +393,11 @@ class _EditProductPageState extends State<EditProductPage> {
           _location = readable.isNotEmpty ? readable : 'Unknown Location';
           _locationController.text = _location;
           _suggestions = [];
+          _suggestionCoords = [];
+          // FIX(gap): keep the exact GPS coordinates instead of throwing
+          // them away after using them only for the reverse-geocode text.
+          _latitude = pos.latitude;
+          _longitude = pos.longitude;
         });
       }
     } on TimeoutException {
@@ -376,13 +420,24 @@ class _EditProductPageState extends State<EditProductPage> {
     }
     try {
       final picked = await _picker.pickMultiImage(
-          maxWidth: 1920, maxHeight: 1920, imageQuality: 90);
+          maxWidth: 1280, maxHeight: 1280, imageQuality: 80);
       if (picked == null || picked.isEmpty) return;
       if (!mounted) return;
-      setState(() => _newImages.addAll(picked.take(remaining)));
+      final toAdd = picked.take(remaining).toList();
+      setState(() => _newImages.addAll(toAdd));
+      // Compress in the background right away, in parallel, so saving
+      // at submit time just sends already-ready bytes instead of waiting.
+      for (final img in toAdd) {
+        unawaited(_precompress(img));
+      }
     } catch (_) {
       if (mounted) _showErrorSnack("Failed to pick images. Try again.");
     }
+  }
+
+  Future<void> _precompress(XFile img) async {
+    final bytes = await _compressImage(img);
+    if (bytes != null) _compressedCache[img.path] = bytes;
   }
 
   Future<Uint8List?> _compressImage(XFile img) async {
@@ -404,15 +459,14 @@ class _EditProductPageState extends State<EditProductPage> {
     if (_titleController.text.trim().length > 120) return "Title must be 120 characters or fewer.";
     if (_descriptionController.text.trim().length < 10) return "Description must be at least 10 characters.";
     if (_descriptionController.text.trim().length > 2000) return "Description must be 2,000 characters or fewer.";
-    final priceText = _priceController.text.trim();
-    final price = double.tryParse(priceText);
-    if (priceText.isEmpty || price == null) return "Please enter a valid price.";
-    // FIX: reject negative/absurd prices
-    if (price < 0)       return "Price cannot be negative.";
-    if (price > 9999999) return "Price seems unrealistically high.";
     if (_condition == null) return "Please select a condition.";
     if (_category  == null) return "Please select a category.";
     if (_location.trim().isEmpty) return "Please set your location.";
+    // FIX(gap): don't let a coordinate-less location silently break
+    // distance sorting/filtering on the home page.
+    if (_latitude == null || _longitude == null) {
+      return "Please pick your location from the suggestions list or use \"detect current location\".";
+    }
     return null;
   }
 
@@ -431,7 +485,6 @@ class _EditProductPageState extends State<EditProductPage> {
       if (newUrls == null) return; // error already shown
 
       final allImages = [..._existingImages, ...newUrls];
-      final price = double.parse(_priceController.text.trim());
 
       await FirebaseFirestore.instance
           .collection('UserProductList')
@@ -439,10 +492,13 @@ class _EditProductPageState extends State<EditProductPage> {
           .update({
         'title'      : _titleController.text.trim(),
         'description': _descriptionController.text.trim(),
-        'price'      : price,
         'category'   : _category,
         'condition'  : _condition,
         'location'   : _location.trim(),
+        // FIX(gap): persist coordinates on edit too, so re-saving a product
+        // heals it if it predates the coordinate fix.
+        'lat'        : _latitude,
+        'lng'        : _longitude,
         'images'     : allImages,
         // FIX: track when the product was last edited
         'updatedAt'  : FieldValue.serverTimestamp(),
@@ -477,7 +533,7 @@ class _EditProductPageState extends State<EditProductPage> {
   }
 
   Future<String?> _uploadSingleImage(XFile img) async {
-    final compressed = await _compressImage(img);
+    final compressed = _compressedCache[img.path] ?? await _compressImage(img);
     if (compressed == null) return null;
     final filename =
         '${DateTime.now().millisecondsSinceEpoch}_${img.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_')}';
@@ -624,54 +680,25 @@ class _EditProductPageState extends State<EditProductPage> {
                   ),
                   SizedBox(height: rl.sectionGap),
 
-                  // ── 3 · Pricing & Condition ──────────────────────────────
+                  // ── 3 · Condition ─────────────────────────────────────────
                   _SectionCard(
                     stepNumber: 3,
                     icon: Icons.sell_outlined,
-                    title: "Pricing & Condition",
-                    subtitle: "Set price and item condition",
+                    title: "Condition",
+                    subtitle: "Set item condition",
                     rl: rl,
-                    child: Row(
+                    child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Expanded(
-                          flex: 5,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _FieldLabel(text: "Price (₹)", rl: rl),
-                              _InputField(
-                                rl: rl,
-                                controller: _priceController,
-                                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                                inputFormatters: [
-                                  FilteringTextInputFormatter.allow(
-                                      RegExp(r'^\d*\.?\d{0,2}')),
-                                ],
-                                hintText: "0.00",
-                                prefixIcon: Icons.currency_rupee_rounded,
-                                textInputAction: TextInputAction.next,
-                              ),
-                            ],
-                          ),
-                        ),
-                        SizedBox(width: rl.rowGap),
-                        Expanded(
-                          flex: 6,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _FieldLabel(text: "Condition", rl: rl),
-                              _DropdownField(
-                                rl: rl,
-                                value: _condition,
-                                hint: "Select",
-                                items: _kConditions,
-                                prefixIcon: Icons.star_outline_rounded,
-                                onChanged: (v) => setState(() => _condition = v),
-                              ),
-                            ],
-                          ),
+                        _FieldLabel(text: "Condition", rl: rl),
+                        _DropdownField(
+                          rl: rl,
+                          value: _condition,
+                          hint: "Select",
+                          items: _kConditions,
+                          prefixIcon: Icons.star_outline_rounded,
+                          onChanged: (v) => setState(() => _condition = v),
+                          isExpanded: true,
                         ),
                       ],
                     ),
@@ -710,7 +737,7 @@ class _EditProductPageState extends State<EditProductPage> {
                     stepNumber: 5,
                     icon: Icons.location_on_outlined,
                     title: "Location",
-                    subtitle: "Nearby buyers find you first",
+                    subtitle: "Nearby people find you first",
                     rl: rl,
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -727,8 +754,17 @@ class _EditProductPageState extends State<EditProductPage> {
                               borderRadius: BorderRadius.circular(8),
                             ),
                             child: Row(children: [
-                              const Icon(Icons.check_circle_rounded,
-                                  color: _kPurple, size: 15),
+                              Icon(
+                                // FIX(gap): show whether this location
+                                // actually has usable coordinates attached.
+                                _latitude != null && _longitude != null
+                                    ? Icons.check_circle_rounded
+                                    : Icons.warning_amber_rounded,
+                                color: _latitude != null && _longitude != null
+                                    ? _kPurple
+                                    : Colors.orange,
+                                size: 15,
+                              ),
                               const SizedBox(width: 7),
                               Expanded(
                                 child: Text(_location,
@@ -879,7 +915,11 @@ class _EditProductPageState extends State<EditProductPage> {
                 color: Colors.grey.shade100,
                 child: const Icon(Icons.broken_image_outlined, color: Colors.grey)),
           ),
-          onRemove: () => setState(() => _newImages.removeAt(e.key)),
+          onRemove: () {
+            final removed = _newImages[e.key];
+            _compressedCache.remove(removed.path);
+            setState(() => _newImages.removeAt(e.key));
+          },
           isCover: _existingImages.isEmpty && e.key == 0,
         )),
         // Add photo slot
@@ -1196,7 +1236,7 @@ class _InputField extends StatelessWidget {
 class _DropdownField extends StatelessWidget {
   final _RL                  rl;
   final String?              value;
-  final String               hint;
+  final String                hint;
   final List<String>         items;
   final ValueChanged<String?> onChanged;
   final IconData?            prefixIcon;

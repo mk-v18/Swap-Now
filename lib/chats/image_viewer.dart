@@ -20,6 +20,7 @@ class _ImageViewerState extends State<ImageViewer> {
 
   @override
   void initState() {
+
     super.initState();
     _transformController.addListener(_onTransformChanged);
   }

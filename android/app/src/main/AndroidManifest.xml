@@ -57,7 +57,7 @@
     -->
 
     <application
-        android:label="SwapNow"
+        android:label="Amoeba"
         android:icon="@mipmap/launcher_icon"
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="false"
@@ -87,7 +87,7 @@
 
             <meta-data
                 android:name="com.google.firebase.messaging.default_notification_icon"
-                android:resource="@mipmap/ic_notification" />
+                android:resource="@drawable/ic_notification" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

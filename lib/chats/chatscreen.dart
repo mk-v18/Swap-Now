@@ -63,11 +63,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _recordTimer;
   String? _currentlyPlayingUrl;
   bool _isPlaying = false;
+  Duration _audioDuration = Duration.zero;
+  Duration _audioPosition = Duration.zero;
 
   Map<String, dynamic>? _intent;
   bool _bannerCollapsed = false;
 
   final Set<String> _alreadySaved = {};
+
+  // ── Encryption readiness ────────────────────────────────────────────────
+  // EncryptionService.ensureReady() does an async Cloud Function call on
+  // first use, so we can't assume it's ready the instant this screen opens.
+  // Kick it off in initState and gate send/decrypt on these flags instead
+  // of letting encrypt()/decrypt() throw mid-gesture.
+  bool _encReady = false;
 
   // Tracks the last snapshot length for which we called markMessagesAsSeen.
   // Prevents calling it on every single stream rebuild (would be hundreds of
@@ -77,7 +86,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // ── Design tokens ─────────────────────────────────────────────────────────
   static const Color _purple = Color(0xFF7B1FA2);
   static const Color _lightPurple = Color(0xFFEDE7F6);
-  static const Color _teal = Color(0xFF00796B);
+  static const Color _teal = Color(0xFF4A148C);
 
   // ── Responsive helpers ────────────────────────────────────────────────────
   double get _sw => MediaQuery.of(context).size.width;
@@ -100,13 +109,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _messageController.addListener(_onTypingChanged);
     _loadIntent();
     _loadSavedUrls();
+    _initEncryption();
+
+    _audioPlayer.setPlayerMode(PlayerMode.mediaPlayer); // ← add here
 
     _audioPlayer.onPlayerStateChanged.listen((state) {
       if (mounted) setState(() => _isPlaying = state == PlayerState.playing);
     });
-    _audioPlayer.onPlayerComplete.listen((_) {
-      if (mounted) setState(() { _isPlaying = false; _currentlyPlayingUrl = null; });
+    _audioPlayer.onDurationChanged.listen((d) {
+      if (mounted) setState(() => _audioDuration = d);
     });
+    _audioPlayer.onPositionChanged.listen((p) {
+      if (mounted) setState(() => _audioPosition = p);
+    });
+    _audioPlayer.onPlayerComplete.listen((_) {
+      if (mounted) setState(() {
+        _isPlaying = false;
+        _currentlyPlayingUrl = null;
+        _audioPosition = Duration.zero;
+      });
+    });
+  }
+
+  Future<void> _initEncryption() async {
+    try {
+      await _enc.ensureReady();
+      if (mounted) setState(() => _encReady = true);
+    } catch (e, st) {
+      // TEMP DEBUG — leave this in until we know the root cause.
+      debugPrint('EncryptionService init failed: $e');
+      debugPrintStack(stackTrace: st);
+      if (mounted) {
+        _snack('Could not set up secure chat. Will retry automatically.', error: true);
+      }
+    }
   }
 
   @override
@@ -118,6 +154,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     } else if (state == AppLifecycleState.resumed) {
       _chatService.setUserPresence(uid, online: true);
       _chatService.markMessagesAsSeen(widget.chatId);
+      // In case the first attempt failed (e.g. no network at cold start),
+      // retry silently whenever the app comes back to foreground.
+      if (!_encReady) _initEncryption();
     }
   }
 
@@ -202,14 +241,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _loadIntent() async {
-    final doc = await FirebaseFirestore.instance
-        .collection('chats')
-        .doc(widget.chatId)
-        .get();
-    if (!mounted) return;
-    if (doc.exists) {
-      final intent = (doc.data() as Map<String, dynamic>)['intent'] as Map<String, dynamic>?;
-      if (intent != null) setState(() => _intent = intent);
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('chats')
+          .doc(widget.chatId)
+          .get();
+      if (!mounted) return;
+      if (doc.exists) {
+        final intent = (doc.data() as Map<String, dynamic>)['intent'] as Map<String, dynamic>?;
+        if (intent != null) setState(() => _intent = intent);
+      }
+    } on FirebaseException catch (_) {
+      // chat deleted or no longer accessible — nothing to show
     }
   }
 
@@ -217,6 +260,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _sendText() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
+
+    if (!_encReady) {
+      try {
+        await _enc.ensureReady();
+        if (mounted) setState(() => _encReady = true);
+      } catch (e) {
+        debugPrint('EncryptionService retry failed: $e'); // TEMP DEBUG
+        _snack('Secure chat isn\'t ready yet — please try again in a moment.', error: true);
+        return;
+      }
+    }
+
     final encrypted = _enc.encrypt(text);
     _messageController.clear();
     await _chatService.sendMessage(
@@ -304,6 +359,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _stopAndSendRecording() async {
     _recordTimer?.cancel();
     final path = await _audioRecorder.stop();
+    final recordedDuration = _recordDuration; // capture before it resets
     setState(() { _isRecording = false; _recordDuration = Duration.zero; });
     if (path == null) return;
     final storagePath = 'chat_audio/${widget.chatId}/${DateTime.now().millisecondsSinceEpoch}.m4a';
@@ -313,7 +369,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         path: storagePath,
         onProgress: (p) => setState(() => _uploadProgress = p));
     await _chatService.sendMessage(
-        chatId: widget.chatId, receiverId: widget.receiverId, type: 'audio', fileUrl: url);
+        chatId: widget.chatId,
+        receiverId: widget.receiverId,
+        type: 'audio',
+        fileUrl: url,
+        extra: {'durationMs': recordedDuration.inMilliseconds});
     setState(() => _uploadProgress = 0.0);
   }
 
@@ -324,9 +384,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _toggleAudio(String url) async {
-    if (_currentlyPlayingUrl == url && _isPlaying) {
-      await _audioPlayer.pause();
+    if (_currentlyPlayingUrl == url) {
+      if (_isPlaying) {
+        await _audioPlayer.pause();
+      } else {
+        await _audioPlayer.resume(); // resume, don't replay from start
+      }
     } else {
+      setState(() { _audioPosition = Duration.zero; _audioDuration = Duration.zero; });
       _currentlyPlayingUrl = url;
       await _audioPlayer.play(UrlSource(url));
     }
@@ -340,23 +405,90 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _deleteChat() async {
+    const primaryPurple = Color(0xFF26004D);
+    const dangerRed = Color(0xFFE53935);
+
     final confirm = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Delete chat'),
-        content: const Text('Delete this entire chat and all messages?'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Delete', style: TextStyle(color: Colors.red))),
-        ],
+      builder: (dialogContext) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.12),
+                blurRadius: 24,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          padding: const EdgeInsets.fromLTRB(20, 24, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: dangerRed.withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.delete_outline_rounded, color: dangerRed, size: 26),
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'Delete Chat',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: primaryPurple),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'This will permanently delete this chat and all its messages. This action cannot be undone.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 13.5, color: Colors.black54, height: 1.4),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.pop(dialogContext, false),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.black54,
+                        side: BorderSide(color: Colors.grey.shade300),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      child: const Text('Cancel', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5)),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.pop(dialogContext, true),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: dangerRed,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      child: const Text('Delete', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5)),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
       ),
     );
+
     if (confirm == true) {
+      if (mounted) Navigator.pop(context); // leave first, tears down listeners
       await _chatService.deleteChat(widget.chatId);
-      if (mounted) Navigator.pop(context);
     }
   }
 
@@ -369,219 +501,280 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     const dangerRed = Color(0xFFE53935);
     final quickReasons = ['Spam', 'Harassment', 'Scam', 'Fake profile', 'Inappropriate'];
 
-    try {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
-          titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
-          contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
-          actionsPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-          title: Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: dangerRed.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Icon(Icons.flag_rounded, color: dangerRed, size: 20),
-              ),
-              const SizedBox(width: 10),
-              const Text(
-                'Report User',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: primaryPurple),
+    void safeDispose() {
+      // Wait for the dialog's close transition to finish before disposing,
+      // otherwise widgets still animating out can touch a disposed controller.
+      Future.delayed(const Duration(milliseconds: 300), () {
+        reasonCtrl.dispose();
+        selectedReason.dispose();
+      });
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.12),
+                blurRadius: 24,
+                offset: const Offset(0, 8),
               ),
             ],
           ),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                RichText(
-                  text: TextSpan(
-                    style: TextStyle(fontSize: 13, color: Colors.grey[600]),
-                    children: [
-                      const TextSpan(text: 'Reporting '),
-                      TextSpan(
-                        text: widget.receiverName,
-                        style: const TextStyle(fontWeight: FontWeight.w700, color: primaryPurple),
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: dangerRed.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.flag_rounded, color: dangerRed, size: 20),
+                  ),
+                  const SizedBox(width: 10),
+                  const Text(
+                    'Report User',
+                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600, color: primaryPurple),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    RichText(
+                      text: TextSpan(
+                        style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+                        children: [
+                          const TextSpan(text: 'Reporting '),
+                          TextSpan(
+                            text: widget.receiverName,
+                            style: const TextStyle(fontWeight: FontWeight.w700, color: primaryPurple),
+                          ),
+                        ],
                       ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                const Text('Quick select', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black54)),
-                const SizedBox(height: 8),
-                ValueListenableBuilder<String?>(
-                  valueListenable: selectedReason,
-                  builder: (_, selected, __) => Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: quickReasons.map((r) {
-                      final isSelected = selected == r;
-                      return GestureDetector(
-                        onTap: () {
-                          selectedReason.value = r;
-                          if (reasonCtrl.text.trim().isEmpty) {
-                            reasonCtrl.text = r;
-                            reasonCtrl.selection = TextSelection.collapsed(offset: reasonCtrl.text.length);
-                          }
-                        },
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 150),
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-                          decoration: BoxDecoration(
-                            color: isSelected ? primaryPurple : primaryPurple.withOpacity(0.06),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                              color: isSelected ? primaryPurple : primaryPurple.withOpacity(0.15),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text('Quick select', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black54)),
+                    const SizedBox(height: 8),
+                    ValueListenableBuilder<String?>(
+                      valueListenable: selectedReason,
+                      builder: (_, selected, __) => Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: quickReasons.map((r) {
+                          final isSelected = selected == r;
+                          return GestureDetector(
+                            onTap: () {
+                              selectedReason.value = r;
+                              if (reasonCtrl.text.trim().isEmpty) {
+                                reasonCtrl.text = r;
+                                reasonCtrl.selection = TextSelection.collapsed(offset: reasonCtrl.text.length);
+                              }
+                            },
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 150),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: isSelected ? primaryPurple : primaryPurple.withOpacity(0.06),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(
+                                  color: isSelected ? primaryPurple : primaryPurple.withOpacity(0.15),
+                                ),
+                              ),
+                              child: Text(
+                                r,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: isSelected ? Colors.white : primaryPurple,
+                                ),
+                              ),
                             ),
-                          ),
-                          child: Text(
-                            r,
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color: isSelected ? Colors.white : primaryPurple,
-                            ),
-                          ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text('Details', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black54)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: reasonCtrl,
+                      maxLines: 4,
+                      maxLength: 500,
+                      style: const TextStyle(fontSize: 13.5),
+                      decoration: InputDecoration(
+                        hintText: 'Describe the issue in more detail…',
+                        hintStyle: TextStyle(fontSize: 13, color: Colors.grey[400]),
+                        filled: true,
+                        fillColor: const Color(0xFFF3F0FB),
+                        counterStyle: const TextStyle(fontSize: 11, color: Colors.black38),
+                        contentPadding: const EdgeInsets.all(12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
                         ),
-                      );
-                    }).toList(),
-                  ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: primaryPurple, width: 1.5),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 16),
-                const Text('Details', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black54)),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: reasonCtrl,
-                  maxLines: 4,
-                  maxLength: 500,
-                  style: const TextStyle(fontSize: 13.5),
-                  decoration: InputDecoration(
-                    hintText: 'Describe the issue in more detail…',
-                    hintStyle: TextStyle(fontSize: 13, color: Colors.grey[400]),
-                    filled: true,
-                    fillColor: const Color(0xFFF3F0FB),
-                    counterStyle: const TextStyle(fontSize: 11, color: Colors.black38),
-                    contentPadding: const EdgeInsets.all(12),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: primaryPurple, width: 1.5),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              style: TextButton.styleFrom(foregroundColor: Colors.black54),
-              child: const Text('Cancel', style: TextStyle(fontWeight: FontWeight.w600)),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: dangerRed,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
               ),
-              child: const Text('Submit Report', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
-            ),
-          ],
-        ),
-      );
-
-      if (confirmed != true || !mounted) return;
-
-      if (reasonCtrl.text.trim().isEmpty) {
-        _snack('Please enter a reason before submitting.', error: true);
-        return;
-      }
-
-      final finalConfirm = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          icon: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: dangerRed.withOpacity(0.1),
-              shape: BoxShape.circle,
-            ),
-            child: const Icon(Icons.error_outline_rounded, color: dangerRed, size: 26),
-          ),
-          title: const Text(
-            'Confirm Report',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: primaryPurple),
-          ),
-          content: RichText(
-            textAlign: TextAlign.center,
-            text: TextSpan(
-              style: const TextStyle(fontSize: 13.5, color: Colors.black87, height: 1.4),
-              children: [
-                const TextSpan(text: 'You are about to report '),
-                TextSpan(
-                  text: widget.receiverName,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const TextSpan(text: '. This will be reviewed by our team. Continue?'),
-              ],
-            ),
-          ),
-          actionsAlignment: MainAxisAlignment.center,
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              style: TextButton.styleFrom(foregroundColor: Colors.black54),
-              child: const Text('Go Back', style: TextStyle(fontWeight: FontWeight.w600)),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: dangerRed,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    style: TextButton.styleFrom(foregroundColor: Colors.black54),
+                    child: const Text('Cancel', style: TextStyle(fontWeight: FontWeight.w600)),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: dangerRed,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    child: const Text('Submit Report', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                  ),
+                ],
               ),
-              child: const Text('Yes, Report', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
-            ),
-          ],
+            ],
+          ),
         ),
+      ),
+    );
+
+    if (confirmed != true || !mounted) {
+      safeDispose();
+      return;
+    }
+
+    if (reasonCtrl.text.trim().isEmpty) {
+      _snack('Please enter a reason before submitting.', error: true);
+      safeDispose();
+      return;
+    }
+
+    final finalConfirm = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.12),
+                blurRadius: 24,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          padding: const EdgeInsets.fromLTRB(20, 24, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: dangerRed.withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.error_outline_rounded, color: dangerRed, size: 26),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Confirm Report',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: primaryPurple),
+              ),
+              const SizedBox(height: 8),
+              RichText(
+                textAlign: TextAlign.center,
+                text: TextSpan(
+                  style: const TextStyle(fontSize: 13.5, color: Colors.black87, height: 1.4),
+                  children: [
+                    const TextSpan(text: 'You are about to report '),
+                    TextSpan(
+                      text: widget.receiverName,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    const TextSpan(text: '. This will be reviewed by our team. Continue?'),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    style: TextButton.styleFrom(foregroundColor: Colors.black54),
+                    child: const Text('Go Back', style: TextStyle(fontWeight: FontWeight.w600)),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: dangerRed,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    child: const Text('Yes, Report', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (finalConfirm != true || !mounted) {
+      safeDispose();
+      return;
+    }
+
+    try {
+      await _chatService.reportUser(
+        reportedUserId: widget.receiverId,
+        reportedUserName: widget.receiverName,
+        chatId: widget.chatId,
+        reason: reasonCtrl.text.trim(),
       );
-
-      if (finalConfirm != true || !mounted) return;
-
-      try {
-        await _chatService.reportUser(
-          reportedUserId: widget.receiverId,
-          reportedUserName: widget.receiverName,
-          chatId: widget.chatId,
-          reason: reasonCtrl.text.trim(),
-        );
-        if (mounted) _snack('Report submitted. Our team will review it.', success: true);
-      } catch (_) {
-        if (mounted) _snack('Failed to submit report. Please try again.', error: true);
-      }
+      if (mounted) _snack('Report submitted. Our team will review it.', success: true);
+    } catch (_) {
+      if (mounted) _snack('Failed to submit report. Please try again.', error: true);
     } finally {
-      reasonCtrl.dispose();
-      selectedReason.dispose();
+      safeDispose();
     }
   }
 
@@ -649,7 +842,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (saved) {
         await _markUrlAsSaved(url);
         setState(() => _downloadProgress[url] = -1);
-        _snack('${type == 'image' ? 'Photo' : 'Video'} saved to gallery ✓', success: true);
+        _snack('${type == 'image' ? 'Photo' : 'Video'} saved to gallery', success: true);
       } else {
         setState(() => _downloadProgress[url] = null);
         _snack('Could not save to gallery', error: true);
@@ -747,21 +940,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   // ── Intent banner ─────────────────────────────────────────────────────────
+  // "Sell to Company" removed entirely — an intent is now either a swap or
+  // a buy request. Anything else stored in old data just falls back to swap.
   Widget _buildIntentBanner() {
     final intentType = _intent!['type'] as String? ?? 'swap';
-    final isSell = intentType == 'sell';
     final isBuy = intentType == 'buy';
-    final color = isSell ? const Color(0xFFD84315) : isBuy ? _purple : _teal;
-    final icon = isSell
-        ? Icons.storefront_outlined
-        : isBuy
-        ? Icons.shopping_bag_outlined
-        : Icons.swap_horiz_rounded;
-    final label = isSell
-        ? 'Wants to Sell to Company'
-        : isBuy
-        ? 'Wants to Buy'
-        : 'Wants to Swap';
+    final color = isBuy ? _purple : _teal;
+    final icon = isBuy ? Icons.shopping_bag_outlined : Icons.swap_horiz_rounded;
+    final label = isBuy ? 'Wants to Buy' : 'Wants to Swap';
 
     final listedProduct = _intent!['listedProduct'] as Map<String, dynamic>?;
     final swapProductsRaw = _intent!['swapProducts'] as List?;
@@ -812,7 +998,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               if (listedProduct != null)
                 _buildProductChip(listedProduct, color,
                     prefix: isBuy ? 'Interested in' : 'Wants in exchange for'),
-              if (!isBuy && !isSell && swapProducts.isNotEmpty) ...[
+              if (!isBuy && swapProducts.isNotEmpty) ...[
                 Padding(
                   padding: EdgeInsets.only(
                       left: _isSmall ? 10 : 14,
@@ -884,6 +1070,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         width: 26,
                         height: 26,
                         fit: BoxFit.cover,
+                        // PERF: cap the decoded bitmap to roughly the display
+                        // size instead of decoding the full-resolution source
+                        // image just to shrink it down to 26x26 on screen.
+                        memCacheWidth: 60,
+                        memCacheHeight: 60,
                         errorWidget: (ctx, url, error) => Container(
                           width: 26,
                           height: 26,
@@ -935,6 +1126,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ? CachedNetworkImage(
                   imageUrl: imageUrl,
                   fit: BoxFit.cover,
+                  memCacheWidth: 80,
+                  memCacheHeight: 80,
                   errorWidget: (ctx, url, error) =>
                   const Icon(Icons.image_not_supported_outlined, size: 16, color: Colors.grey),
                 )
@@ -951,9 +1144,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 2),
-                  Text('₹ ${p['price'] ?? '—'}',
-                      style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 3),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.swap_horiz_rounded, size: 11, color: color),
+                      const SizedBox(width: 3),
+                      Text('Swap',
+                          style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w600)),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -962,18 +1162,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
     );
   }
-
-  // ── Swap product detail sheet ─────────────────────────────────────────────
-  /*void _showSwapProductDetail(Map<String, dynamic> p) {
-    final images = (p['images'] as List?)?.map((e) => e as String).toList() ?? [];
-    final pageCtrl = PageController();
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-
-    );
-  }*/
 
   void _showSwapProductDetail(Map<String, dynamic> p) {
     final images = (p['images'] as List?)?.map((e) => e as String).toList() ?? [];
@@ -991,108 +1179,205 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           return StatefulBuilder(builder: (ctx2, setSheet) {
             return Container(
               decoration: const BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+                color: Colors.white,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+                boxShadow: [
+                  BoxShadow(color: Color(0x1A000000), blurRadius: 24, offset: Offset(0, -6)),
+                ],
+              ),
               child: Column(
                 children: [
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10),
                   Container(
-                      width: 40, height: 4,
-                      decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    height: _isSmall ? 180 : (_isTablet ? 300 : 220),
-                    child: images.isEmpty
-                        ? Container(color: Colors.grey[200], child: const Center(child: Icon(Icons.image_not_supported, size: 48, color: Colors.grey)))
-                        : Stack(
-                      children: [
-                        PageView.builder(
-                          controller: pageCtrl,
-                          itemCount: images.length,
-                          onPageChanged: (i) => setSheet(() => currentImg = i),
-                          itemBuilder: (_, i) => CachedNetworkImage(
-                            imageUrl: images[i],
-                            fit: BoxFit.cover,
-                            width: double.infinity,
-                            placeholder: (ctx, url) => Container(
-                              color: Colors.grey[100],
-                              child: const Center(
-                                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00796B)),
-                              ),
-                            ),
-                            errorWidget: (ctx, url, error) => Container(
-                              color: Colors.grey[200],
-                              child: const Center(
-                                child: Icon(Icons.image_not_supported_outlined, size: 40, color: Colors.grey),
-                              ),
-                            ),
-                          ),
-                        ),
-                        if (images.length > 1)
-                          Positioned(
-                            bottom: 10, left: 0, right: 0,
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: List.generate(images.length, (i) {
-                                final active = i == currentImg;
-                                return AnimatedContainer(
-                                  duration: const Duration(milliseconds: 200),
-                                  margin: const EdgeInsets.symmetric(horizontal: 3),
-                                  width: active ? 18 : 6, height: 5,
-                                  decoration: BoxDecoration(
-                                      color: active ? Colors.white : Colors.white54,
-                                      borderRadius: BorderRadius.circular(3)),
-                                );
-                              }),
-                            ),
-                          ),
-                      ],
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.grey[300],
+                      borderRadius: BorderRadius.circular(2),
                     ),
                   ),
+                  const SizedBox(height: 8),
                   Expanded(
                     child: SingleChildScrollView(
                       controller: scrollCtrl,
-                      padding: EdgeInsets.all(_isSmall ? 14 : 20),
+                      physics: const ClampingScrollPhysics(),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                                color: const Color(0xFF00796B).withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(8)),
-                            child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                              Icon(Icons.swap_horiz_rounded, size: 14, color: Color(0xFF00796B)),
-                              SizedBox(width: 4),
-                              Text('Offered for Swap',
-                                  style: TextStyle(fontSize: 11, color: Color(0xFF00796B), fontWeight: FontWeight.w600)),
-                            ]),
+                          // ---- Image carousel ----
+                          Stack(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(20),
+                                child: SizedBox(
+                                  height: _isSmall ? 220 : (_isTablet ? 340 : 260),
+                                  width: double.infinity,
+                                  child: images.isEmpty
+                                      ? Container(
+                                    decoration: BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.topLeft,
+                                        end: Alignment.bottomRight,
+                                        colors: [Colors.grey[200]!, Colors.grey[100]!],
+                                      ),
+                                    ),
+                                    child: const Center(
+                                      child: Icon(Icons.image_not_supported_rounded,
+                                          size: 48, color: Colors.grey),
+                                    ),
+                                  )
+                                      : PageView.builder(
+                                    controller: pageCtrl,
+                                    itemCount: images.length,
+                                    onPageChanged: (i) => setSheet(() => currentImg = i),
+                                    itemBuilder: (_, i) => Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        CachedNetworkImage(
+                                          imageUrl: images[i],
+                                          fit: BoxFit.cover,
+                                          memCacheWidth: 900,
+                                          placeholder: (ctx, url) => Container(
+                                            color: Colors.grey[100],
+                                            child: const Center(
+                                              child: CircularProgressIndicator(
+                                                  strokeWidth: 2, color: Color(0xFF00796B)),
+                                            ),
+                                          ),
+                                          errorWidget: (ctx, url, error) => Container(
+                                            color: Colors.grey[200],
+                                            child: const Center(
+                                              child: Icon(Icons.image_not_supported_outlined,
+                                                  size: 40, color: Colors.grey),
+                                            ),
+                                          ),
+                                        ),
+                                        // subtle bottom gradient so dots stay legible
+                                        if (images.length > 1)
+                                          const DecoratedBox(
+                                            decoration: BoxDecoration(
+                                              gradient: LinearGradient(
+                                                begin: Alignment.topCenter,
+                                                end: Alignment.bottomCenter,
+                                                colors: [Colors.transparent, Color(0x66000000)],
+                                                stops: [0.7, 1.0],
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              if (images.length > 1)
+                                Positioned(
+                                  bottom: 12,
+                                  left: 0,
+                                  right: 0,
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: List.generate(images.length, (i) {
+                                      final active = i == currentImg;
+                                      return AnimatedContainer(
+                                        duration: const Duration(milliseconds: 200),
+                                        curve: Curves.easeOut,
+                                        margin: const EdgeInsets.symmetric(horizontal: 3),
+                                        width: active ? 20 : 6,
+                                        height: 6,
+                                        decoration: BoxDecoration(
+                                          color: active ? Colors.white : Colors.white54,
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                      );
+                                    }),
+                                  ),
+                                ),
+                            ],
                           ),
-                          const SizedBox(height: 12),
-                          Text(p['title'] ?? 'Product',
-                              style: TextStyle(fontSize: _isSmall ? 17 : 20, fontWeight: FontWeight.w700)),
-                          const SizedBox(height: 8),
-                          Text('₹ ${p['price'] ?? '—'}',
-                              style: TextStyle(
-                                  fontSize: _isSmall ? 16 : 18,
-                                  fontWeight: FontWeight.w700,
-                                  color: const Color(0xFF6A1B9A))),
-                          const SizedBox(height: 14),
-                          if ((p['condition'] ?? '').toString().isNotEmpty)
-                            _detailRow('Condition', p['condition'].toString()),
-                          if ((p['category'] ?? '').toString().isNotEmpty)
-                            _detailRow('Category', p['category'].toString()),
-                          if ((p['location'] ?? '').toString().isNotEmpty)
-                            _detailRow('Location', p['location'].toString()),
-                          if ((p['description'] ?? '').toString().isNotEmpty) ...[
-                            const SizedBox(height: 8),
-                            const Text('Description',
-                                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
-                            const SizedBox(height: 6),
-                            Text(p['description'].toString(),
-                                style: const TextStyle(fontSize: 14, color: Colors.black54, height: 1.6)),
-                          ],
-                          SizedBox(height: MediaQuery.of(context).padding.bottom + 16),
+
+                          // ---- Content ----
+                          Padding(
+                            padding: EdgeInsets.fromLTRB(
+                              _isSmall ? 16 : 22,
+                              18,
+                              _isSmall ? 16 : 22,
+                              MediaQuery.of(context).padding.bottom + 20,
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF00796B).withOpacity(0.1),
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.swap_horiz_rounded, size: 15, color: Color(0xFF00796B)),
+                                      SizedBox(width: 5),
+                                      Text(
+                                        'Offered for Swap',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Color(0xFF00796B),
+                                          fontWeight: FontWeight.w700,
+                                          letterSpacing: 0.2,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 14),
+                                Text(
+                                  p['title'] ?? 'Product',
+                                  style: TextStyle(
+                                    fontSize: _isSmall ? 19 : 22,
+                                    fontWeight: FontWeight.w800,
+                                    color: const Color(0xFF1A1A1A),
+                                    height: 1.25,
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+
+                                // ---- Info chips ----
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    if ((p['condition'] ?? '').toString().isNotEmpty)
+                                      _infoChip(Icons.verified_outlined, p['condition'].toString()),
+                                    if ((p['category'] ?? '').toString().isNotEmpty)
+                                      _infoChip(Icons.category_outlined, p['category'].toString()),
+                                    if ((p['location'] ?? '').toString().isNotEmpty)
+                                      _infoChip(Icons.location_on_outlined, p['location'].toString()),
+                                  ],
+                                ),
+
+                                if ((p['description'] ?? '').toString().isNotEmpty) ...[
+                                  const SizedBox(height: 22),
+                                  const Text(
+                                    'Description',
+                                    style: TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w700,
+                                      color: Color(0xFF1A1A1A),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    p['description'].toString(),
+                                    style: const TextStyle(
+                                      fontSize: 14,
+                                      color: Colors.black54,
+                                      height: 1.6,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -1106,20 +1391,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     ).whenComplete(() => pageCtrl.dispose());
   }
 
-  Widget _detailRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
+  Widget _infoChip(IconData icon, String label) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF5F5F5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFEDEDED)),
+      ),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
-            width: _isSmall ? 80 : 90,
-            child: Text(label,
-                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.black87)),
-          ),
-          Expanded(
-            child: Text(value,
-                style: const TextStyle(fontSize: 13, color: Colors.black54, fontWeight: FontWeight.w500)),
+          Icon(icon, size: 15, color: Colors.black54),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.black87),
           ),
         ],
       ),
@@ -1180,21 +1467,70 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           : [
         PopupMenuButton<String>(
           icon: const Icon(Icons.more_vert, color: Colors.white),
+          offset: const Offset(0, 45),
+          elevation: 6,
+          shadowColor: Colors.black26,
+          color: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          padding: EdgeInsets.zero,
           onSelected: (v) {
             if (v == 'delete_chat') _deleteChat();
             if (v == 'report') _showReportDialog();
           },
           itemBuilder: (_) => [
-            const PopupMenuItem(
+            PopupMenuItem(
               value: 'report',
-              child: Row(children: [
-                Icon(Icons.flag_outlined, color: Colors.red, size: 18),
-                SizedBox(width: 10),
-                Text('Report User', style: TextStyle(color: Colors.red)),
-              ]),
+              height: 46,
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.flag_outlined, color: Colors.red, size: 16),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text(
+                    'Report User',
+                    style: TextStyle(
+                      color: Colors.red,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13.5,
+                    ),
+                  ),
+                ],
+              ),
             ),
-            const PopupMenuDivider(),
-            const PopupMenuItem(value: 'delete_chat', child: Text('Delete Chat')),
+            const PopupMenuDivider(height: 1),
+            PopupMenuItem(
+              value: 'delete_chat',
+              height: 46,
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF26004D).withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.delete_outline_rounded, color: Color(0xFF26004D), size: 16),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text(
+                    'Delete Chat',
+                    style: TextStyle(
+                      color: Color(0xFF26004D),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
       ],
@@ -1215,6 +1551,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         return StreamBuilder<DocumentSnapshot>(
           stream: FirebaseFirestore.instance.collection('chats').doc(widget.chatId).snapshots(),
           builder: (ctx, chatSnap) {
+            if (chatSnap.hasError) return const SizedBox.shrink();
             bool isTyping = false;
             if (chatSnap.hasData && chatSnap.data!.exists) {
               final typing =
@@ -1275,8 +1612,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return StreamBuilder<QuerySnapshot>(
       stream: _chatService.getMessages(widget.chatId),
       builder: (context, snapshot) {
-        // Mark seen only when the message count actually changes (new message
-        // arrived), not on every rebuild — avoids hundreds of Firestore writes.
+        if (snapshot.hasError) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && Navigator.canPop(context)) {
+              _snack('This chat is no longer available', error: true);
+              Navigator.pop(context);
+            }
+          });
+          return const SizedBox.shrink();
+        }
+
         if (snapshot.hasData) {
           final len = snapshot.data!.docs.length;
           if (len != _lastSeenSnapshotLength) {
@@ -1287,18 +1632,57 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           }
         }
 
+        // FIX (bug 2): previously this returned a CircularProgressIndicator
+        // while waiting for the first snapshot. Firestore's on-device cache
+        // resolves almost instantly on repeat opens (this stream isn't a
+        // one-time `get()`, it's a listener, and cached data is delivered
+        // synchronously before the fresh server data arrives), so the
+        // spinner was mostly just a flash of loading UI before the real
+        // content popped in. Rendering nothing during that (very short) gap
+        // makes the chat feel like it "just appears" instead of visibly
+        // loading, matching what you asked for.
         if (!snapshot.hasData) {
-          return const Center(child: CircularProgressIndicator());
+          return const SizedBox.shrink();
         }
         final docs = snapshot.data!.docs;
         if (docs.isEmpty) {
           return Center(
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              Icon(Icons.lock_outline, size: 44, color: Colors.grey[400]),
-              const SizedBox(height: 8),
-              Text('Messages are end-to-end encrypted',
-                  style: TextStyle(color: Colors.grey[500], fontSize: 13)),
-            ]),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00796B).withOpacity(0.08),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(Icons.lock_rounded, size: 32, color: const Color(0xFF00796B).withOpacity(0.8)),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Messages are end-to-end encrypted',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.grey[700],
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Text(
+                    'No one outside this chat can read them, not even us',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.grey[500],
+                      fontSize: 12,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           );
         }
 
@@ -1310,15 +1694,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           itemCount: docs.length,
           itemBuilder: (context, i) {
             final doc = docs[i];
-            final data = doc.data() as Map<String, dynamic>;
-            final ts = (data['timestamp'] as Timestamp?)?.toDate();
+            // FIX (bug 4): use the pending-writes-aware resolver so a
+            // message that hasn't been acked by the server yet still gets
+            // a usable timestamp (the device clock) instead of null, which
+            // previously caused rapid multi-sends to flicker/misorder.
+            final ts = _resolveTimestamp(doc);
 
             bool showDateChip = false;
             if (ts != null) {
               if (i == docs.length - 1) {
                 showDateChip = true;
               } else {
-                final prevTs = ((docs[i + 1].data() as Map<String, dynamic>)['timestamp'] as Timestamp?)?.toDate();
+                final prevTs = _resolveTimestamp(docs[i + 1]);
                 if (prevTs != null && _dateLabel(ts) != _dateLabel(prevTs)) {
                   showDateChip = true;
                 }
@@ -1335,6 +1722,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         );
       },
     );
+  }
+
+  // FIX (bug 4) — corrected approach: `.data(serverTimestampBehavior: ...)`
+  // isn't available in this project's cloud_firestore version, so instead
+  // we fall back to the device clock only for messages that are still
+  // "pending" (not yet acknowledged by the server). `doc.metadata
+  // .hasPendingWrites` is true exactly for messages you just sent that
+  // haven't round-tripped yet — that's when `timestamp` reads as null
+  // because the `FieldValue.serverTimestamp()` sentinel hasn't resolved.
+  // Once the server confirms, this naturally switches to the real value.
+  DateTime? _resolveTimestamp(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>?;
+    final ts = data?['timestamp'] as Timestamp?;
+    if (ts != null) return ts.toDate();
+    if (doc.metadata.hasPendingWrites) return DateTime.now();
+    return null;
   }
 
   String _dateLabel(DateTime dt) {
@@ -1371,14 +1774,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final extra = (data['extra'] is Map)
         ? Map<String, dynamic>.from(data['extra'] as Map)
         : <String, dynamic>{};
-    final timestamp = (data['timestamp'] as Timestamp?)?.toDate();
+    // FIX (bug 4): resolve via the pending-writes-aware helper so each
+    // bubble's own time label populates immediately for messages still in
+    // flight, instead of rendering blank and then popping in once the
+    // server confirms — that pop-in is what made rapid multi-sends look
+    // like a bug.
+    final timestamp = _resolveTimestamp(doc);
     final status = (data['status'] ?? 'sent') as String;
     final encrypted = data['encrypted'] == true;
     final time = timestamp != null ? DateFormat('h:mm a').format(timestamp) : '';
     final selected = _selectedMessageIds.contains(doc.id);
 
+    // Guard against decrypting before EncryptionService has finished its
+    // async init — previously this threw a StateError the instant any
+    // encrypted message tried to render (see _enc.decrypt's _requireReady).
     if (type == 'text' && encrypted) {
-      text = _enc.decrypt(text);
+      text = _encReady ? _enc.decrypt(text) : '🔒 Decrypting…';
     }
 
     return GestureDetector(
@@ -1425,11 +1836,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (encrypted && type == 'text')
-                    Padding(
-                      padding: const EdgeInsets.only(right: 3),
-                      child: Icon(Icons.lock, size: 10, color: Colors.grey[400]),
-                    ),
+                  // FIX (bug 3): removed the small lock icon that used to
+                  // render next to the timestamp for encrypted text
+                  // messages. `encrypted` is still used above to decide
+                  // whether to decrypt the text — it's just no longer
+                  // shown as an icon here.
                   Text(time, style: TextStyle(fontSize: 11, color: Colors.grey[500])),
                   if (isMe) ...[const SizedBox(width: 4), _buildTick(status)],
                 ],
@@ -1471,6 +1882,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   width: _mediaW,
                   height: _mediaH,
                   fit: BoxFit.cover,
+                  // PERF: chat bubbles never render larger than _mediaW —
+                  // capping the decode target here is the biggest single
+                  // win for scroll smoothness in image-heavy chats.
+                  memCacheWidth: 600,
                   placeholder: (ctx, url) => SizedBox(
                     width: _mediaW,
                     height: _mediaH,
@@ -1520,8 +1935,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         );
 
       case 'audio':
-        final isThisPlaying = _currentlyPlayingUrl == fileUrl && _isPlaying;
+        final isThisTrack = _currentlyPlayingUrl == fileUrl;
+        final isThisPlaying = isThisTrack && _isPlaying;
         final waveWidth = _isSmall ? 90.0 : 120.0;
+
+        final storedMs = extra['durationMs'] as int?;
+        final knownDuration = storedMs != null ? Duration(milliseconds: storedMs) : null;
+        final total = (isThisTrack && _audioDuration > Duration.zero) ? _audioDuration : knownDuration;
+        final pos = isThisTrack ? _audioPosition : Duration.zero;
+        final progressRatio = (total != null && total.inMilliseconds > 0)
+            ? (pos.inMilliseconds / total.inMilliseconds).clamp(0.0, 1.0)
+            : 0.0;
+
+        String fmt(Duration d) {
+          final m = d.inMinutes.remainder(60);
+          final s = d.inSeconds.remainder(60);
+          return '$m:${s.toString().padLeft(2, '0')}';
+        }
+
+        final timeLabel = isThisTrack && (isThisPlaying || pos > Duration.zero)
+            ? (total != null ? '${fmt(pos)} / ${fmt(total)}' : fmt(pos))
+            : (total != null ? fmt(total) : '');
+
         return Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           child: Row(
@@ -1541,19 +1976,37 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    width: waveWidth, height: 2,
-                    decoration: BoxDecoration(
-                        color: isMe ? Colors.white54 : Colors.grey[300],
-                        borderRadius: BorderRadius.circular(1)),
-                    child: isThisPlaying
-                        ? LinearProgressIndicator(
-                        color: isMe ? Colors.white : _purple,
-                        backgroundColor: Colors.transparent)
-                        : null,
+                  Stack(
+                    alignment: Alignment.centerLeft,
+                    children: [
+                      Container(
+                        width: waveWidth, height: 2,
+                        decoration: BoxDecoration(
+                            color: isMe ? Colors.white54 : Colors.grey[300],
+                            borderRadius: BorderRadius.circular(1)),
+                      ),
+                      if (progressRatio > 0)
+                        Container(
+                          width: waveWidth * progressRatio, height: 2,
+                          decoration: BoxDecoration(
+                              color: isMe ? Colors.white : _purple,
+                              borderRadius: BorderRadius.circular(1)),
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 4),
-                  Icon(Icons.mic, size: 14, color: isMe ? Colors.white70 : Colors.grey[500]),
+                  Row(
+                    children: [
+                      Icon(Icons.mic, size: 12, color: isMe ? Colors.white70 : Colors.grey[500]),
+                      if (timeLabel.isNotEmpty) ...[
+                        const SizedBox(width: 4),
+                        Text(timeLabel,
+                            style: TextStyle(
+                                fontSize: 11,
+                                color: isMe ? Colors.white70 : Colors.grey[500])),
+                      ],
+                    ],
+                  ),
                 ],
               ),
             ],
