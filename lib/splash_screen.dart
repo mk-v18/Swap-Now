@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'package:credbro/chats/notification_service.dart';
-import 'package:credbro/logs/wrapper.dart';
+import 'package:amoeba/chats/notification_service.dart';
+import 'package:amoeba/logs/wrapper.dart';
 
 class SplashScreen extends StatefulWidget {
   // C1 fix: navigatorKey passed directly — no unsafe widget tree cast

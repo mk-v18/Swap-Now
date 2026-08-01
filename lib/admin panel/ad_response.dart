@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter_svg/svg.dart';
 import 'package:intl/intl.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -692,7 +693,7 @@ class _AdResponsesPageState extends State<AdResponsesPage>
   Widget _emptyView(double sw) => Center(
     child: Padding(
       padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: Image.asset(
+      child: SvgPicture.asset(
         _emptyImageAsset(),
         width: _cl(sw * 0.7, 200.0, 320.0),
         fit: BoxFit.contain,
@@ -704,15 +705,15 @@ class _AdResponsesPageState extends State<AdResponsesPage>
   String _emptyImageAsset() {
     switch (_selectedStatus) {
       case 'approved':
-        return 'assets/images/empty_approved.png';
+        return 'assets/images/empty_approved.svg';
       case 'rejected':
-        return 'assets/images/empty_rejected.png';
+        return 'assets/images/empty_rejected.svg';
       case 'pending':
-        return 'assets/images/empty_pending.png';
+        return 'assets/images/empty_pending.svg';
       default:
         return widget.isAdmin
-            ? 'assets/images/empty_no_ads.png'
-            : 'assets/images/empty_no_ads.png';
+            ? 'assets/images/empty_no_ads.svg'
+            : 'assets/images/empty_no_ads.svg';
     }
   }
 

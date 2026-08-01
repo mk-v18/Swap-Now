@@ -39,14 +39,33 @@ class NotificationService {
   static const _chatChannelId   = 'chat_messages';
   static const _chatChannelName = 'Chat Messages';
 
-  // NEW: separate channel for swap-request / accept / decline / exchange
+  // Separate channel for swap-request / accept / decline / exchange
   // notifications so they don't get grouped visually with chat messages,
   // and so background/terminated-state deliveries (which use the
   // channelId set server-side in the FCM payload) land correctly too.
   static const _swapChannelId   = 'swap_updates';
   static const _swapChannelName = 'Swap Updates';
 
-  // NEW: the full set of "type" values the swap/exchange Cloud Functions
+  // Separate channel for admin-facing "new help query submitted"
+  // notifications. Kept distinct from chat/swap so admins can mute/manage
+  // it independently, and so background/terminated deliveries land with
+  // the right channelId (set server-side in onHelpQueryCreated).
+  static const _helpChannelId   = 'help_queries';
+  static const _helpChannelName = 'Help Queries';
+
+  // NEW: channel for ad request lifecycle notifications — covers both
+  // directions: admin gets "new ad request submitted", submitter gets
+  // "approved"/"rejected". Kept as one channel since they're all about
+  // the same feature area (WantToAdvertisePage / AdResponsesPage).
+  static const _adChannelId   = 'ad_updates';
+  static const _adChannelName = 'Ad Updates';
+
+  // NEW: channel for admin-facing "new suggestion submitted"
+  // notifications (SuggestionsPage → suggestions/{id}).
+  static const _suggestionChannelId   = 'suggestions';
+  static const _suggestionChannelName = 'Suggestions';
+
+  // The full set of "type" values the swap/exchange Cloud Functions
   // send. Anything in this set is routed differently from chat messages —
   // no chatId/senderName/senderPhoto shape, and title/body come from the
   // FCM `notification` block rather than `data`.
@@ -58,9 +77,33 @@ class NotificationService {
     'exchange_cancelled',
   };
 
+  // The "type" value sent by onHelpQueryCreated (index.js section 6).
+  // Same shape as swap notifications — title/body live in
+  // message.notification, not message.data.
+  static const _helpNotificationTypes = {
+    'help_query',
+  };
+
+  // NEW: the "type" values sent by onAdRequestCreated / onAdRequestUpdated
+  // (index.js section 7). Same shape as swap/help — title/body live in
+  // message.notification.
+  static const _adNotificationTypes = {
+    'ad_request_submitted',
+    'ad_request_approved',
+    'ad_request_rejected',
+  };
+
+  // NEW: the "type" value sent by onSuggestionCreated (index.js section 8).
+  static const _suggestionNotificationTypes = {
+    'new_suggestion',
+  };
+
   static const _allowedSchemes = {'https', 'http'};
 
   bool _isSwapType(String type) => _swapNotificationTypes.contains(type);
+  bool _isHelpType(String type) => _helpNotificationTypes.contains(type);
+  bool _isAdType(String type) => _adNotificationTypes.contains(type);
+  bool _isSuggestionType(String type) => _suggestionNotificationTypes.contains(type);
 
   // ── INIT ──────────────────────────────────────────────────────────────────
   Future<void> init(GlobalKey<NavigatorState> navigatorKey) async {
@@ -102,12 +145,51 @@ class NotificationService {
       ),
     );
 
-    // NEW: swap/exchange channel.
+    // Swap/exchange channel.
     await androidPlugin?.createNotificationChannel(
       const AndroidNotificationChannel(
         _swapChannelId,
         _swapChannelName,
         description:      'Swap request, accept/decline, and exchange notifications',
+        importance:       Importance.max,
+        playSound:        true,
+        enableVibration:  true,
+        showBadge:        true,
+      ),
+    );
+
+    // Help query channel (admin-facing).
+    await androidPlugin?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _helpChannelId,
+        _helpChannelName,
+        description:      'New support/help query submissions',
+        importance:       Importance.max,
+        playSound:        true,
+        enableVibration:  true,
+        showBadge:        true,
+      ),
+    );
+
+    // NEW: Ad request channel (admin submission alert + user approve/reject).
+    await androidPlugin?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _adChannelId,
+        _adChannelName,
+        description:      'Ad request submissions, approvals, and rejections',
+        importance:       Importance.max,
+        playSound:        true,
+        enableVibration:  true,
+        showBadge:        true,
+      ),
+    );
+
+    // NEW: Suggestion channel (admin-facing).
+    await androidPlugin?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _suggestionChannelId,
+        _suggestionChannelName,
+        description:      'New suggestions submitted by users',
         importance:       Importance.max,
         playSound:        true,
         enableVibration:  true,
@@ -170,11 +252,30 @@ class NotificationService {
     final data = message.data;
     final type = _str(data, 'type', fallback: 'text');
 
-    // NEW: swap/exchange notifications take a completely different shape
+    // Swap/exchange notifications take a completely different shape
     // (no chatId/senderName — title/body live in message.notification),
     // so branch them off before touching any of the chat-specific fields.
     if (_isSwapType(type)) {
       await _handleSwapForegroundMessage(message, type);
+      return;
+    }
+
+    // Help-query notifications (admin-facing) — same reasoning as swap
+    // notifications above, branch off before the chat-specific fields.
+    if (_isHelpType(type)) {
+      await _handleHelpForegroundMessage(message);
+      return;
+    }
+
+    // NEW: ad request notifications (submitted / approved / rejected).
+    if (_isAdType(type)) {
+      await _handleAdForegroundMessage(message, type);
+      return;
+    }
+
+    // NEW: new-suggestion notifications (admin-facing).
+    if (_isSuggestionType(type)) {
+      await _handleSuggestionForegroundMessage(message);
       return;
     }
 
@@ -198,7 +299,7 @@ class NotificationService {
     );
   }
 
-  // NEW: shows the local notification for swap_request / swap_accepted /
+  // Shows the local notification for swap_request / swap_accepted /
   // swap_declined / exchange_completed / exchange_cancelled. Title/body come
   // from the FCM `notification` block the Cloud Function already set — we
   // only fall back to a generic title if that's somehow missing (e.g. a
@@ -240,6 +341,128 @@ class NotificationService {
     );
   }
 
+  // Shows the local notification for help_query. Title/body come from
+  // the FCM `notification` block the Cloud Function already set (see
+  // onHelpQueryCreated in index.js) — a generic title is used only as a
+  // fallback for a data-only test message.
+  Future<void> _handleHelpForegroundMessage(RemoteMessage message) async {
+    final title = message.notification?.title ?? 'New help query';
+    final body  = message.notification?.body  ?? '';
+    final payload = jsonEncode(message.data);
+    final notifId = _helpNotifId(message.data);
+
+    final androidDetails = AndroidNotificationDetails(
+      _helpChannelId,
+      _helpChannelName,
+      channelDescription: 'New support/help query submissions',
+      importance:         Importance.max,
+      priority:           Priority.high,
+      styleInformation:   BigTextStyleInformation(body),
+      color:              const Color(0xFF5800B3),
+      icon:               'ic_notification',
+      playSound:          true,
+      enableVibration:    true,
+      when:               DateTime.now().millisecondsSinceEpoch,
+      showWhen:           true,
+    );
+
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert:     true,
+      presentBadge:     true,
+      presentSound:     true,
+      threadIdentifier: 'help',
+    );
+
+    await _localNotifications.show(
+      notifId,
+      title,
+      body,
+      NotificationDetails(android: androidDetails, iOS: iosDetails),
+      payload: payload,
+    );
+  }
+
+  // NEW: shows the local notification for ad_request_submitted /
+  // ad_request_approved / ad_request_rejected. Title/body come from the
+  // FCM `notification` block set server-side in onAdRequestCreated /
+  // onAdRequestUpdated.
+  Future<void> _handleAdForegroundMessage(RemoteMessage message, String type) async {
+    final title = message.notification?.title ?? _adTitleFor(type);
+    final body  = message.notification?.body  ?? '';
+    final payload = jsonEncode(message.data);
+    final notifId = _adNotifId(message.data, type);
+
+    final androidDetails = AndroidNotificationDetails(
+      _adChannelId,
+      _adChannelName,
+      channelDescription: 'Ad request submissions, approvals, and rejections',
+      importance:         Importance.max,
+      priority:           Priority.high,
+      styleInformation:   BigTextStyleInformation(body),
+      color:              const Color(0xFF5800B3),
+      icon:               'ic_notification',
+      playSound:          true,
+      enableVibration:    true,
+      when:               DateTime.now().millisecondsSinceEpoch,
+      showWhen:           true,
+    );
+
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert:     true,
+      presentBadge:     true,
+      presentSound:     true,
+      threadIdentifier: 'ad',
+    );
+
+    await _localNotifications.show(
+      notifId,
+      title,
+      body,
+      NotificationDetails(android: androidDetails, iOS: iosDetails),
+      payload: payload,
+    );
+  }
+
+  // NEW: shows the local notification for new_suggestion. Title/body come
+  // from the FCM `notification` block set server-side in
+  // onSuggestionCreated.
+  Future<void> _handleSuggestionForegroundMessage(RemoteMessage message) async {
+    final title = message.notification?.title ?? 'New suggestion';
+    final body  = message.notification?.body  ?? '';
+    final payload = jsonEncode(message.data);
+    final notifId = _suggestionNotifId(message.data);
+
+    final androidDetails = AndroidNotificationDetails(
+      _suggestionChannelId,
+      _suggestionChannelName,
+      channelDescription: 'New suggestions submitted by users',
+      importance:         Importance.max,
+      priority:           Priority.high,
+      styleInformation:   BigTextStyleInformation(body),
+      color:              const Color(0xFF5800B3),
+      icon:               'ic_notification',
+      playSound:          true,
+      enableVibration:    true,
+      when:               DateTime.now().millisecondsSinceEpoch,
+      showWhen:           true,
+    );
+
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert:     true,
+      presentBadge:     true,
+      presentSound:     true,
+      threadIdentifier: 'suggestion',
+    );
+
+    await _localNotifications.show(
+      notifId,
+      title,
+      body,
+      NotificationDetails(android: androidDetails, iOS: iosDetails),
+      payload: payload,
+    );
+  }
+
   String _swapTitleFor(String type) {
     switch (type) {
       case 'swap_request':        return 'New swap request';
@@ -251,6 +474,17 @@ class NotificationService {
     }
   }
 
+  // NEW: fallback titles if the FCM `notification` block is somehow
+  // missing (e.g. a data-only test message from the Firebase console).
+  String _adTitleFor(String type) {
+    switch (type) {
+      case 'ad_request_submitted':  return 'New ad request';
+      case 'ad_request_approved':   return 'Ad request approved';
+      case 'ad_request_rejected':   return 'Ad request rejected';
+      default:                      return 'Ad update';
+    }
+  }
+
   // Stable notif id namespaced by type+id so it can never collide with a
   // chat notification's chatId-based id, and so e.g. a "declined" and a
   // later "accepted" push for the same request don't stomp each other.
@@ -259,6 +493,28 @@ class NotificationService {
         ? _str(data, 'requestId')
         : _str(data, 'historyId');
     return 'swap_${type}_$id'.hashCode & 0x7FFFFFFF;
+  }
+
+  // Stable notif id namespaced by queryId so it can never collide with
+  // a chat or swap notification's id, and repeated pushes for the same
+  // query (e.g. a resubmit) replace rather than stack.
+  int _helpNotifId(Map<String, dynamic> data) {
+    final id = _str(data, 'queryId');
+    return 'help_query_$id'.hashCode & 0x7FFFFFFF;
+  }
+
+  // NEW: stable notif id namespaced by type+adId so a "submitted" push and
+  // a later "approved"/"rejected" push for the same ad don't stomp each
+  // other, and never collide with chat/swap/help ids.
+  int _adNotifId(Map<String, dynamic> data, String type) {
+    final id = _str(data, 'adId');
+    return 'ad_${type}_$id'.hashCode & 0x7FFFFFFF;
+  }
+
+  // NEW: stable notif id namespaced by suggestionId.
+  int _suggestionNotifId(Map<String, dynamic> data) {
+    final id = _str(data, 'suggestionId');
+    return 'suggestion_$id'.hashCode & 0x7FFFFFFF;
   }
 
   // ── SHOW LOCAL NOTIFICATION (chat) ───────────────────────────────────────
@@ -329,8 +585,8 @@ class NotificationService {
     final actionId = response.actionId;
 
     // Reply / mark-read actions only ever exist on chat notifications
-    // (swap notifications don't add these actions), so it's safe to check
-    // these first regardless of type.
+    // (swap/help/ad/suggestion notifications don't add these actions), so
+    // it's safe to check these first regardless of type.
     if (actionId?.startsWith('reply_') == true) {
       final replyText = response.input?.trim();
       if (replyText != null && replyText.isNotEmpty) {
@@ -439,13 +695,21 @@ class NotificationService {
     }
   }
 
-  // NEW: single entry point that decides where a payload should navigate —
-  // a chat screen for ordinary messages, or the requests/history pages for
-  // swap and exchange updates.
+  // Single entry point that decides where a payload should navigate — a
+  // chat screen for ordinary messages, the requests/history pages for
+  // swap and exchange updates, the admin help-queries page for a new
+  // support query, the ad-responses page for ad lifecycle updates, or
+  // the admin categories page for a new suggestion.
   void _routeNotification(Map<String, dynamic> data) {
     final type = _str(data, 'type', fallback: 'text');
     if (_isSwapType(type)) {
       _navigateForSwap(type, data);
+    } else if (_isHelpType(type)) {
+      _navigateForHelp(data);
+    } else if (_isAdType(type)) {
+      _navigateForAd(type, data);
+    } else if (_isSuggestionType(type)) {
+      _navigateForSuggestion(data);
     } else {
       _navigateToChat(data);
     }
@@ -478,9 +742,9 @@ class NotificationService {
     });
   }
 
-  // NEW: routes each swap/exchange type to the right screen+tab. We don't
-  // have a receiverId/receiverName/receiverImage in these payloads (only
-  // chatId on the 'accepted' case), so rather than opening ChatScreen with
+  // Routes each swap/exchange type to the right screen+tab. We don't have
+  // a receiverId/receiverName/receiverImage in these payloads (only chatId
+  // on the 'accepted' case), so rather than opening ChatScreen with
   // incomplete data, we land on the Requests page's matching tab — the
   // user can tap into the chat from there.
   void _navigateForSwap(String type, Map<String, dynamic> data) {
@@ -508,6 +772,62 @@ class NotificationService {
       default:
         debugPrint('[Notifications] Unknown swap notification type: $type');
     }
+  }
+
+  // Routes a tapped help_query notification to the admin's help queries
+  // list. There's no per-query detail route in the app today
+  // (AdminHelpQueriesPage opens the detail sheet itself via a StreamBuilder
+  // + tap), so we land on the list — the admin can tap the relevant card.
+  void _navigateForHelp(Map<String, dynamic> data) {
+    final nav = _navigatorKey?.currentState;
+    if (nav == null) {
+      _pendingNavigationPayload = jsonEncode(data);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingNavigation());
+      return;
+    }
+    nav.pushNamed('/admin-help-queries');
+  }
+
+  // NEW: routes ad_request_submitted (admin) / ad_request_approved /
+  // ad_request_rejected (submitter) to AdResponsesPage in the right mode.
+  // AdResponsesPage itself opens the detail sheet for a specific ad on tap,
+  // so we land on the (filtered) list rather than trying to deep-link to
+  // one card.
+  void _navigateForAd(String type, Map<String, dynamic> data) {
+    final nav = _navigatorKey?.currentState;
+    if (nav == null) {
+      _pendingNavigationPayload = jsonEncode(data);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingNavigation());
+      return;
+    }
+
+    switch (type) {
+      case 'ad_request_submitted':
+        nav.pushNamed('/ad-responses', arguments: {'isAdmin': true});
+        break;
+      case 'ad_request_approved':
+      case 'ad_request_rejected':
+        nav.pushNamed('/ad-responses', arguments: {'isAdmin': false});
+        break;
+      default:
+        debugPrint('[Notifications] Unknown ad notification type: $type');
+    }
+  }
+
+  // NEW: routes a tapped new_suggestion notification. There is no
+  // dedicated "review suggestions" admin screen yet (only Help Queries,
+  // Reports, and Ad Responses exist in AdminCategoriesPage today), so this
+  // lands on the admin categories page as the closest available screen.
+  // Build a SuggestionsAdminPage + register a '/admin-suggestions' route
+  // if you want a direct deep link here instead.
+  void _navigateForSuggestion(Map<String, dynamic> data) {
+    final nav = _navigatorKey?.currentState;
+    if (nav == null) {
+      _pendingNavigationPayload = jsonEncode(data);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingNavigation());
+      return;
+    }
+    nav.pushNamed('/admin-categories');
   }
 
   // ── ACTIVE CHAT MANAGEMENT ────────────────────────────────────────────────

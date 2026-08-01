@@ -267,10 +267,34 @@ class ChatService {
     }
   }
 
-  /// Deletes all messages in the chat via batched writes, then deletes the chat doc.
+  /// Deletes all messages in the chat via batched writes.
+  ///
+  /// ROOT CAUSE FIX: this used to unconditionally `chatRef.delete()` the
+  /// whole chat document at the end. But `intent` (the swap/buy banner
+  /// ChatScreen renders via `_buildIntentBanner`) lives as a FIELD on that
+  /// SAME document (see swap_request_service.dart's `acceptRequest`, which
+  /// merges `{'intent': {...}}` onto `chats/{chatId}`). Deleting the whole
+  /// doc silently wiped the intent along with the messages, so the banner
+  /// vanished the moment "Delete Chat" was tapped — and stayed gone even
+  /// if the two users ended up back in the same chat later, since nothing
+  /// re-writes `intent` except a fresh `acceptRequest` call.
+  ///
+  /// Fix: if the chat has an `intent`, never hard-delete the doc. Instead
+  /// rewrite it as a "fresh" shell (empty last message, reset timestamp)
+  /// that keeps `participants` (required unchanged by firestore.rules'
+  /// `allow update` check) and `intent` intact. Only chats with no intent
+  /// (plain, non-swap/buy conversations) are removed entirely, same as
+  /// before.
   Future<void> deleteChat(String chatId) async {
     const batchSize = 499;
     final chatRef = _firestore.collection('chats').doc(chatId);
+
+    // Grab intent + participants BEFORE we start deleting anything.
+    final chatSnap = await chatRef.get();
+    final chatData = chatSnap.data() as Map<String, dynamic>?;
+    final existingIntent = chatData?['intent'];
+    final participants = chatData?['participants'];
+
     QuerySnapshot messages;
     do {
       messages =
@@ -282,7 +306,24 @@ class ChatService {
       }
       await batch.commit();
     } while (messages.docs.length == batchSize);
-    await chatRef.delete();
+
+    if (existingIntent != null && participants != null) {
+      // Keep the doc alive so the intent banner survives "Delete Chat".
+      // NOTE: this is a non-merge `set()`, which already replaces the
+      // whole document — any field left out (lastSenderId, lastStatus,
+      // etc.) is dropped automatically. `FieldValue.delete()` is only
+      // valid inside update()/merge-set() calls, so it's not used here.
+      await chatRef.set({
+        'participants': participants,
+        'lastMessage': '',
+        'typing': {},
+        'timestamp': FieldValue.serverTimestamp(),
+        'intent': existingIntent,
+      });
+    } else {
+      // No intent tied to this chat — safe to remove the doc entirely.
+      await chatRef.delete();
+    }
   }
 
   // ── ADMIN LOOKUP ─────────────────────────────────────────────────────────

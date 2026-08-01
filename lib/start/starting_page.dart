@@ -1,7 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import '../logs/wrapper.dart';
 import '../pages/bottom_navigation.dart';
 
@@ -132,7 +132,7 @@ class _StartingPageState extends State<StartingPage>
                           children: [
                             Text(
                               'Skip',
-                              style: GoogleFonts.poppins(
+                              style: TextStyle(
                                 color: _primary,
                                 fontSize: skipFontSize,
                                 fontWeight: FontWeight.w600,
@@ -150,8 +150,8 @@ class _StartingPageState extends State<StartingPage>
                   SizedBox(height: size.height * 0.2),
 
                   // ── Illustration ────────────────────────────────────────
-                  Image.asset(
-                    'assets/images/boxes.png',
+                  SvgPicture.asset(
+                    'assets/images/boxes.svg',
                     width: imageWidth,
                     fit: BoxFit.contain,
                   ),
@@ -162,7 +162,7 @@ class _StartingPageState extends State<StartingPage>
                   Text(
                     "Exchange What You Have,\nGet What You Need.",
                     textAlign: TextAlign.center,
-                    style: GoogleFonts.poppins(
+                    style: TextStyle(
                       fontSize: titleFontSize,
                       fontWeight: FontWeight.w700,
                       color: const Color(0xFF5800B3),
@@ -174,7 +174,7 @@ class _StartingPageState extends State<StartingPage>
                   Text(
                     "Every Product Deserves Another Chance",
                     textAlign: TextAlign.center,
-                    style: GoogleFonts.poppins(
+                    style: TextStyle(
                       fontSize: subtitleFontSize,
                       color: const Color(0xFF5800B3).withOpacity(0.65),
                       fontWeight: FontWeight.w500,
@@ -237,7 +237,7 @@ class _StartingPageState extends State<StartingPage>
                               children: [
                                 Text(
                                   'Start Exchanging',
-                                  style: GoogleFonts.poppins(
+                                  style: TextStyle(
                                     color: Colors.white,
                                     fontSize: buttonFontSize,
                                     fontWeight: FontWeight.w600,

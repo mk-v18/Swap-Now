@@ -2,7 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/start/payment.dart';
+import 'package:amoeba/start/starting_page.dart';
+// REMOVED: import 'package:amoeba/start/payment.dart';
+// Payment is no longer part of the signup funnel — after this screen the
+// user goes straight to StartingPage instead.
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
@@ -496,6 +499,10 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
 
       // FIX: Batch user doc write and referral update — reduces round-trips.
       // User doc uses set+merge so it is idempotent on retry.
+      //
+      // CHANGED: onboardingStep now advances straight to 'starting_page'
+      // instead of 'payment' — payment is no longer part of this chain,
+      // so Wrapper's next stop for this user is StartingPage.
       await FirebaseFirestore.instance.collection('users').doc(uid).set({
         'uid':              uid,
         'phone':            user.phoneNumber,
@@ -511,7 +518,7 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
             ? _referralController.text.trim()
             : null,
         'role':             'user',
-        'onboardingStep':   'payment',
+        'onboardingStep':   'starting_page', // CHANGED: was 'payment'
         'createdAt':        FieldValue.serverTimestamp(),
       }, SetOptions(merge: true)); // FIX: merge:true → idempotent on retry
 
@@ -535,11 +542,13 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
 
       if (!mounted) return;
 
+      // CHANGED: was PaymentPage — payment removed from onboarding, so we
+      // go straight to StartingPage now.
       // FIX(reliability): pushReplacement — user cannot press Back to re-submit
       // personal details and trigger duplicate Firestore/Storage writes.
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => const PaymentPage()),
+        MaterialPageRoute(builder: (_) => const StartingPage()),
       );
     } catch (_) {
       if (mounted) _showErrorSnack('Something went wrong. Please try again.');

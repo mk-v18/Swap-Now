@@ -1,13 +1,15 @@
 // ignore_for_file: unawaited_futures
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/logs/wrapper.dart';
-import 'package:credbro/start/privacy_policy.dart';
-import 'package:credbro/start/terms_of_use.dart';
+import 'package:amoeba/logs/wrapper.dart';
+import 'package:amoeba/start/privacy_policy.dart';
+import 'package:amoeba/start/terms_of_use.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:otp_autofill/otp_autofill.dart'; // NEW — SMS User Consent API autofill
 import '../start/personal_details.dart';
 import 'package:flutter/gestures.dart';
 
@@ -30,8 +32,26 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   // _fillBoxesVisually (each of which can fire multiple times per OTP flow).
   static final RegExp _nonDigits = RegExp(r'\D');
 
+  // NEW — compiled once. Used to pull a 6-digit code out of the raw SMS
+  // body handed to us by the SMS User Consent API below.
+  static final RegExp _sixDigitCode = RegExp(r'\d{6}');
+
   // ── Firebase ──────────────────────────────────────────────────────────────
   final FirebaseAuth _auth = FirebaseAuth.instance;
+
+  // NEW — Drives Android's SMS User Consent API. Unlike the SMS Retriever
+  // API (which is what the `AutofillHints.oneTimeCode` fields below quietly
+  // rely on via the OS Autofill framework), this does NOT require the app's
+  // signing certificate hash to be registered anywhere. That makes it the
+  // reliable path: if the app's release SHA-256 fingerprint isn't (yet)
+  // registered in the Firebase console — a very common gap right after
+  // switching to a new release keystore — the Retriever-based paths silently
+  // never fire, and the user is left typing the OTP by hand and sitting
+  // through 30s resend cooldowns (this is what the screen recording showed).
+  // With this listener running, the moment the OTP SMS arrives Android shows
+  // a one-tap "Allow SwapNow to read this message?" sheet, and tapping it
+  // fills all 6 boxes and auto-verifies immediately.
+  final OTPInteractor _otpInteractor = OTPInteractor();
 
   // ── Controllers / nodes ───────────────────────────────────────────────────
   final TextEditingController _phoneController = TextEditingController();
@@ -119,6 +139,11 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   @override
   void dispose() {
+    // NEW — stop the SMS User Consent listener. Not strictly required
+    // (Android times it out after 5 minutes on its own) but avoids a
+    // dangling native receiver + a stray callback firing after this State
+    // is gone.
+    _otpInteractor.stopListenForCode();
     for (final c in _otpControllers) c.dispose(); // also removes listeners
     _phoneController.dispose();
     for (final f in _focusNodes)       f.dispose();
@@ -148,6 +173,25 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         if (mounted) _verifyOtp();
       });
     }
+  }
+
+  // NEW — Starts listening for the OTP SMS via Android's SMS User Consent
+  // API. This is the primary, reliable autofill path (see field doc comment
+  // above for why). Called once per OTP send (fresh listener per code, since
+  // a resend means a brand-new code is on its way).
+  void _listenForIncomingOtp() {
+    _otpInteractor.stopListenForCode();
+    _otpInteractor
+        .startListenUserConsent(null) // pass a sender phone number here if you have one to filter by
+        .then((code) {
+      if (!mounted) return;
+      final extracted = _sixDigitCode.firstMatch(code ?? '')?.group(0);
+      if (extracted != null && extracted.length == 6) {
+        _fillBoxesVisually(extracted);
+      }
+    }).catchError((e) {
+      debugPrint('[SwapNow] SMS User Consent listener ended: $e');
+    });
   }
 
   // ── Error mapping ─────────────────────────────────────────────────────────
@@ -342,6 +386,12 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         });
         _slideCtrl.forward();
         _startResendTimer();
+        // NEW — start the SMS User Consent listener the instant the code is
+        // actually sent, so it's already armed and waiting when the SMS
+        // arrives (rather than relying solely on the OS Autofill framework
+        // hints on the TextFields, which — as seen in testing — silently
+        // don't trigger on every device/OEM).
+        _listenForIncomingOtp();
         _showSuccessSnack('OTP sent to +91 $phone');
         Future.delayed(
           const Duration(milliseconds: 350),
@@ -449,6 +499,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   void _goBackToPhone() {
     _resendTimer?.cancel();
     _resendCooldownNotifier.value = 0;
+    // NEW — user backed out of this OTP; stop waiting for a code that no
+    // longer matters so a late/stray SMS can't silently fill stale boxes.
+    _otpInteractor.stopListenForCode();
 
     _slideCtrl.reverse().then((_) {
       if (!mounted) return;
@@ -615,10 +668,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                     SizedBox(height: screenH * 0.03),
 
                     Center(
-                      child: Image.asset(
-                        'assets/images/signup-image.png',
-                        height:     heroH,
-                        cacheWidth: (screenW * devicePixelRatio).toInt(),
+                      child: SvgPicture.asset(
+                        'assets/images/signup-image.svg',
+                        height: heroH,
                       ),
                     ),
 
@@ -636,7 +688,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                               height:     1.2),
                           children: [
                             TextSpan(
-                              text:  'swapnow',
+                              text:  'Amoeba',
                               style: TextStyle(color: _purple),
                             ),
                           ],

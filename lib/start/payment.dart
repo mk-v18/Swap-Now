@@ -1,7 +1,6 @@
 import 'dart:async';
-
-import 'package:credbro/start/payment_fail.dart';
-import 'package:credbro/start/payment_success.dart';
+import 'package:amoeba/start/payment_fail.dart';
+import 'package:amoeba/start/payment_success.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/svg.dart';
 import 'package:razorpay_flutter/razorpay_flutter.dart';

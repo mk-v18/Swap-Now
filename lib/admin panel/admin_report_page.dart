@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/chats/chatservice.dart';
+import 'package:amoeba/chats/chatservice.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:intl/intl.dart';
 
 /// Admin-only screen that lists all user reports and lets the admin
@@ -383,8 +384,8 @@ class _ReportList extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Image.asset(
-                    'assets/images/no_reports.png',
+                  SvgPicture.asset(
+                    'assets/images/no_reports.svg',
                     width: 180,
                     height: 180,
                     fit: BoxFit.contain,

@@ -1,6 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/chats/chatservice.dart';
-import 'package:credbro/custom_loader.dart';
+import 'package:amoeba/chats/chatservice.dart';
+import 'package:amoeba/custom_loader.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/svg.dart';

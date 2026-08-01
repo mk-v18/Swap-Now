@@ -1,14 +1,17 @@
-import 'package:credbro/logs/banned_page.dart';
+import 'package:amoeba/logs/banned_page.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter_svg/svg.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../admin panel/admin_bottom_nav.dart';
-import '../start/payment.dart';
 import '../start/starting_page.dart';
 import 'otp.dart';
 import '../pages/bottom_navigation.dart';
 import '../start/personal_details.dart';
+// REMOVED: import '../start/payment.dart';
+// Payment is no longer part of the onboarding routing chain — it'll be
+// wired in separately elsewhere, so Wrapper doesn't need to know about it.
 
 
 class Wrapper extends StatelessWidget {
@@ -79,13 +82,15 @@ class Wrapper extends StatelessWidget {
 
       final data = doc.data() ?? {};
       final role = data['role']?.toString().trim().toLowerCase() ?? 'user';
-      final hasPaid = data['hasPaid'] == true;
+      // REMOVED: `hasPaid` no longer gates onboarding — payment is being
+      // moved to a separate place in the app, not the signup funnel.
       final name = data['name']?.toString().trim() ?? '';
       final email = data['email']?.toString().trim() ?? '';
       final location = data['location']?.toString().trim() ?? '';
       final image = data['profileImage']?.toString().trim() ?? '';
       // Checkpoint written by each onboarding step:
-      // 'personal_details' -> 'payment' -> 'starting_page' -> 'done'
+      // 'personal_details' -> 'starting_page' -> 'done'
+      // (payment step removed from this chain)
       final step =
           data['onboardingStep']?.toString().trim() ?? 'personal_details';
 
@@ -106,8 +111,9 @@ class Wrapper extends StatelessWidget {
           image.isNotEmpty;
 
       // Resume exactly where the user left off:
+      // OTP (handled above by authStateChanges) -> PersonalDetails ->
+      // StartingPage -> BottomNavigation. Payment step removed.
       if (!profileComplete) return const PersonalDetailsPage();
-      if (!hasPaid) return const PaymentPage();
       if (step != 'done') return const StartingPage();
 
       // FIX(perf): same three-writes-in-parallel treatment here.
@@ -260,11 +266,12 @@ class _ErrorScreen extends StatelessWidget {
                   color: const Color(0xFF5800B3).withOpacity(0.08),
                 ),
                 child: Center(
-                  child: Image.asset(
-                    'assets/images/no_connection.png', // swap in your asset
+                  child: SvgPicture.asset(
+                    'assets/images/no_connection.svg', // SVG asset
                     width: 80,
                     height: 80,
-                    errorBuilder: (context, error, stackTrace) => const Icon(
+                    fit: BoxFit.contain,
+                    placeholderBuilder: (context) => const Icon(
                       Icons.wifi_off_rounded,
                       size: 56,
                       color: Color(0xFF5800B3),

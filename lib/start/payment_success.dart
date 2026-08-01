@@ -1,4 +1,4 @@
-import 'package:credbro/start/starting_page.dart';
+import 'package:amoeba/start/starting_page.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';

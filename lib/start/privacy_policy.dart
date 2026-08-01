@@ -16,10 +16,10 @@ class PrivacyPolicyPage extends StatelessWidget {
   const PrivacyPolicyPage({super.key});
 
   // ---- Editable constants -------------------------------------------------
-  static const String appName = 'SwapNow';
-  static const String companyName = 'SwapNow Pvt Ltd.';
+  static const String appName = 'Amoeba';
+  static const String companyName = 'SwapNow Private Limited.';
   static const String supportEmail = 'swapnowofficial@gmail.com';
-  static const String effectiveDate = 'July 1, 2026';
+  static const String effectiveDate = 'August 1, 2026';
   static const String websiteUrl = 'https://swapnow.in';
 
   // ---- Design tokens (mirrors app-wide purple/lavender system) -----------

@@ -1,4 +1,4 @@
-import 'package:credbro/splash_screen.dart';
+import 'package:amoeba/splash_screen.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -6,9 +6,12 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:media_kit/media_kit.dart';
+import 'admin panel/ad_response.dart';
+import 'admin panel/admin_categories_page.dart';
+import 'admin panel/admin_help_queries.dart';
 import 'chats/chatscreen.dart';
-import 'chats/swap_requests_page.dart'; // NEW — adjust path if this file lives elsewhere
-import 'chats/exchange_history_page.dart'; // NEW — adjust path if this file lives elsewhere
+import 'chats/exchange_history_page.dart';
+import 'chats/swap_requests_page.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -179,7 +182,7 @@ class SwapNowApp extends StatelessWidget {
           );
         }
 
-        // NEW: swap request notifications (sent / accepted / declined)
+        // Swap request notifications (sent / accepted / declined)
         // deep-link here, landing on the matching tab.
         //   tab 0 = Incoming, tab 1 = Active, tab 2 = Sent
         if (settings.name == '/swap-requests') {
@@ -191,9 +194,37 @@ class SwapNowApp extends StatelessWidget {
           );
         }
 
-        // NEW: exchange completed/cancelled notifications deep-link here.
+        // Exchange completed/cancelled notifications deep-link here.
         if (settings.name == '/exchange-history') {
           return MaterialPageRoute(builder: (_) => const ExchangeHistoryPage());
+        }
+
+        // Admin "new help query submitted" notifications deep-link here.
+        // No arguments needed — AdminHelpQueriesPage streams the full
+        // list itself; the admin taps the relevant card once inside.
+        if (settings.name == '/admin-help-queries') {
+          return MaterialPageRoute(builder: (_) => const AdminHelpQueriesPage());
+        }
+
+        // NEW: ad request notifications deep-link here.
+        //   isAdmin: true  → admin's "new ad request submitted" push
+        //   isAdmin: false → submitter's "approved"/"rejected" push
+        if (settings.name == '/ad-responses') {
+          final args = settings.arguments as Map<String, dynamic>? ?? {};
+          return MaterialPageRoute(
+            builder: (_) => AdResponsesPage(
+              isAdmin: (args['isAdmin'] as bool?) ?? false,
+            ),
+          );
+        }
+
+        // NEW: "new suggestion submitted" notifications deep-link here.
+        // There's no dedicated suggestions-review screen yet, so this
+        // lands the admin on the categories hub as the closest existing
+        // screen — build a SuggestionsAdminPage + register its own route
+        // if you want a direct deep link instead.
+        if (settings.name == '/admin-categories') {
+          return MaterialPageRoute(builder: (_) => const AdminCategoriesPage());
         }
 
         return null;

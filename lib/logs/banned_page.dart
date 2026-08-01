@@ -1,7 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/logs/otp.dart';
+import 'package:amoeba/logs/otp.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter_svg/svg.dart';
 import '../help/help_center.dart';
 
 /// Full-screen block shown instead of the normal app when the user's
@@ -16,7 +17,7 @@ class AccountBannedPage extends StatelessWidget {
   // TODO: point this at your illustration asset, e.g. add to pubspec.yaml:
   //   assets:
   //     - assets/images/account_banned.png
-  static const _illustrationAsset = 'assets/images/account_banned.png';
+  static const _illustrationAsset = 'assets/images/account_banned.svg';
 
   // Banned users can still open the in-app Help Center to submit/track an
   // appeal — this is the primary path now instead of relying on email.
@@ -71,17 +72,20 @@ class AccountBannedPage extends StatelessWidget {
                             height: 148,
                             color: Colors.white,
                             padding: const EdgeInsets.all(20),
-                            child: Image.asset(
-                              _illustrationAsset,
-                              fit: BoxFit.contain,
-                              errorBuilder: (context, error, stackTrace) {
-                                // Falls back gracefully if the asset hasn't
-                                // been added yet.
-                                return Icon(
-                                  Icons.block_rounded,
-                                  color: Colors.red.shade400,
-                                  size: 56,
-                                );
+                            child: Builder(
+                              builder: (context) {
+                                try {
+                                  return SvgPicture.asset(
+                                    _illustrationAsset,
+                                    fit: BoxFit.contain,
+                                  );
+                                } catch (_) {
+                                  return Icon(
+                                    Icons.block_rounded,
+                                    color: Colors.red.shade400,
+                                    size: 56,
+                                  );
+                                }
                               },
                             ),
                           ),

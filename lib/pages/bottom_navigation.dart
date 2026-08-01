@@ -1,8 +1,8 @@
-import 'package:credbro/chats/exchange_history_page.dart';
-import 'package:credbro/chats/swap_requests_page.dart';
-import 'package:credbro/pages/chatspage.dart';
-import 'package:credbro/pages/homepage.dart';
-import 'package:credbro/pages/profilepage_screen.dart';
+import 'package:amoeba/chats/exchange_history_page.dart';
+import 'package:amoeba/chats/swap_requests_page.dart';
+import 'package:amoeba/pages/chatspage.dart';
+import 'package:amoeba/pages/homepage.dart';
+import 'package:amoeba/pages/profilepage_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_svg/svg.dart';

@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/help/help_query_model.dart';
+import 'package:amoeba/help/help_query_model.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/svg.dart';
 import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -267,10 +268,10 @@ class _AdminHelpQueriesPageState extends State<AdminHelpQueriesPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Image.asset(
+                  SvgPicture.asset(
                     _search.isNotEmpty
-                        ? 'assets/images/no_search_results.png'
-                        : 'assets/images/no_queries.png',
+                        ? 'assets/images/no_search_results.svg'
+                        : 'assets/images/no_queries.svg',
                     width: r.w(180),
                     height: r.w(180),
                     fit: BoxFit.contain,

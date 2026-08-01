@@ -1,6 +1,6 @@
-import 'package:credbro/admin%20panel/ad_response.dart';
-import 'package:credbro/admin%20panel/admin_help_queries.dart';
-import 'package:credbro/admin%20panel/admin_report_page.dart';
+import 'package:amoeba/admin%20panel/ad_response.dart';
+import 'package:amoeba/admin%20panel/admin_help_queries.dart';
+import 'package:amoeba/admin%20panel/admin_report_page.dart';
 import 'package:flutter/material.dart';
 
 // Local copies — private identifiers don't cross files in Dart

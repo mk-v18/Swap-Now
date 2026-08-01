@@ -24,9 +24,21 @@ rules_version = '2';
 //     existing role/banned protection. hasPaid can now ONLY be set by the
 //     verifyPayment Cloud Function (Admin SDK writes bypass these rules
 //     entirely) or by an admin — never by a client write, direct or via a
-//     compromised app build. onboardingStep is left untouched since it may
-//     still be written from other onboarding screens — revisit once that's
-//     confirmed.
+//     compromised app build.
+//
+//     CONFIRMED: `onboardingStep` is intentionally left OUT of this guard
+//     (freely writable by the owner). Payment has been removed from the
+//     signup funnel (Wrapper no longer checks `hasPaid` at all — the chain
+//     is now personal_details -> starting_page -> done), so `onboardingStep`
+//     is purely a client-side "where do I resume onboarding" pointer, not a
+//     security gate. A user directly writing `onboardingStep: 'done'` just
+//     changes which screen Wrapper shows them next — it doesn't unlock
+//     anything else, since no other rule below conditions access on
+//     onboardingStep or hasPaid (listings, chats, etc. only check
+//     role/banned/ownership). If payment is reintroduced elsewhere as an
+//     actual access gate (e.g. some feature requires hasPaid == true),
+//     enforce that check in that feature's own rule — don't rely on
+//     onboardingStep for it.
 //   - swapRequests now stores a `participants: [fromUserId, toUserId]` array
 //     on create, and the read/update rules key off that array instead of
 //     fromUserId/toUserId directly. This is required because
@@ -137,6 +149,7 @@ service cloud.firestore {
       // a trusted Cloud Function (Admin SDK, bypasses these rules), can do
       // that. hasPaid is specifically gated behind verifyPayment's
       // server-side Razorpay signature check — see functions/index.js.
+      // (onboardingStep is deliberately NOT in this guard — see CHANGE LOG.)
       allow update: if isAdmin()
         || (
           isOwner(uid)
@@ -186,9 +199,22 @@ match /chats/{chatId} {
     && request.auth.uid in request.resource.data.participants
     && request.resource.data.participants.size() == 2;
 
+  // `intent` (the swap/buy banner ChatScreen renders) is frozen against
+  // REMOVAL the same way participants[] is frozen against reassignment:
+  // once a chat doc has an `intent` key, no client update may write a
+  // version of the doc that drops it entirely. This is a server-side
+  // backstop for the ChatService.deleteChat() fix, which now resets a
+  // chat's doc (clearing messages/lastMessage/etc.) instead of deleting
+  // it outright specifically so `intent` survives — this rule makes that
+  // guarantee hold even if some other/future code path tries to bypass
+  // it. Note it only requires the KEY to still be present, not that its
+  // VALUE stay identical — acceptRequest() still needs to overwrite an
+  // existing intent with a newer one (e.g. two users swap again later),
+  // and that remains allowed.
   allow update: if isSignedIn()
     && (request.auth.uid in resource.data.participants || isAdmin())
-    && request.resource.data.participants == resource.data.participants;
+    && request.resource.data.participants == resource.data.participants
+    && (!('intent' in resource.data) || ('intent' in request.resource.data));
 
   allow delete: if isSignedIn()
     && request.auth.uid in resource.data.participants;
@@ -217,6 +243,9 @@ match /chats/{chatId} {
     // callback, as a record/log only. Access itself (hasPaid) is now
     // controlled entirely by verifyPayment — this collection no longer
     // grants access by its own existence, it's just an audit trail.
+    // Payment is currently detached from the onboarding funnel (see
+    // CHANGE LOG) — this collection and its rules are untouched and ready
+    // for whenever payment is wired in elsewhere in the app.
     match /payments/{paymentId} {
       allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
       allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;

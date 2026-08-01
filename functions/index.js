@@ -521,3 +521,167 @@ exports.onSwapCompleted = onDocumentUpdated("swapRequests/{requestId}", async (e
 
   return null;
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// 6. Help query notifications — notify ALL admins when a user submits
+//    a new support query. Reuses _sendPushToUser (defined above in
+//    section 4) and its stale-token cleanup.
+//
+//    NOTE: unlike sendChatNotification's admin lookup (which only grabs
+//    ONE admin via limit(1)), this notifies every admin account, since
+//    a support team may have more than one admin.
+// ══════════════════════════════════════════════════════════════════════
+exports.onHelpQueryCreated = onDocumentCreated("help_queries/{queryId}", async (event) => {
+  const data = event.data?.data();
+  if (!data) return null;
+
+  let adminSnap;
+  try {
+    adminSnap = await db.collection("users").where("role", "==", "admin").get();
+  } catch (err) {
+    console.error("Failed to fetch admins for help query notification:", err.message);
+    return null;
+  }
+
+  if (adminSnap.empty) return null;
+
+  const userName = data.userName || "A user";
+  const subject  = data.subject  || "New support query";
+
+  const sends = adminSnap.docs.map((doc) =>
+    _sendPushToUser(doc.id, {
+      title: "New help query",
+      body: `${userName}: ${subject}`,
+      data: {
+        type: "help_query",
+        queryId: event.params.queryId,
+        category: data.category || "",
+      },
+      channelId: "help_queries",
+    })
+  );
+
+  await Promise.all(sends);
+  return null;
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 7. Ad request notifications
+//    a) New ad request submitted → notify ALL admins.
+//    b) Admin approves/rejects → notify the submitter.
+//
+//    Path: AdRequests/{uid}/ads/{adId}  (see WantToAdvertisePage /
+//    AdResponsesPage — {uid} is the submitter's own uid).
+// ══════════════════════════════════════════════════════════════════════
+
+exports.onAdRequestCreated = onDocumentCreated(
+  "AdRequests/{uid}/ads/{adId}",
+  async (event) => {
+    const data = event.data?.data();
+    if (!data) return null;
+
+    let adminSnap;
+    try {
+      adminSnap = await db.collection("users").where("role", "==", "admin").get();
+    } catch (err) {
+      console.error("Failed to fetch admins for ad request notification:", err.message);
+      return null;
+    }
+    if (adminSnap.empty) return null;
+
+    const title    = data.title    || "New ad request";
+    const category = data.category || "";
+
+    const sends = adminSnap.docs.map((doc) =>
+      _sendPushToUser(doc.id, {
+        title: "New ad request",
+        body: category ? `${title} · ${category}` : title,
+        data: {
+          type:  "ad_request_submitted",
+          uid:   event.params.uid,
+          adId:  event.params.adId,
+        },
+        channelId: "ad_updates",
+      })
+    );
+
+    await Promise.all(sends);
+    return null;
+  }
+);
+
+exports.onAdRequestUpdated = onDocumentUpdated(
+  "AdRequests/{uid}/ads/{adId}",
+  async (event) => {
+    const before = event.data?.before?.data();
+    const after  = event.data?.after?.data();
+    if (!before || !after) return null;
+
+    // Only react to a transition INTO approved/rejected — skip no-op
+    // writes and any other status change (e.g. re-saving as pending).
+    if (before.status === after.status) return null;
+    if (after.status !== "approved" && after.status !== "rejected") return null;
+
+    const uid   = event.params.uid;
+    const title = after.title || "your ad request";
+    const approved = after.status === "approved";
+
+    await _sendPushToUser(uid, {
+      title: approved ? "Ad request approved 🎉" : "Ad request rejected",
+      body: approved
+        ? `Your ad "${title}" has been approved.`
+        : `Your ad "${title}" was not approved this time.`,
+      data: {
+        type: approved ? "ad_request_approved" : "ad_request_rejected",
+        adId: event.params.adId,
+      },
+      channelId: "ad_updates",
+    });
+    return null;
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════
+// 8. Suggestion notifications — notify ALL admins when a user posts a
+//    suggestion. NOTE: suggestions/{id} currently stores no userId
+//    (SuggestionsPage writes only `message` + `timestamp`), so there is
+//    no submitter to notify back — this is admin-facing only.
+// ══════════════════════════════════════════════════════════════════════
+
+exports.onSuggestionCreated = onDocumentCreated(
+  "suggestions/{suggestionId}",
+  async (event) => {
+    const data = event.data?.data();
+    if (!data) return null;
+
+    let adminSnap;
+    try {
+      adminSnap = await db.collection("users").where("role", "==", "admin").get();
+    } catch (err) {
+      console.error("Failed to fetch admins for suggestion notification:", err.message);
+      return null;
+    }
+    if (adminSnap.empty) return null;
+
+    // Trim so a long suggestion doesn't blow out the notification body.
+    const rawMessage = (data.message || "").trim();
+    const preview = rawMessage.length > 80
+      ? `${rawMessage.slice(0, 80)}…`
+      : (rawMessage || "A user submitted a suggestion");
+
+    const sends = adminSnap.docs.map((doc) =>
+      _sendPushToUser(doc.id, {
+        title: "New suggestion",
+        body: preview,
+        data: {
+          type: "new_suggestion",
+          suggestionId: event.params.suggestionId,
+        },
+        channelId: "suggestions",
+      })
+    );
+
+    await Promise.all(sends);
+    return null;
+  }
+);

@@ -1,9 +1,6 @@
-import 'package:credbro/admin panel/admin_profile.dart';
-import 'package:credbro/admin panel/referal_page.dart';
-import 'package:credbro/admin%20panel/ad_response.dart';
-import 'package:credbro/admin%20panel/admin_categories_page.dart';
-import 'package:credbro/admin%20panel/admin_chat.dart';
-import 'package:credbro/admin%20panel/admin_help_queries.dart';
+import 'package:amoeba/admin panel/admin_profile.dart';
+import 'package:amoeba/admin panel/referal_page.dart';
+import 'package:amoeba/admin%20panel/admin_categories_page.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_svg/svg.dart';

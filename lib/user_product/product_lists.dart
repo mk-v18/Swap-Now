@@ -1,9 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/Advertisement/location_ad.dart';
+import 'package:amoeba/Advertisement/location_ad.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import '../chats/chatscreen.dart';
-import '../chats/chatservice.dart';
 import '../chats/swap_request_service.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────

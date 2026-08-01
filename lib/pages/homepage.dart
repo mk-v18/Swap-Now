@@ -1,12 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/pages/wishlistpage.dart';
+import 'package:amoeba/pages/wishlistpage.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_svg/svg.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 import '../user_product/product_lists.dart';
 import '../user_product/model/user_product_listing.dart';
 
@@ -100,6 +102,14 @@ class _HomePageState extends State<HomePage> {
   bool _isProcessingItems = false;
   List<QueryDocumentSnapshot>? _lastDocs;
   String _lastDocsFingerprint = '';
+
+  // Count of listings that are neither the current user's own nor
+  // 'exchanged' — computed BEFORE the search/category filters are
+  // applied. Used to tell "nothing is actually available" (all
+  // remaining docs are exchanged/own) apart from "a search or filter
+  // narrowed an otherwise-non-empty list down to zero", since those two
+  // cases need different empty-state artwork (see _buildProductStream).
+  int _availableCount = 0;
 
   static const int _pageSize = 10;
   int _visibleCount = _pageSize;
@@ -288,6 +298,60 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// Opens the tap-to-edit location sheet (typing w/ autocomplete + GPS
+  /// detect, mirrors ProfilePage's location editor) and, if the user saves
+  /// a new value, updates the header instantly and persists it to
+  /// Firestore under the same `users/{uid}` fields (`location`, `lat`,
+  /// `lng`) that ProfilePage reads on its own initState — so opening
+  /// ProfilePage afterwards shows the new location right away, without
+  /// any extra wiring on that page.
+  Future<void> _showLocationEditSheet() async {
+    final result = await showModalBottomSheet<Map<String, dynamic>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _LocationEditSheet(initialLocation: userLocation),
+    );
+
+    if (result == null || !mounted) return;
+
+    final newLocation = result['location'] as String;
+    final newLat = result['lat'] as double?;
+    final newLng = result['lng'] as double?;
+
+    // Reflect on THIS screen immediately: update the header text and
+    // re-sort the already-loaded product list against the new coordinates
+    // (old distance cache is invalid once the user's own location moves).
+    setState(() {
+      userLocation = newLocation;
+      userLat = newLat;
+      userLng = newLng;
+    });
+    _distanceCache.clear();
+    if (_lastDocs != null) {
+      _processItems(_lastDocs!);
+    }
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).update({
+        'location': newLocation,
+        'lat': newLat,
+        'lng': newLng,
+      });
+    } catch (e) {
+      if (kDebugMode) debugPrint('Failed to save location: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not save your location. Try again.'),
+          ),
+        );
+      }
+    }
+  }
+
   double _calcDistance(double lat1, double lon1, double lat2, double lon2) =>
       Geolocator.distanceBetween(lat1, lon1, lat2, lon2) / 1000;
 
@@ -316,6 +380,7 @@ class _HomePageState extends State<HomePage> {
     // address string -> every candidate entry waiting on that address.
     // Multiple items sharing a location string only pay for one geocode.
     final Map<String, List<Map<String, dynamic>>> pendingGeocode = {};
+    int availableCount = 0;
 
     try {
       for (final doc in docs) {
@@ -329,6 +394,13 @@ class _HomePageState extends State<HomePage> {
         // onSwapCompleted Cloud Function sets status: 'exchanged' on the
         // UserProductList doc — hide it from the homepage from that point on.
         if (data['status'] == 'exchanged') continue;
+
+        // Counted before search/category filters below: this is "how many
+        // listings actually exist to show at all", independent of whatever
+        // the user typed/selected. Lets the empty state tell "everything's
+        // exchanged / nothing left" apart from "your search/filter matched
+        // nothing".
+        availableCount++;
 
         if (filters.isNotEmpty) {
           final cat = (data['category'] as String?) ?? '';
@@ -411,6 +483,7 @@ class _HomePageState extends State<HomePage> {
     if (mounted) {
       setState(() {
         _processedItems = candidates;
+        _availableCount = availableCount;
         if (_visibleCount < _pageSize) _visibleCount = _pageSize;
       });
     }
@@ -530,7 +603,7 @@ class _HomePageState extends State<HomePage> {
       width: double.infinity,
       color: Colors.white,
       child: Image.asset(
-        'assets/images/trust_banner.png',
+        'assets/images/trust_banner.webp',
         width: double.infinity,
         fit: BoxFit.fitWidth,
         errorBuilder: (context, error, stackTrace) =>
@@ -589,25 +662,40 @@ class _HomePageState extends State<HomePage> {
               SizedBox(height: isTablet ? 4 : 2),
 
               // ── Location ──
-              Row(
-                children: [
-                  Icon(Icons.add_location_alt_outlined,
-                      color: Colors.white, size: isTablet ? 20 : 18),
-                  const SizedBox(width: 4),
-                  Flexible(
-                    child: Text(
-                      userLocation.isNotEmpty
-                          ? userLocation
-                          : "Location not set",
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: isTablet ? 13 : 12,
-                        fontWeight: FontWeight.w600,
-                      ),
+              // Now tappable: opens a bottom sheet to update the location
+              // (type-ahead search or GPS detect). Wrapped in Material +
+              // InkWell (instead of GestureDetector) so there's a visible
+              // tap response, and a small edit pencil makes it discoverable.
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: _showLocationEditSheet,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Row(
+                      children: [
+                        Icon(Icons.add_location_alt_outlined,
+                            color: Colors.white, size: isTablet ? 20 : 18),
+                        const SizedBox(width: 4),
+                        Flexible(
+                          child: Text(
+                            userLocation.isNotEmpty
+                                ? userLocation
+                                : "Location not set",
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: isTablet ? 13 : 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                      ],
                     ),
                   ),
-                ],
+                ),
               ),
 
               SizedBox(height: isTablet ? 18 : 20),
@@ -631,8 +719,8 @@ class _HomePageState extends State<HomePage> {
             Positioned(
               right: isTablet ? 0 : 12,
               top: isTablet ? 48 : 54,
-              child: Image.asset(
-                'assets/images/items.png',
+              child: SvgPicture.asset(
+                'assets/images/items.svg',
                 width: isTablet ? 160 : 120,
                 height: isTablet ? 160 : 120,
                 fit: BoxFit.contain,
@@ -820,7 +908,7 @@ class _HomePageState extends State<HomePage> {
           Row(
             children: [
               Text(
-                "New Items",
+                "Nearby Items",
                 style: TextStyle(
                   fontWeight: FontWeight.w600,
                   fontSize: _BP.fontSize(context, 16),
@@ -1077,7 +1165,7 @@ class _HomePageState extends State<HomePage> {
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
-              asset: 'assets/images/error_state.png',
+              asset: 'assets/images/error_state.svg',
               fallbackIcon: Icons.error_outline,
             ),
           );
@@ -1111,7 +1199,7 @@ class _HomePageState extends State<HomePage> {
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
-              asset: 'assets/images/no_items.png',
+              asset: 'assets/images/no_items.svg',
               fallbackIcon: Icons.inventory_2_outlined,
             ),
           );
@@ -1129,12 +1217,33 @@ class _HomePageState extends State<HomePage> {
         }
 
         if (_processedItems.isEmpty) {
+          // ROOT CAUSE FIX: previously this always showed
+          // no_search_results.png / no_nearby_items.png here, because the
+          // dedicated no_items.png branch above only fires when the raw
+          // Firestore query itself returned zero docs. But once every
+          // remaining listing is 'exchanged' (or belongs to the current
+          // user), the docs are still there — just filtered out client
+          // side in _processItems — so that branch never triggered and
+          // users saw the wrong ("no nearby"/"no search results")
+          // artwork instead of the intended "no items" one. `_availableCount`
+          // is computed BEFORE search/category filters, so ==0 here means
+          // nothing exists to show at all (not just "your search/filter
+          // matched nothing") — that's the real "no items" case.
+          if (_availableCount == 0) {
+            return SliverToBoxAdapter(
+              child: _buildStatePlaceholder(
+                context,
+                asset: 'assets/images/no_items.svg',
+                fallbackIcon: Icons.inventory_2_outlined,
+              ),
+            );
+          }
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
               asset: _searchQuery.isNotEmpty
-                  ? 'assets/images/no_search_results.png'
-                  : 'assets/images/no_nearby_items.png',
+                  ? 'assets/images/no_search_results.svg'
+                  : 'assets/images/no_nearby_items.svg',
               fallbackIcon: _searchQuery.isNotEmpty
                   ? Icons.search_off
                   : Icons.location_off_outlined,
@@ -1150,8 +1259,23 @@ class _HomePageState extends State<HomePage> {
         final midRange = visibleItems
             .where((e) =>
         (e['distance'] as double) > 15 &&
-            (e['distance'] as double) <= 80)
+            (e['distance'] as double) <= 100)
             .toList();
+
+        // Only nearby (0-15km) and midRange (15-100km) are shown — items
+        // beyond 100km (or whose distance never resolved) are deliberately
+        // not displayed. If that leaves nothing in either bucket even
+        // though _processedItems isn't empty, fall back to the empty-state
+        // placeholder instead of rendering a blank screen.
+        if (nearby.isEmpty && midRange.isEmpty) {
+          return SliverToBoxAdapter(
+            child: _buildStatePlaceholder(
+              context,
+              asset: 'assets/images/no_nearby_items.svg',
+              fallbackIcon: Icons.location_off_outlined,
+            ),
+          );
+        }
 
         final hasMore = _visibleCount < _processedItems.length;
 
@@ -1167,7 +1291,7 @@ class _HomePageState extends State<HomePage> {
                     bottom: 5,
                   ),
                   child: Text(
-                    "Nearby Products",
+                    "Around You",
                     style: TextStyle(
                       fontSize: _BP.fontSize(context, 16),
                       fontWeight: FontWeight.w600,
@@ -1199,6 +1323,16 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// FIX: `asset` here is always a `.svg` path (no_items.svg, error_state.svg,
+  /// no_search_results.svg, no_nearby_items.svg). This previously used
+  /// `Image.asset`, which only decodes raster formats (PNG/JPG/WebP) — it
+  /// cannot rasterize SVG at all. Every call was silently failing and
+  /// falling through to `errorBuilder`, which is why the fallback
+  /// `Icon` (`inventory_2_outlined`, `search_off`, etc.) was showing
+  /// instead of the actual illustration on every empty/error state.
+  /// Switched to `SvgPicture.asset` (already imported via `flutter_svg`
+  /// and used elsewhere in this file, e.g. `_iconBtn` and `items.svg`
+  /// in `_buildHeader`) so these actually render as vector graphics.
   Widget _buildStatePlaceholder(
       BuildContext context, {
         required String asset,
@@ -1207,11 +1341,19 @@ class _HomePageState extends State<HomePage> {
     return Padding(
       padding: const EdgeInsets.all(40),
       child: Center(
-        child: Image.asset(
+        child: SvgPicture.asset(
           asset,
           width: 200,
           height: 200,
           fit: BoxFit.contain,
+          // Shown briefly while the SVG is being parsed/decoded.
+          placeholderBuilder: (context) => Icon(
+            fallbackIcon,
+            size: 80,
+            color: Colors.grey[400],
+          ),
+          // Shown only if the asset genuinely fails to load (missing file,
+          // malformed SVG, etc.) — same fallback as before.
           errorBuilder: (context, error, stackTrace) => Icon(
             fallbackIcon,
             size: 80,
@@ -1258,6 +1400,345 @@ class _HomePageState extends State<HomePage> {
           addRepaintBoundaries: true,
           addSemanticIndexes: false,
         ),
+      ),
+    );
+  }
+}
+
+// ─── Location edit bottom sheet ─────────────────────────────────────────────
+// Tap-to-edit location widget for the HomePage header. Mirrors
+// ProfilePage's location editor (Nominatim autocomplete + GPS detect) but
+// renders suggestions inline in the sheet instead of an overlay, since a
+// modal bottom sheet already has its own scroll surface.
+//
+// Returns a Map with keys 'location' (String), 'lat' (double?), 'lng'
+// (double?) via Navigator.pop when the user saves, or null on cancel.
+
+class _LocationEditSheet extends StatefulWidget {
+  final String initialLocation;
+
+  const _LocationEditSheet({required this.initialLocation});
+
+  @override
+  State<_LocationEditSheet> createState() => _LocationEditSheetState();
+}
+
+class _LocationEditSheetState extends State<_LocationEditSheet> {
+  late final TextEditingController _controller =
+  TextEditingController(text: widget.initialLocation);
+  final FocusNode _focusNode = FocusNode();
+
+  Timer? _debounce;
+  bool _isFetchingSuggestions = false;
+  bool _isDetectingLocation = false;
+  List<String> _suggestions = [];
+  List<Map<String, double>?> _suggestionCoords = [];
+
+  // Coordinates for whatever is currently in the field / was just picked.
+  // Reset to null the moment the user types manually (same rule as
+  // ProfilePage) so we never save stale lat/lng that no longer matches
+  // the text on screen.
+  double? _lat;
+  double? _lng;
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _controller.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _onChanged(String value) {
+    _lat = null;
+    _lng = null;
+    _debounce?.cancel();
+    if (value.trim().length < 3) {
+      setState(() {
+        _suggestions = [];
+        _suggestionCoords = [];
+      });
+      return;
+    }
+    _debounce = Timer(
+      const Duration(milliseconds: 500),
+          () => _fetchSuggestions(value.trim()),
+    );
+  }
+
+  Future<void> _fetchSuggestions(String input) async {
+    if (!mounted) return;
+    setState(() => _isFetchingSuggestions = true);
+    try {
+      final url = Uri.parse(
+        'https://nominatim.openstreetmap.org/search'
+            '?q=${Uri.encodeComponent(input)}'
+            '&format=json&limit=5&addressdetails=1',
+      );
+      final response = await http
+          .get(url, headers: {'User-Agent': 'SwapNow/1.0 (com.credbro.app)'});
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        final List data = json.decode(response.body);
+        setState(() {
+          _suggestions = data
+              .map<String>((item) => item['display_name'] as String)
+              .toList();
+          _suggestionCoords = data.map<Map<String, double>?>((item) {
+            final lat = double.tryParse(item['lat']?.toString() ?? '');
+            final lon = double.tryParse(item['lon']?.toString() ?? '');
+            if (lat == null || lon == null) return null;
+            return {'lat': lat, 'lng': lon};
+          }).toList();
+        });
+      } else {
+        setState(() {
+          _suggestions = [];
+          _suggestionCoords = [];
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _suggestions = [];
+          _suggestionCoords = [];
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _isFetchingSuggestions = false);
+    }
+  }
+
+  void _selectSuggestion(int index) {
+    if (index < 0 || index >= _suggestions.length) return;
+    final suggestion = _suggestions[index];
+    final parts = suggestion.split(',').map((s) => s.trim()).toList();
+    final coords =
+    index < _suggestionCoords.length ? _suggestionCoords[index] : null;
+    _controller.text = parts.take(3).join(', ');
+    _lat = coords?['lat'];
+    _lng = coords?['lng'];
+    _focusNode.unfocus();
+    setState(() {
+      _suggestions = [];
+      _suggestionCoords = [];
+    });
+  }
+
+  Future<void> _useCurrentLocation() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return;
+
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied ||
+            permission == LocationPermission.deniedForever) return;
+      }
+
+      if (!mounted) return;
+      setState(() => _isDetectingLocation = true);
+
+      final position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high);
+      final placemarks = await placemarkFromCoordinates(
+          position.latitude, position.longitude);
+
+      if (!mounted) return;
+
+      if (placemarks.isNotEmpty) {
+        final place = placemarks.first;
+        setState(() {
+          _controller.text =
+          "${place.locality}, ${place.administrativeArea}, ${place.country}";
+          _suggestions = [];
+          _suggestionCoords = [];
+          _lat = position.latitude;
+          _lng = position.longitude;
+        });
+      }
+    } catch (_) {
+      // Kept silent to match ProfilePage's existing GPS-error handling —
+      // this sheet has no ScaffoldMessenger of its own to surface a snack.
+    } finally {
+      if (mounted) setState(() => _isDetectingLocation = false);
+    }
+  }
+
+  void _save() {
+    final text = _controller.text.trim();
+    if (text.isEmpty) {
+      Navigator.pop(context);
+      return;
+    }
+    Navigator.pop(context, {
+      'location': text,
+      'lat': _lat,
+      'lng': _lng,
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+    return Padding(
+      // Pushes the sheet above the keyboard while it's open.
+      padding: EdgeInsets.only(bottom: bottomInset),
+      child: DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.5,
+        minChildSize: 0.35,
+        maxChildSize: 0.85,
+        builder: (context, scrollController) {
+          return Container(
+            padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            child: ListView(
+              controller: scrollController,
+              children: [
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 14),
+                    decoration: BoxDecoration(
+                      color: Colors.grey[300],
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const Text(
+                  "Update Location",
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: _kPrimaryDark,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: _controller,
+                  focusNode: _focusNode,
+                  autofocus: true,
+                  keyboardType: TextInputType.streetAddress,
+                  onChanged: _onChanged,
+                  decoration: InputDecoration(
+                    hintText: "Type your location",
+                    prefixIcon: _isFetchingSuggestions
+                        ? const Padding(
+                      padding: EdgeInsets.all(14),
+                      child: SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: _kPrimaryDark),
+                      ),
+                    )
+                        : const Icon(Icons.location_on_outlined,
+                        color: _kPrimary),
+                    suffixIcon: _isDetectingLocation
+                        ? const Padding(
+                      padding: EdgeInsets.all(14),
+                      child: SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: _kPrimaryDark),
+                      ),
+                    )
+                        : IconButton(
+                      tooltip: "Use current location",
+                      icon: const Icon(Icons.my_location_rounded,
+                          color: _kPrimary),
+                      onPressed: _useCurrentLocation,
+                    ),
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: Color(0xFFDDD6F0)),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: Color(0xFFDDD6F0)),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide:
+                      const BorderSide(color: Color(0xFFECEAFF), width: 1.5),
+                    ),
+                  ),
+                ),
+                if (_suggestions.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  ...List.generate(_suggestions.length, (i) {
+                    return InkWell(
+                      onTap: () => _selectSuggestion(i),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            vertical: 10, horizontal: 4),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.location_on_outlined,
+                                size: 16, color: _kPrimary),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                _suggestions[i],
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }),
+                ],
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: _kPrimary),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10)),
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text("Cancel",
+                            style: TextStyle(color: _kPrimary)),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _kPrimary,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10)),
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                        onPressed: _save,
+                        child: const Text("Save",
+                            style: TextStyle(color: Colors.white)),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }

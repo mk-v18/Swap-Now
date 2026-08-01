@@ -1,5 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:credbro/custom_loader.dart';
+import 'package:amoeba/custom_loader.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../logs/otp.dart';
@@ -144,7 +144,7 @@ class _AdminProfilePageState extends State<AdminProfilePage> {
     final btnFontSz   = _clamp(screenW * 0.042, 14.0, 17.0);
 
     return Scaffold(
-      backgroundColor: const Color(0xFFFFFFFFF),
+      backgroundColor: const Color(0xFFFFFFFF),
       appBar: _buildAppBar(screenW),
       body: SafeArea(
         child: StreamBuilder<DocumentSnapshot>(
@@ -311,7 +311,7 @@ class _AdminProfilePageState extends State<AdminProfilePage> {
     final titleSz = _clamp(screenW * 0.05, 17.0, 22.0);
     return AppBar(
       scrolledUnderElevation: 0,
-      backgroundColor: const Color(0xFFFFFFFFF),
+      backgroundColor: const Color(0xFFFFFFFF),
       surfaceTintColor: Colors.transparent,
       elevation: 0,
       centerTitle: true,
