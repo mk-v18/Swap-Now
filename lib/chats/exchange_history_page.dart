@@ -9,6 +9,7 @@ class _T {
   static const teal = Color(0xFF00796B);
   static const textDark = Color(0xFF1A1A2E);
   static const textLight = Color(0xFF9999AA);
+  static const deepPurple = Color(0xFF4A148C);
 }
 
 class ExchangeHistoryPage extends StatelessWidget {
@@ -54,14 +55,46 @@ class ExchangeHistoryPage extends StatelessWidget {
           final docs = snap.data!.docs;
           if (docs.isEmpty) {
             return Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.history_rounded, size: 46, color: Colors.grey[350]),
-                  const SizedBox(height: 10),
-                  Text('No completed exchanges yet',
-                      style: TextStyle(color: Colors.grey[500], fontSize: 13.5)),
-                ],
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 40),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 80,
+                      height: 80,
+                      decoration: BoxDecoration(
+                        color: _T.deepPurple.withOpacity(0.08),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        Icons.history_rounded,
+                        size: 34,
+                        color: _T.deepPurple.withOpacity(0.65),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'No completed exchanges yet',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.grey[800],
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Your finished swaps will be listed here',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.grey[500],
+                        fontSize: 12.5,
+                        height: 1.4,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             );
           }

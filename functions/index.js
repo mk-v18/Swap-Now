@@ -291,6 +291,150 @@ exports.verifyPayment = onCall(
 );
 
 // ══════════════════════════════════════════════════════════════════════
+// 2c. Listing publish fee — createListingOrder / verifyListingPayment
+//
+// Shown to a user in product_page.dart the first time they hit Publish
+// without hasLifetimeListingAccess already set. Two paths:
+//   'lifetime'   — flat ₹49 one-time. On verified payment we set
+//                  hasLifetimeListingAccess so every future publish skips
+//                  this fee entirely.
+//   'perListing' — 20% of the price they're listing THIS item at, capped
+//                  at ₹100 and floored at Razorpay's own ₹1 minimum.
+//                  Charged again on every future listing.
+//
+// Same security posture as createRazorpayOrder/verifyPayment above: the
+// amount is always computed HERE from trusted server-side constants (or,
+// for perListing, from a client-supplied price used only to compute a fee
+// that's then clamped) — never trusted verbatim from the client, and
+// access is only ever granted after verifyListingPayment's HMAC check.
+// ══════════════════════════════════════════════════════════════════════
+const LISTING_LIFETIME_FEE_PAISE = 4900; // ₹49.00 — keep in sync with _kLifetimeFeeRupees in product_page.dart
+const LISTING_PERLISTING_FEE_RATE = 0.20; // 20% — keep in sync with _kPerListingFeeRate
+const LISTING_PERLISTING_FEE_CAP_PAISE = 10000; // ₹100.00 cap — keep in sync with _kPerListingFeeCapRupees
+const LISTING_PERLISTING_FEE_MIN_PAISE = 100; // ₹1.00 — Razorpay's own order minimum
+
+function _computePerListingFeePaise(rawPrice) {
+  const price = Number(rawPrice);
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new HttpsError("invalid-argument", "A valid product price is required.");
+  }
+  const rawPaise = Math.round(price * 100 * LISTING_PERLISTING_FEE_RATE);
+  return Math.min(Math.max(rawPaise, LISTING_PERLISTING_FEE_MIN_PAISE), LISTING_PERLISTING_FEE_CAP_PAISE);
+}
+
+exports.createListingOrder = onCall(
+  { secrets: [razorpayKeyId, razorpayKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const feeType = request.data?.feeType;
+    if (feeType !== "lifetime" && feeType !== "perListing") {
+      throw new HttpsError("invalid-argument", "feeType must be 'lifetime' or 'perListing'.");
+    }
+
+    const amountPaise = feeType === "lifetime"
+      ? LISTING_LIFETIME_FEE_PAISE
+      : _computePerListingFeePaise(request.data?.price);
+
+    // Razorpay caps `receipt` at 40 chars — same truncation as
+    // createRazorpayOrder above.
+    const receipt = `lst_${request.auth.uid.slice(0, 12)}_${Date.now()}`;
+    const auth = Buffer.from(
+      `${razorpayKeyId.value()}:${razorpayKeySecret.value()}`
+    ).toString("base64");
+
+    let res;
+    try {
+      res = await fetch("https://api.razorpay.com/v1/orders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${auth}`,
+        },
+        body: JSON.stringify({
+          amount: amountPaise,
+          currency: "INR",
+          receipt,
+          notes: { uid: request.auth.uid, feeType },
+        }),
+      });
+    } catch (err) {
+      console.error("Razorpay listing order request failed:", err.message);
+      throw new HttpsError("unavailable", "Could not reach payment gateway.");
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.error("Razorpay listing order creation failed:", res.status, errBody);
+      throw new HttpsError("internal", "Could not create order.");
+    }
+
+    const order = await res.json();
+    return {
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      feeType,
+    };
+  }
+);
+
+exports.verifyListingPayment = onCall(
+  { secrets: [razorpayKeySecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const { orderId, paymentId, signature, feeType, amount } = request.data;
+    if (!orderId || !paymentId || !signature) {
+      throw new HttpsError("invalid-argument", "Missing payment fields.");
+    }
+    if (feeType !== "lifetime" && feeType !== "perListing") {
+      throw new HttpsError("invalid-argument", "feeType must be 'lifetime' or 'perListing'.");
+    }
+
+    const expected = crypto
+      .createHmac("sha256", razorpayKeySecret.value())
+      .update(`${orderId}|${paymentId}`)
+      .digest("hex");
+
+    if (expected !== signature) {
+      throw new HttpsError("permission-denied", "Signature mismatch.");
+    }
+
+    // Log every verified listing-fee payment for support/records, mirroring
+    // the `payments` collection pattern used for the registration fee.
+    // `amount` here is display-only — it came from createListingOrder's own
+    // response on the client and is never used to decide anything; the
+    // signature check above is what actually gates access.
+    await db.collection("listingPayments").add({
+      userId: request.auth.uid,
+      paymentId,
+      orderId,
+      feeType,
+      amount: typeof amount === "number" ? amount : null,
+      status: "verified",
+      timestamp: FieldValue.serverTimestamp(),
+    });
+
+    // Only 'lifetime' grants the standing flag — 'perListing' is spent the
+    // moment this listing is published and never persists on the user doc.
+    if (feeType === "lifetime") {
+      await db.collection("users").doc(request.auth.uid).update({
+        hasLifetimeListingAccess: true,
+        lifetimeListingPaymentId: paymentId,
+        lifetimeListingPaidAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    return { verified: true };
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════
 // 3. Chat encryption key — called once per device from
 //    encryption_service.dart, result cached in flutter_secure_storage
 //    on the client so this only runs on first launch / cache miss.

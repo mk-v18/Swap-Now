@@ -235,7 +235,7 @@ class _ChatsPageState extends State<ChatsPage> {
     final rl = _RL(MediaQuery.of(context).size.width);
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF8F8F8),
+      backgroundColor: const Color(0xFFFFFFFF),
       appBar: AppBar(
         scrolledUnderElevation: 0,
         backgroundColor: Colors.white,
@@ -268,26 +268,36 @@ class _ChatsPageState extends State<ChatsPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  SvgPicture.asset(
-                    'assets/images/empty_chats.svg',
-                    width: rl.emptyIconSize,
-                    height: rl.emptyIconSize,
+                  Container(
+                    width: rl.emptyIconSize+30,
+                    height: rl.emptyIconSize+30,
+                    decoration: BoxDecoration(
+                      color: Color(0xFF4A148C).withOpacity(0.08),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      Icons.chat_bubble_outline_rounded,
+                      size: rl.emptyIconSize * 0.6,
+                      color: Color(0xFF4A148C).withOpacity(0.6),
+                    ),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 20),
                   Text(
                     'No chats yet',
                     style: TextStyle(
-                      color: Colors.grey[400],
+                      color: Colors.black,
                       fontSize: rl.emptyFontSize,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
                   const SizedBox(height: 6),
                   Text(
                     'Start a conversation to see it here',
                     style: TextStyle(
-                      color: Colors.grey[350] ?? Colors.grey[300],
-                      fontSize: (rl.emptyFontSize ?? 14) * 0.75,
+                      color: Colors.grey[600],
+                      fontSize: (rl.emptyFontSize ?? 14) * 0.78,
                     ),
+                    textAlign: TextAlign.center,
                   ),
                 ],
               ),

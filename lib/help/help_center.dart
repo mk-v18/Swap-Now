@@ -1,5 +1,4 @@
 import 'dart:async';
-
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -632,8 +631,10 @@ class _HelpCenterPageState extends State<HelpCenterPage> {
         if (snapshot.hasError) {
           return _CenteredMessage(
             icon: Icons.error_outline,
-            text: 'Something went wrong loading your queries.',
+            title: 'Something went wrong',
+            subtitle: 'Could not load your queries right now',
             r: r,
+            accent: const Color(0xFFD32F2F),
           );
         }
         if (snapshot.connectionState == ConnectionState.waiting) {
@@ -643,7 +644,8 @@ class _HelpCenterPageState extends State<HelpCenterPage> {
         if (docs.isEmpty) {
           return _CenteredMessage(
             icon: Icons.inbox_outlined,
-            text: 'No queries yet. Tap "New Query" to reach our support team.',
+            title: 'No queries yet',
+            subtitle: 'Tap "New Query" to reach our support team',
             r: r,
           );
         }
@@ -794,21 +796,59 @@ class _QueryCard extends StatelessWidget {
 
 class _CenteredMessage extends StatelessWidget {
   final IconData icon;
-  final String text;
+  final String title;
+  final String? subtitle;
   final _Resp r;
-  const _CenteredMessage({required this.icon, required this.text, required this.r});
+  final Color accent;
+
+  const _CenteredMessage({
+    required this.icon,
+    required this.title,
+    this.subtitle,
+    required this.r,
+    this.accent = const Color(0xFF4A148C),
+  });
 
   @override
   Widget build(BuildContext context) {
+    final badgeSize = r.w(80);
     return Center(
       child: Padding(
-        padding: EdgeInsets.all(r.w(24)),
+        padding: EdgeInsets.symmetric(horizontal: r.w(32)),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: r.w(48), color: Colors.grey.shade400),
-            SizedBox(height: r.h(12)),
-            Text(text, textAlign: TextAlign.center, style: TextStyle(color: Colors.grey.shade600, fontSize: r.sp(13))),
+            Container(
+              width: badgeSize,
+              height: badgeSize,
+              decoration: BoxDecoration(
+                color: accent.withOpacity(0.08),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: r.w(34), color: accent.withOpacity(0.65)),
+            ),
+            SizedBox(height: r.h(16)),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.grey.shade800,
+                fontSize: r.sp(14.5),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            if (subtitle != null) ...[
+              SizedBox(height: r.h(6)),
+              Text(
+                subtitle!,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.grey.shade500,
+                  fontSize: r.sp(12.5),
+                  height: 1.4,
+                ),
+              ),
+            ],
           ],
         ),
       ),

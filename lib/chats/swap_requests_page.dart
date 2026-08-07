@@ -88,7 +88,15 @@ class _SwapRequestsPageState extends State<SwapRequestsPage>
       builder: (context, snap) {
         if (!snap.hasData) return const Center(child: CircularProgressIndicator());
         final docs = snap.data!.docs;
-        if (docs.isEmpty) return _emptyState('No pending requests', Icons.inbox_outlined);
+        // Incoming tab
+        if (docs.isEmpty) {
+          return _emptyState(
+            'No pending requests',
+            Icons.inbox_outlined,
+            subtitle: 'Swap requests from other users will show up here',
+            accent: _T.deepPurple,
+          );
+        }
 
         return ListView.separated(
           padding: const EdgeInsets.all(16),
@@ -306,8 +314,14 @@ class _SwapRequestsPageState extends State<SwapRequestsPage>
       builder: (context, snap) {
         if (!snap.hasData) return const Center(child: CircularProgressIndicator());
         final docs = snap.data!.docs;
+        // Active tab
         if (docs.isEmpty) {
-          return _emptyState('No active swaps yet', Icons.swap_horiz_rounded);
+          return _emptyState(
+            'No active swaps yet',
+            Icons.swap_horiz_rounded,
+            subtitle: 'Accept a request to start swapping with someone',
+            accent: _T.teal,
+          );
         }
 
         return ListView.separated(
@@ -646,7 +660,14 @@ class _SwapRequestsPageState extends State<SwapRequestsPage>
       builder: (context, snap) {
         if (!snap.hasData) return const Center(child: CircularProgressIndicator());
         final docs = snap.data!.docs;
-        if (docs.isEmpty) return _emptyState('No requests sent yet', Icons.send_outlined);
+        if (docs.isEmpty) {
+          return _emptyState(
+            'No requests sent yet',
+            Icons.send_outlined,
+            subtitle: 'Requests you send to other users will appear here',
+            accent: _T.deepPurple,
+          );
+        }
 
         return ListView.separated(
           padding: const EdgeInsets.all(16),
@@ -1009,21 +1030,59 @@ class _SwapRequestsPageState extends State<SwapRequestsPage>
     );
   }
 
-  Widget _emptyState(String label, IconData icon) => Center(
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, size: 44, color: Colors.grey[350]),
-        const SizedBox(height: 10),
-        Text(label, style: TextStyle(color: Colors.grey[500], fontSize: 13.5)),
-      ],
-    ),
-  );
+  Widget _emptyState(
+      String title,
+      IconData icon, {
+        String? subtitle,
+        Color accent = _T.deepPurple,
+      }) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 84,
+              height: 84,
+              decoration: BoxDecoration(
+                color: accent.withOpacity(0.08),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 36, color: accent.withOpacity(0.7)),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: _T.textDark,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            if (subtitle != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.grey[500],
+                  fontSize: 12.5,
+                  height: 1.4,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 
   void _snack(String msg, {bool error = false}) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(msg),
-      backgroundColor: error ? const Color(0xFFB00020) : Colors.black87,
+      backgroundColor: error ? const Color(0xFFB00020) : Colors.green,
       behavior: SnackBarBehavior.floating,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
     ));

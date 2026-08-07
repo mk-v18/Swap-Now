@@ -12,6 +12,11 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
+import 'package:razorpay_flutter/razorpay_flutter.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_remote_config/firebase_remote_config.dart';
+import 'package:amoeba/start/payment_success.dart';
+import 'package:amoeba/start/payment_fail.dart';
 
 // ─── Responsive Layout Helper ─────────────────────────────────────────────────
 class _RL {
@@ -87,6 +92,30 @@ const int    _kCompressQuality= 65;
 const int    _kCompressMaxDim = 1024;
 const int    _kSuggestionCacheCap = 40;
 
+// ─── Listing publish fee ───────────────────────────────────────────────────
+// Two ways to unlock Publish, offered in a dialog every time the signed-in
+// user does NOT already have `hasLifetimeListingAccess` on their user doc:
+//   • Lifetime  — flat ₹49 once. On verified payment the server sets
+//                 hasLifetimeListingAccess, so every future listing skips
+//                 this dialog entirely.
+//   • Per-listing — 20% of the price the user is asking for THIS item,
+//                 capped at ₹100. Charged again on every future listing.
+// The actual charged amount is always computed server-side in
+// functions/index.js (createListingOrder) from these same numbers — this
+// copy is for showing the user an accurate preview before checkout opens,
+// never for deciding what Razorpay actually charges.
+const double _kLifetimeFeeRupees        = 49.0;
+const double _kPerListingFeeRate        = 0.20;
+const double _kPerListingFeeCapRupees   = 100.0;
+const double _kPerListingFeeMinRupees   = 1.0; // Razorpay's own order minimum
+
+enum _ListingFeeType { lifetime, perListing }
+
+// Razorpay's `key_id` is publishable, not a secret — see the identical
+// pattern (and reasoning) in start/payment.dart. Kept as its own fallback
+// here so this page has no compile-time dependency on that screen.
+const String _kRazorpayKeyFallback = 'rzp_test_TBJCKQmpFKyNl6'; // TODO: keep in sync with start/payment.dart
+
 /// Cached autocomplete result for a given query string.
 class _SuggestionResult {
   final List<String> names;
@@ -106,6 +135,7 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
   // ── Controllers ──────────────────────────────────────────────────────────
   final TextEditingController _titleController       = TextEditingController();
   final TextEditingController _descriptionController = TextEditingController();
+  final TextEditingController _priceController        = TextEditingController();
   final TextEditingController _locationController    = TextEditingController();
 
   final FocusNode _locationFocusNode = FocusNode();
@@ -164,11 +194,44 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
   final http.Client _httpClient = http.Client();
   final ImagePicker _picker     = ImagePicker();
 
+  // ── Listing fee payment ───────────────────────────────────────────────────
+  late final Razorpay _razorpay;
+  // Resolved once in initState — Remote Config value if available, else the
+  // hardcoded fallback. Same reasoning as start/payment.dart: never read
+  // _kRazorpayKeyFallback directly anywhere else.
+  String _razorpayKey = _kRazorpayKeyFallback;
+  // Bridges Razorpay's global event-callback API to the single in-flight
+  // checkout this page ever opens at a time (one per Publish attempt).
+  _ListingFeeType? _pendingFeeType;
+  int? _pendingAmountPaise;
+
   // ── Lifecycle ────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
     _locationFocusNode.addListener(_onLocationFocusChange);
+
+    _razorpay = Razorpay();
+    _razorpay.on(Razorpay.EVENT_PAYMENT_SUCCESS, _handleListingPaymentSuccess);
+    _razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, _handleListingPaymentError);
+    _razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, _handleListingExternalWallet);
+    _loadRazorpayKey();
+  }
+
+  Future<void> _loadRazorpayKey() async {
+    try {
+      final remoteConfig = FirebaseRemoteConfig.instance;
+      await remoteConfig.setConfigSettings(RemoteConfigSettings(
+        fetchTimeout: const Duration(seconds: 8),
+        minimumFetchInterval: const Duration(hours: 1),
+      ));
+      await remoteConfig.setDefaults({'razorpay_key_id': _kRazorpayKeyFallback});
+      await remoteConfig.fetchAndActivate();
+      final fetched = remoteConfig.getString('razorpay_key_id');
+      if (fetched.isNotEmpty && mounted) _razorpayKey = fetched;
+    } catch (e) {
+      debugPrint('Remote Config fetch failed, using fallback Razorpay key: $e');
+    }
   }
 
   void _onLocationFocusChange() {
@@ -180,11 +243,13 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     _debounce?.cancel();
     _httpClient.close();
     _removeOverlay();
+    _razorpay.clear();
     _locationFocusNode
       ..removeListener(_onLocationFocusChange)
       ..dispose();
     _titleController.dispose();
     _descriptionController.dispose();
+    _priceController.dispose();
     _locationController.dispose();
     super.dispose();
   }
@@ -490,6 +555,11 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     if (_titleController.text.trim().length > 120) return "Title must be 120 characters or fewer.";
     if (_descriptionController.text.trim().length < 10) return "Description must be at least 10 characters.";
     if (_descriptionController.text.trim().length > 2000) return "Description must be 2,000 characters or fewer.";
+    final priceText = _priceController.text.trim();
+    if (priceText.isEmpty) return "Please enter a price.";
+    final price = double.tryParse(priceText);
+    if (price == null || price <= 0) return "Please enter a valid price greater than 0.";
+    if (price > 9999999) return "Price seems too high — please double-check it.";
     if (_condition == null) return "Please select a condition.";
     if (_category  == null) return "Please select a category.";
     if (_location.trim().isEmpty) return "Please set your location.";
@@ -500,6 +570,29 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
       return "Please pick your location from the suggestions list or use \"detect current location\".";
     }
     return null;
+  }
+
+  // ── Listing fee helpers ───────────────────────────────────────────────────
+  double get _enteredPrice => double.tryParse(_priceController.text.trim()) ?? 0;
+
+  // 20% of the entered price, floored at Razorpay's ₹1 minimum and capped at
+  // ₹100 — a preview only; functions/index.js computes the real charge.
+  double get _perListingFeePreview {
+    final raw = _enteredPrice * _kPerListingFeeRate;
+    if (raw < _kPerListingFeeMinRupees) return _kPerListingFeeMinRupees;
+    if (raw > _kPerListingFeeCapRupees) return _kPerListingFeeCapRupees;
+    return raw;
+  }
+
+  Future<bool> _hasLifetimeListingAccess(String uid) async {
+    try {
+      final doc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
+      return doc.data()?['hasLifetimeListingAccess'] == true;
+    } catch (_) {
+      // If the check itself fails, fall through to the fee dialog rather
+      // than silently letting an unpaid publish through.
+      return false;
+    }
   }
 
   // ── Submit ────────────────────────────────────────────────────────────────
@@ -517,6 +610,28 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         return;
       }
 
+      final alreadyUnlocked = await _hasLifetimeListingAccess(user.uid);
+      if (!mounted) return;
+
+      if (alreadyUnlocked) {
+        await _publishListing(user);
+        return;
+      }
+
+      final chosen = await _showListingFeeDialog();
+      if (chosen == null) return; // user dismissed the dialog — not an error
+      if (!mounted) return;
+      await _startListingCheckout(chosen, user);
+      // From here on the Razorpay event handlers below take over: they push
+      // PaymentSuccessPage / PaymentFailedPage, and the actual publish runs
+      // from PaymentSuccessPage's Continue button, which then pops back here.
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
+    }
+  }
+
+  Future<void> _publishListing(User user, {_ListingFeeType? feeTypeCharged}) async {
+    try {
       final imageUrls = await _uploadImagesParallel(user.uid);
       if (imageUrls == null) return;
 
@@ -524,6 +639,7 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         'userId'     : user.uid,
         'title'      : _titleController.text.trim(),
         'description': _descriptionController.text.trim(),
+        'price'      : _enteredPrice,
         'category'   : _category,
         'condition'  : _condition,
         'location'   : _location.trim(),
@@ -534,6 +650,11 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         'images'     : imageUrls,
         'createdAt'  : FieldValue.serverTimestamp(),
         'status'     : 'active',
+        // Record-only — how (if at all) this specific publish was paid for.
+        // Doesn't drive any access logic; hasLifetimeListingAccess on the
+        // user doc is what actually gates future publishes.
+        if (feeTypeCharged != null)
+          'listingFeeType': feeTypeCharged == _ListingFeeType.lifetime ? 'lifetime' : 'perListing',
       });
 
       if (!mounted) return;
@@ -543,9 +664,183 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
       if (mounted) _showErrorSnack("Upload failed: ${e.message ?? 'Try again.'}");
     } catch (_) {
       if (mounted) _showErrorSnack("Failed to publish product. Try again.");
-    } finally {
-      if (mounted) setState(() => _isSubmitting = false);
     }
+  }
+
+  // ── Listing fee dialog ────────────────────────────────────────────────────
+  Future<_ListingFeeType?> _showListingFeeDialog() {
+    return showDialog<_ListingFeeType>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) => _ListingFeeDialog(
+        perListingFeePreview: _perListingFeePreview,
+      ),
+    );
+  }
+
+  // ── Razorpay checkout for the listing fee ────────────────────────────────
+  // Opens checkout and returns as soon as it's on screen — it does NOT wait
+  // for the outcome. Success/failure arrive later via the event handlers
+  // below, which is where PaymentSuccessPage/PaymentFailedPage get shown.
+  Future<void> _startListingCheckout(_ListingFeeType feeType, User user) async {
+    String orderId;
+    int amountPaise;
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable('createListingOrder');
+      final result = await callable.call({
+        'feeType': feeType == _ListingFeeType.lifetime ? 'lifetime' : 'perListing',
+        if (feeType == _ListingFeeType.perListing) 'price': _enteredPrice,
+      }).timeout(const Duration(seconds: 15));
+      final data = result.data as Map;
+      orderId = data['orderId'] as String;
+      amountPaise = data['amount'] as int;
+    } on FirebaseFunctionsException catch (e) {
+      debugPrint('createListingOrder rejected: ${e.code} ${e.message}');
+      if (mounted) _showErrorSnack("Could not start payment. Please try again.");
+      return;
+    } catch (e) {
+      debugPrint('createListingOrder call error: $e');
+      if (mounted) _showErrorSnack("Network error. Please check your connection and retry.");
+      return;
+    }
+
+    final options = {
+      'key': _razorpayKey,
+      'amount': amountPaise,
+      'order_id': orderId,
+      'name': 'SwapNow',
+      'description': feeType == _ListingFeeType.lifetime
+          ? 'Lifetime listing access'
+          : 'Listing fee for this product',
+      'prefill': {'contact': user.phoneNumber ?? ''},
+      'external': {
+        'wallets': ['paytm']
+      },
+      'method': {'upi': true, 'card': true, 'netbanking': true, 'wallet': true},
+      'theme': {'color': '#6A00FF'},
+      'notes': {'uid': user.uid},
+    };
+
+    _pendingFeeType = feeType;
+    _pendingAmountPaise = amountPaise;
+    try {
+      _razorpay.open(options);
+    } catch (e) {
+      debugPrint('Razorpay open error: $e');
+      _pendingFeeType = null;
+      _pendingAmountPaise = null;
+      if (mounted) _showErrorSnack("Could not open payment. Please try again.");
+    }
+  }
+
+  void _handleListingPaymentSuccess(PaymentSuccessResponse response) async {
+    final feeType = _pendingFeeType;
+    final amountPaise = _pendingAmountPaise;
+    _pendingFeeType = null;
+    _pendingAmountPaise = null;
+    if (feeType == null || !mounted) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+    final paymentId = response.paymentId ?? 'unknown';
+    final orderId = response.orderId ?? '';
+    final signature = response.signature ?? '';
+    final now = DateTime.now();
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable('verifyListingPayment');
+      final result = await callable.call({
+        'orderId': orderId,
+        'paymentId': paymentId,
+        'signature': signature,
+        'feeType': feeType == _ListingFeeType.lifetime ? 'lifetime' : 'perListing',
+        if (amountPaise != null) 'amount': amountPaise,
+      }).timeout(const Duration(seconds: 15));
+
+      final verified = (result.data as Map)['verified'] == true;
+      if (!verified) throw Exception('Server did not confirm verification.');
+
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PaymentSuccessPage(
+            paymentId: paymentId,
+            time: now.toIso8601String(),
+            subtitle: feeType == _ListingFeeType.lifetime
+                ? "Lifetime listing access unlocked — every future listing is free."
+                : "Listing fee received for this product.",
+            // Runs the actual publish (image upload + Firestore write) while
+            // this page's own Continue button shows its spinner, then pops
+            // back to the listing page — "back to where it started".
+            onContinue: () async {
+              if (user != null) {
+                await _publishListing(user, feeTypeCharged: feeType);
+              }
+              if (mounted) Navigator.of(context).pop();
+            },
+          ),
+        ),
+      );
+    } on FirebaseFunctionsException catch (e) {
+      debugPrint('verifyListingPayment rejected: ${e.code} ${e.message}');
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PaymentFailedPage(
+            errorCode: e.code,
+            errorMessage:
+            "Payment received but verification failed. Contact support with payment ID: $paymentId",
+            onRetry: () => Navigator.of(context).pop(),
+          ),
+        ),
+      );
+    } catch (e) {
+      debugPrint('verifyListingPayment call error: $e');
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PaymentFailedPage(
+            errorCode: "VERIFY_ERROR",
+            errorMessage:
+            "Couldn't confirm payment. Contact support with payment ID: $paymentId if this persists.",
+            onRetry: () => Navigator.of(context).pop(),
+          ),
+        ),
+      );
+    }
+  }
+
+  void _handleListingPaymentError(PaymentFailureResponse response) {
+    _pendingFeeType = null;
+    _pendingAmountPaise = null;
+    if (!mounted) return;
+
+    final message = response.code == Razorpay.PAYMENT_CANCELLED
+        ? "Payment was cancelled."
+        : response.code == Razorpay.NETWORK_ERROR
+        ? "Network error. Please check your connection and retry."
+        : "Payment failed. Please try a different payment method.";
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PaymentFailedPage(
+          errorCode: (response.code ?? 0).toString(),
+          errorMessage: message,
+          // Just returns the user to the listing page — they can tap
+          // Publish again to retry from scratch.
+          onRetry: () => Navigator.of(context).pop(),
+        ),
+      ),
+    );
+  }
+
+  void _handleListingExternalWallet(ExternalWalletResponse response) {
+    _pendingFeeType = null;
+    _pendingAmountPaise = null;
+    if (mounted) _showSuccessSnack("Redirecting to ${response.walletName ?? 'wallet'}...");
   }
 
   Future<List<String>?> _uploadImagesParallel(String uid) async {
@@ -587,6 +882,7 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
       _images.clear();
       _titleController.clear();
       _descriptionController.clear();
+      _priceController.clear();
       _category = null;
       _condition = null;
       _locationController.clear();
@@ -725,6 +1021,19 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
                           hintText: "Condition, features, reason for swapping…",
                           prefixIcon: Icons.notes_rounded,
                           alignLabelWithHint: true,
+                        ),
+                        SizedBox(height: rl.sectionGap),
+                        _FieldLabel(text: "Price (₹)", rl: rl),
+                        _InputField(
+                          rl: rl,
+                          controller: _priceController,
+                          hintText: "e.g. 1500",
+                          prefixIcon: Icons.currency_rupee_rounded,
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                          inputFormatters: [
+                            FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d{0,2}')),
+                          ],
+                          textInputAction: TextInputAction.done,
                         ),
                       ],
                     ),
@@ -1072,6 +1381,164 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
                   color: Colors.white,
                   fontSize: rl.saveButtonFontSize,
                   letterSpacing: 0.2)),
+        ]),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  LISTING FEE — selection dialog
+// ══════════════════════════════════════════════════════════════════════════════
+/// Shown before Publish whenever the signed-in user doesn't already have
+/// hasLifetimeListingAccess. Lets them pick between a one-time ₹49 lifetime
+/// unlock, or a per-listing fee (20% of their asking price, capped ₹100).
+class _ListingFeeDialog extends StatefulWidget {
+  final double perListingFeePreview;
+  const _ListingFeeDialog({required this.perListingFeePreview});
+
+  @override
+  State<_ListingFeeDialog> createState() => _ListingFeeDialogState();
+}
+
+class _ListingFeeDialogState extends State<_ListingFeeDialog> {
+  _ListingFeeType _selected = _ListingFeeType.lifetime;
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: const BoxDecoration(color: _kPurpleLight, shape: BoxShape.circle),
+                  child: const Icon(Icons.workspace_premium_outlined, color: _kPurple, size: 20),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text("Choose how to publish",
+                      style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: _kLabel)),
+                ),
+              ]),
+              const SizedBox(height: 6),
+              Text("Pick a plan to publish this listing.",
+                  style: TextStyle(fontSize: 13, color: _kSubtext)),
+              const SizedBox(height: 18),
+              _FeeOptionCard(
+                selected: _selected == _ListingFeeType.lifetime,
+                title: "Lifetime access",
+                subtitle: "Pay once — every future listing is free.",
+                priceLabel: "₹${_kLifetimeFeeRupees.toStringAsFixed(0)}",
+                priceSublabel: "one-time",
+                onTap: () => setState(() => _selected = _ListingFeeType.lifetime),
+              ),
+              const SizedBox(height: 10),
+              _FeeOptionCard(
+                selected: _selected == _ListingFeeType.perListing,
+                title: "Pay per listing",
+                subtitle: "Capped at ₹${_kPerListingFeeCapRupees.toStringAsFixed(0)}."
+                    " Charged again next time.",
+                priceLabel: "₹${widget.perListingFeePreview.toStringAsFixed(2)}",
+                priceSublabel: "this listing",
+                onTap: () => setState(() => _selected = _ListingFeeType.perListing),
+              ),
+              const SizedBox(height: 20),
+              Row(children: [
+                Expanded(
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        foregroundColor: _kSubtext),
+                    child: const Text("Cancel"),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(context).pop(_selected),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _kPurple,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 13),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      elevation: 0,
+                    ),
+                    child: const Text("Continue", style: TextStyle(fontWeight: FontWeight.w600)),
+                  ),
+                ),
+              ]),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FeeOptionCard extends StatelessWidget {
+  final bool selected;
+  final String title;
+  final String subtitle;
+  final String priceLabel;
+  final String priceSublabel;
+  final VoidCallback onTap;
+
+  const _FeeOptionCard({
+    required this.selected,
+    required this.title,
+    required this.subtitle,
+    required this.priceLabel,
+    required this.priceSublabel,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: selected ? _kPurpleLight : Colors.white,
+          border: Border.all(color: selected ? _kPurple : _kBorder, width: selected ? 1.6 : 1.2),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(children: [
+          Icon(
+            selected ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded,
+            color: selected ? _kPurple : Colors.grey.shade400,
+            size: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(title, style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w700, color: _kLabel)),
+              const SizedBox(height: 3),
+              Text(subtitle, style: TextStyle(fontSize: 12, color: _kSubtext, height: 1.3)),
+            ]),
+          ),
+          const SizedBox(width: 8),
+          Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+            Text(priceLabel,
+                style: TextStyle(
+                    fontSize: 16, fontWeight: FontWeight.w800,
+                    color: selected ? _kPurple : _kLabel)),
+            Text(priceSublabel, style: TextStyle(fontSize: 10.5, color: _kSubtext)),
+          ]),
         ]),
       ),
     );

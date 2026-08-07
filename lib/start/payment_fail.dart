@@ -6,11 +6,17 @@ import 'package:google_mobile_ads/google_mobile_ads.dart';
 class PaymentFailedPage extends StatefulWidget {
   final String errorCode;
   final String errorMessage;
+  // Optional — when provided, Try Again calls this instead of navigating
+  // back to the registration PaymentPage. Other payment flows (e.g. the
+  // product-listing fee) pass their own — typically just popping back to
+  // wherever the flow started.
+  final VoidCallback? onRetry;
 
   const PaymentFailedPage({
     super.key,
     required this.errorCode,
     required this.errorMessage,
+    this.onRetry,
   });
 
   @override
@@ -482,6 +488,10 @@ class _PaymentFailedPageState extends State<PaymentFailedPage>
     setState(() => _isLoading = true);
     await Future.delayed(const Duration(milliseconds: 300));
     if (!mounted) return;
+    if (widget.onRetry != null) {
+      widget.onRetry!.call();
+      return;
+    }
     // pushReplacement instead of push: prevents the back stack from
     // accumulating Fail → Pay → Fail → Pay chains.
     Navigator.pushReplacement(

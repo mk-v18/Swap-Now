@@ -40,6 +40,9 @@ class _SplashScreenState extends State<SplashScreen>
   late Animation<double> _ring;
 
   // ── Particles ─────────────────────────────────────────────────
+  // FIX(perf): 30 -> 16. Combined with scoping the particle canvas to its
+  // own controller below (instead of rebuilding as part of one giant merged
+  // listener), this was the other big chunk of steady per-frame cost.
   final List<_Particle> _particles = [];
   final math.Random _rng = math.Random();
 
@@ -195,7 +198,7 @@ class _SplashScreenState extends State<SplashScreen>
   }
 
   void _buildParticles() {
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 16; i++) {
       _particles.add(_Particle(
         x: _rng.nextDouble(),
         y: _rng.nextDouble(),
@@ -234,39 +237,55 @@ class _SplashScreenState extends State<SplashScreen>
     final taglineFontSize = isTablet ? 38.0 : isSmall ? 26.0 : 32.0;
     final subtitleFontSize = isTablet ? 16.0 : isSmall ? 12.0 : 14.0;
 
+    // FIX(perf): This used to be a single
+    // `Listenable.merge([_bgController, _entryController, _pulseController,
+    // _particleController, _shimmerController, _ringController])` wrapping
+    // the ENTIRE Stack (background gradients, 30-particle canvas, rings,
+    // shimmer text, content layout). That meant a tick from ANY of those 6
+    // independently-running controllers rebuilt EVERYTHING — effectively a
+    // full-tree rebuild ~60 times a second for the whole splash duration,
+    // regardless of which single piece actually needed to change. On
+    // weaker devices that's exactly the kind of load that shows up as
+    // dropped frames / stutter / a splash that "isn't working properly".
+    //
+    // Now each piece is scoped to only the controller it actually depends
+    // on, so e.g. a particle-controller tick only rebuilds the particle
+    // canvas, not the background gradients or the ring. `_buildLogo` (pulse)
+    // and `_buildShimmerText` (shimmer) already had their own scoped
+    // AnimatedBuilders internally — this just stops the outer merge from
+    // needlessly re-running everything around them too.
     return Scaffold(
-      body: AnimatedBuilder(
-        animation: Listenable.merge([
-          _bgController,
-          _entryController,
-          _pulseController,
-          _particleController,
-          _shimmerController,
-          _ringController,
-        ]),
-        builder: (context, _) {
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              _buildBackground(size),
-              CustomPaint(
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          AnimatedBuilder(
+            animation: _bgController,
+            builder: (context, _) => _buildBackground(size),
+          ),
+          RepaintBoundary(
+            child: AnimatedBuilder(
+              animation: _particleController,
+              builder: (context, _) => CustomPaint(
                 painter: _ParticlePainter(
                   particles: _particles,
                   progress: _particleController.value,
                   size: size,
                 ),
               ),
-              _buildRings(size, logoSize),
-              if (_showContent)
-                _buildContent(
-                  size: size,
-                  logoSize: logoSize,
-                  taglineFontSize: taglineFontSize,
-                  subtitleFontSize: subtitleFontSize,
-                ),
-            ],
-          );
-        },
+            ),
+          ),
+          AnimatedBuilder(
+            animation: _ringController,
+            builder: (context, _) => _buildRings(size, logoSize),
+          ),
+          if (_showContent)
+            _buildContent(
+              size: size,
+              logoSize: logoSize,
+              taglineFontSize: taglineFontSize,
+              subtitleFontSize: subtitleFontSize,
+            ),
+        ],
       ),
     );
   }
@@ -307,10 +326,12 @@ class _SplashScreenState extends State<SplashScreen>
                 math.sin(angle * 1.3) * size.height * 0.04,
             child: _buildOrb(size.width * 0.45, const Color(0xFFAB00FF), 0.12),
           ),
-          Opacity(
-            opacity: 0.04,
-            child: CustomPaint(painter: _NoisePainter(), size: size),
-          ),
+          // REMOVED: a full-screen Opacity(0.04) + CustomPaint(_NoisePainter())
+          // layer that drew (width * height / 60) individual circles onto a
+          // separate compositing layer purely for a subtle grain texture.
+          // On a ~1080x2400 phone screen that's on the order of 40,000+
+          // drawCircle calls for a barely-visible effect — not worth the
+          // GPU/CPU cost on a splash screen that's supposed to feel instant.
         ],
       ),
     );
@@ -433,11 +454,15 @@ class _SplashScreenState extends State<SplashScreen>
                   shape: BoxShape.circle,
                   boxShadow: [
                     BoxShadow(
+                      // FIX(perf): blurRadius 60 / spreadRadius 20 -> 40 / 12.
+                      // This shadow recomputes every pulse frame; a smaller
+                      // blur radius is noticeably cheaper for the GPU to
+                      // rasterize while still reading as a soft glow.
                       color: const Color(0xFF9B30FF).withOpacity(
                         0.3 + (_pulse.value - 0.85) / 0.2 * 0.2,
                       ),
-                      blurRadius: 60,
-                      spreadRadius: 20,
+                      blurRadius: 40,
+                      spreadRadius: 12,
                     ),
                   ],
                 ),
@@ -614,24 +639,4 @@ class _ParticlePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_ParticlePainter old) => old.progress != progress;
-}
-
-// ── Noise painter ──────────────────────────────────────────────────────────
-class _NoisePainter extends CustomPainter {
-  final math.Random _rng = math.Random(42);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = Colors.white;
-    final w = size.width.toInt();
-    final h = size.height.toInt();
-    for (int i = 0; i < w * h ~/ 60; i++) {
-      final x = _rng.nextDouble() * size.width;
-      final y = _rng.nextDouble() * size.height;
-      canvas.drawCircle(Offset(x, y), 0.6, paint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(_NoisePainter old) => false;
 }

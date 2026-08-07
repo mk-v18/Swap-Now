@@ -1,8 +1,17 @@
+import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+// FIX(gap): This page used to read only the `payments` collection, which
+// is written exclusively by the one-time registration fee flow
+// (start/payment.dart). The newer per-listing publish fee
+// (user_product/product_page.dart) logs its verified payments to a
+// SEPARATE `listingPayments` collection — so any ₹49 lifetime unlock or
+// per-listing fee a user paid was silently invisible here, even though it
+// went through fine. This page now merges both collections into one
+// timeline, tagging each entry so the card can show the right title.
 class PaymentsDetails extends StatefulWidget {
   const PaymentsDetails({super.key});
 
@@ -10,9 +19,94 @@ class PaymentsDetails extends StatefulWidget {
   State<PaymentsDetails> createState() => _PaymentsDetailsState();
 }
 
+/// Which collection a merged entry came from — drives title/labels only;
+/// both render through the same `_PaymentCard`.
+enum _PaymentSource { registration, listing }
+
+class _PaymentEntry {
+  final _PaymentSource source;
+  final Map<String, dynamic> data;
+  final DateTime? timestamp; // null while a serverTimestamp is still pending
+  const _PaymentEntry({required this.source, required this.data, required this.timestamp});
+}
+
 class _PaymentsDetailsState extends State<PaymentsDetails> {
   static const Color _brand = Color(0xFF5800B3);
   static const Color _title = Color(0xFF0D1B4B);
+
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _registrationSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _listingSub;
+
+  List<_PaymentEntry>? _registrationEntries; // null = still loading
+  List<_PaymentEntry>? _listingEntries;
+  String? _registrationError;
+  String? _listingError;
+
+  @override
+  void initState() {
+    super.initState();
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    _registrationSub = FirebaseFirestore.instance
+        .collection('payments')
+        .where('userId', isEqualTo: user.uid)
+        .orderBy('timestamp', descending: true)
+        .snapshots()
+        .listen(
+          (snap) {
+        if (!mounted) return;
+        setState(() {
+          _registrationError = null;
+          _registrationEntries = snap.docs
+              .map((d) => _PaymentEntry(
+            source: _PaymentSource.registration,
+            data: d.data(),
+            timestamp: _tsOf(d.data()['timestamp']),
+          ))
+              .toList();
+        });
+      },
+      onError: (e) {
+        if (!mounted) return;
+        setState(() => _registrationError = e.toString());
+      },
+    );
+
+    _listingSub = FirebaseFirestore.instance
+        .collection('listingPayments')
+        .where('userId', isEqualTo: user.uid)
+        .orderBy('timestamp', descending: true)
+        .snapshots()
+        .listen(
+          (snap) {
+        if (!mounted) return;
+        setState(() {
+          _listingError = null;
+          _listingEntries = snap.docs
+              .map((d) => _PaymentEntry(
+            source: _PaymentSource.listing,
+            data: d.data(),
+            timestamp: _tsOf(d.data()['timestamp']),
+          ))
+              .toList();
+        });
+      },
+      onError: (e) {
+        if (!mounted) return;
+        setState(() => _listingError = e.toString());
+      },
+    );
+  }
+
+  static DateTime? _tsOf(dynamic ts) => ts is Timestamp ? ts.toDate() : null;
+
+  @override
+  void dispose() {
+    _registrationSub?.cancel();
+    _listingSub?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -47,66 +141,66 @@ class _PaymentsDetailsState extends State<PaymentsDetails> {
       body: user == null
           ? const _EmptyState(
         icon: Icons.lock_outline,
-        message: 'Please log in to view your payment history.',
+        title: 'Please log in',
+        subtitle: 'Log in to view your payment history',
       )
-          : StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-        stream: FirebaseFirestore.instance
-            .collection('payments')
-            .where('userId', isEqualTo: user.uid)
-            .orderBy('timestamp', descending: true)
-            .snapshots(),
-        builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return const _EmptyState(
-              icon: Icons.error_outline,
-              message:
-              'Could not load payments right now.\nPlease try again shortly.',
-            );
-          }
+          : _buildBody(),
+    );
+  }
 
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(
-              child: CircularProgressIndicator(color: _brand),
-            );
-          }
+  Widget _buildBody() {
+    if (_registrationError != null || _listingError != null) {
+      return const _EmptyState(
+        icon: Icons.error_outline,
+        title: 'Could not load payments',
+        subtitle: 'Please try again shortly',
+        accent: Color(0xFFD32F2F),
+      );
+    }
 
-          final docs = snapshot.data?.docs ?? [];
+    // Either stream can still be on its first snapshot.
+    if (_registrationEntries == null || _listingEntries == null) {
+      return const Center(child: CircularProgressIndicator(color: _brand));
+    }
 
-          if (docs.isEmpty) {
-            return const _EmptyState(
-              icon: Icons.receipt_long_outlined,
-              message: 'No payments yet.\nYour transaction history will show up here.',
-            );
-          }
+    final merged = [..._registrationEntries!, ..._listingEntries!]
+      ..sort((a, b) {
+        // Entries with no timestamp yet (just-written, server round trip
+        // still pending) sort first so they're visible immediately.
+        if (a.timestamp == null && b.timestamp == null) return 0;
+        if (a.timestamp == null) return -1;
+        if (b.timestamp == null) return 1;
+        return b.timestamp!.compareTo(a.timestamp!);
+      });
 
-          return ListView.separated(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-            itemCount: docs.length,
-            separatorBuilder: (_, __) => const SizedBox(height: 12),
-            itemBuilder: (context, index) {
-              final data = docs[index].data();
-              return _PaymentCard(data: data);
-            },
-          );
-        },
-      ),
+    if (merged.isEmpty) {
+      return const _EmptyState(
+        icon: Icons.receipt_long_outlined,
+        title: 'No payments yet',
+        subtitle: 'Your transaction history will show up here',
+      );
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+      itemCount: merged.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 12),
+      itemBuilder: (context, index) => _PaymentCard(entry: merged[index]),
     );
   }
 }
 
 class _PaymentCard extends StatelessWidget {
-  const _PaymentCard({required this.data});
+  const _PaymentCard({required this.entry});
 
-  final Map<String, dynamic> data;
-
-  static const Color _brand = Color(0xFF5800B3);
+  final _PaymentEntry entry;
 
   @override
   Widget build(BuildContext context) {
+    final data = entry.data;
     final status = (data['status'] as String?) ?? 'unknown';
-    final isSuccess =
-        status == 'pending_verification' || status == 'verified' || status == 'success';
     final isFailed = status == 'failed';
+    final isSuccess = !isFailed;
 
     final amountPaise = data['amount'] as int?;
     final amountText = amountPaise != null
@@ -118,10 +212,9 @@ class _PaymentCard extends StatelessWidget {
     final message = data['message'] as String?;
     final code = data['code'];
 
-    final ts = data['timestamp'];
     String dateText = '—';
-    if (ts is Timestamp) {
-      dateText = DateFormat('d MMM yyyy, h:mm a').format(ts.toDate());
+    if (entry.timestamp != null) {
+      dateText = DateFormat('d MMM yyyy, h:mm a').format(entry.timestamp!);
     }
 
     return Container(
@@ -143,12 +236,14 @@ class _PaymentCard extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                isFailed ? 'Payment Failed' : 'Registration Fee',
-                style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: Color(0xFF0D1B4B),
+              Expanded(
+                child: Text(
+                  _titleFor(entry, isFailed),
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF0D1B4B),
+                  ),
                 ),
               ),
               _StatusBadge(status: status, isSuccess: isSuccess, isFailed: isFailed),
@@ -170,6 +265,13 @@ class _PaymentCard extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  String _titleFor(_PaymentEntry entry, bool isFailed) {
+    if (isFailed) return 'Payment Failed';
+    if (entry.source == _PaymentSource.registration) return 'Registration Fee';
+    final feeType = entry.data['feeType'] as String?;
+    return feeType == 'lifetime' ? 'Lifetime Listing Access' : 'Listing Fee';
   }
 }
 
@@ -265,26 +367,57 @@ class _DetailRow extends StatelessWidget {
 }
 
 class _EmptyState extends StatelessWidget {
-  const _EmptyState({required this.icon, required this.message});
+  const _EmptyState({
+    required this.icon,
+    required this.title,
+    this.subtitle,
+    this.accent = const Color(0xFF4A148C),
+  });
 
   final IconData icon;
-  final String message;
+  final String title;
+  final String? subtitle;
+  final Color accent;
 
   @override
   Widget build(BuildContext context) {
     return Center(
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 32),
+        padding: const EdgeInsets.symmetric(horizontal: 36),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 44, color: Colors.grey.shade400),
-            const SizedBox(height: 12),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13.5, color: Colors.grey.shade600),
+            Container(
+              width: 80,
+              height: 80,
+              decoration: BoxDecoration(
+                color: accent.withOpacity(0.08),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 34, color: accent.withOpacity(0.65)),
             ),
+            const SizedBox(height: 16),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 14.5,
+                fontWeight: FontWeight.w700,
+                color: Colors.grey.shade800,
+              ),
+            ),
+            if (subtitle != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                subtitle!,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  height: 1.4,
+                  color: Colors.grey.shade500,
+                ),
+              ),
+            ],
           ],
         ),
       ),

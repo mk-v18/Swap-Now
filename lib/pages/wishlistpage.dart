@@ -187,7 +187,7 @@ class _WishlistPageState extends State<WishlistPage> {
       width: double.infinity,
       color: Colors.white,
       child: Image.asset(
-        'assets/images/trust_banner.png',
+        'assets/images/trust-banner.png',
         width: double.infinity,
         fit: BoxFit.fitWidth,
         // RELIABILITY: silent fallback — hides banner if asset is missing
@@ -197,25 +197,50 @@ class _WishlistPageState extends State<WishlistPage> {
   }
 
   Widget _buildEmptyState(bool isSmall) {
+    final accent = const Color(0xFFE91E63);
+    final iconSize = isSmall ? 52.0 : 64.0;
+
     return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            Icons.favorite_border,
-            size: isSmall ? 52 : 64,
-            color: Colors.grey[300],
-          ),
-          const SizedBox(height: 16),
-          Text(
-            'Your wishlist is empty.',
-            style: TextStyle(
-              color: Colors.grey[400],
-              fontSize: isSmall ? 14 : 15,
-              fontWeight: FontWeight.w500,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: iconSize + 20,
+              height: iconSize + 20,
+              decoration: BoxDecoration(
+                color: accent.withOpacity(0.08),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                Icons.favorite_border_rounded,
+                size: iconSize * 0.5,
+                color: accent.withOpacity(0.6),
+              ),
             ),
-          ),
-        ],
+            SizedBox(height: isSmall ? 16 : 20),
+            Text(
+              'Your wishlist is empty',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.grey[800],
+                fontSize: isSmall ? 15 : 16,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Tap the heart on any item to save it here',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.grey[500],
+                fontSize: isSmall ? 12 : 13,
+                height: 1.4,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

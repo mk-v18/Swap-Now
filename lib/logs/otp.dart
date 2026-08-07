@@ -629,28 +629,15 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     final rawBoxW   = (otpTotalW - 5 * 8) / 6;
     final boxSize   = rawBoxW.clamp(36.0, 52.0);
 
-    if (_isVerifying) {
-      return const Scaffold(
-        backgroundColor: Colors.white,
-        body: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              CircularProgressIndicator(color: _purple),
-              SizedBox(height: 16),
-              Text(
-                'Verifying…',
-                style: TextStyle(
-                    fontSize:   14,
-                    color:      Colors.grey,
-                    fontWeight: FontWeight.w500),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
+    // REMOVED: this used to short-circuit the whole build() with a
+    // full-screen "Verifying…" Scaffold whenever `_isVerifying` was true —
+    // swapping out the entire OTP page (boxes, header, everything) for a
+    // centered spinner the instant the 6th digit landed. That's jarring:
+    // the OTP boxes the user just filled in visibly vanish for however
+    // long sign-in + the Firestore user-doc lookup take. The Verify button
+    // below already renders its own inline spinner via `isLoading:
+    // _isVerifying` (see `_PurpleButton`), so "verifying" now stays
+    // anchored to that one spot instead of taking over the screen.
     return Scaffold(
       backgroundColor:          Colors.white,
       resizeToAvoidBottomInset: true,
@@ -668,9 +655,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                     SizedBox(height: screenH * 0.03),
 
                     Center(
-                      child: SvgPicture.asset(
-                        'assets/images/signup-image.svg',
+                      child: Image.asset(
+                        'assets/images/signup-image.png',
                         height: heroH,
+                        fit: BoxFit.contain,
                       ),
                     ),
 
@@ -859,12 +847,21 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                             ),
                             const SizedBox(height: 28),
 
-                            AutofillGroup(
-                              child: Row(
-                                mainAxisAlignment:
-                                MainAxisAlignment.spaceBetween,
-                                children: List.generate(
-                                    6, (i) => _buildOtpBox(i, boxSize)),
+                            // FIX: OTP boxes are now disabled (not editable)
+                            // while verification is in flight, since the
+                            // full-screen takeover that used to make this
+                            // moot is gone — without this, a user could keep
+                            // editing digits while a sign-in request for the
+                            // previous code was still in the air.
+                            AbsorbPointer(
+                              absorbing: _isVerifying,
+                              child: AutofillGroup(
+                                child: Row(
+                                  mainAxisAlignment:
+                                  MainAxisAlignment.spaceBetween,
+                                  children: List.generate(
+                                      6, (i) => _buildOtpBox(i, boxSize)),
+                                ),
                               ),
                             ),
 

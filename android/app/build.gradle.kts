@@ -15,7 +15,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.credbro"
+    namespace = "com.amoebaofficial.app"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = "27.0.12077973"
 
@@ -33,7 +33,7 @@ android {
         // FIX: was "com.example.credbro" — Flutter's default template value.
         // Must match the package name registered in your Firebase project
         // and, eventually, your Play Store listing exactly.
-        applicationId = "com.example.credbro"
+        applicationId = "com.amoebaofficial.app"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

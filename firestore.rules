@@ -156,6 +156,11 @@ service cloud.firestore {
           && request.resource.data.get('role', 'user') == resource.data.get('role', 'user')
           && request.resource.data.get('banned', false) == resource.data.get('banned', false)
           && request.resource.data.get('hasPaid', false) == resource.data.get('hasPaid', false)
+          // hasLifetimeListingAccess follows the exact same pattern as
+          // hasPaid above: only verifyListingPayment's server-side HMAC
+          // check (functions/index.js) may flip this to true.
+          && request.resource.data.get('hasLifetimeListingAccess', false)
+             == resource.data.get('hasLifetimeListingAccess', false)
         );
 
       allow delete: if isAdmin();
@@ -171,7 +176,11 @@ service cloud.firestore {
 
       allow create: if isSignedIn()
         && !isBanned()
-        && request.resource.data.userId == request.auth.uid;
+        && request.resource.data.userId == request.auth.uid
+        // A missing/zero/negative price broke home-page sorting the same
+        // way a missing lat/lng did — require a real positive number.
+        && request.resource.data.price is number
+        && request.resource.data.price > 0;
 
       // FIX: banned users could previously still edit/delete their own
       // existing listings even though blocked from creating new ones.
@@ -179,6 +188,16 @@ service cloud.firestore {
       // moderate/remove listings regardless of the owner's ban status).
       allow update, delete: if isAdmin()
         || (isSignedIn() && !isBanned() && resource.data.userId == request.auth.uid);
+    }
+
+    // ---------------- listingPayments (listing-fee payment log) ----------------
+    // Mirrors the `payments` collection's rules below: written only by
+    // verifyListingPayment via the Admin SDK (which bypasses these rules
+    // entirely), never directly by a client. Owners and admins may read
+    // their own records for support lookups.
+    match /listingPayments/{paymentId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow write: if false;
     }
 
     // ---------------- chats ----------------

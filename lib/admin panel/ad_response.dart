@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter_svg/svg.dart';
 import 'package:intl/intl.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -693,27 +692,51 @@ class _AdResponsesPageState extends State<AdResponsesPage>
   Widget _emptyView(double sw) => Center(
     child: Padding(
       padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: SvgPicture.asset(
+      child: Image.network(
         _emptyImageAsset(),
         width: _cl(sw * 0.7, 200.0, 320.0),
         fit: BoxFit.contain,
+        loadingBuilder: (context, child, progress) {
+          if (progress == null) return child;
+          return SizedBox(
+            width: _cl(sw * 0.7, 200.0, 320.0),
+            height: _cl(sw * 0.7, 200.0, 320.0),
+            child: const Center(
+              child: CircularProgressIndicator(
+                color: _purple,
+                strokeWidth: 1.5,
+              ),
+            ),
+          );
+        },
+        errorBuilder: (context, error, stackTrace) => SizedBox(
+          width: _cl(sw * 0.7, 200.0, 320.0),
+          height: _cl(sw * 0.5, 140.0, 220.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.inbox_outlined, size: 40, color: Colors.grey.shade300),
+              const SizedBox(height: 8),
+              Text('Nothing here yet',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade400)),
+            ],
+          ),
+        ),
       ),
     ),
   );
 
-// ── Picks the right empty-state illustration ────────────────────────────
+  // ── Picks the right empty-state illustration URL ─────────────────────────
   String _emptyImageAsset() {
     switch (_selectedStatus) {
       case 'approved':
-        return 'assets/images/empty_approved.svg';
+        return 'https://i.ibb.co/5gv47dS3/empty-approved.png';
       case 'rejected':
-        return 'assets/images/empty_rejected.svg';
+        return 'https://i.ibb.co/d4rLGcmY/empty-rejected.png';
       case 'pending':
-        return 'assets/images/empty_pending.svg';
+        return 'https://i.ibb.co/CKR81d07/empty-pending.png';
       default:
-        return widget.isAdmin
-            ? 'assets/images/empty_no_ads.svg'
-            : 'assets/images/empty_no_ads.svg';
+        return 'https://i.ibb.co/pvkG2Ygw/empty-no-ads.png';
     }
   }
 

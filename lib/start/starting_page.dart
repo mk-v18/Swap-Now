@@ -1,7 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 import '../logs/wrapper.dart';
 import '../pages/bottom_navigation.dart';
 
@@ -150,7 +149,7 @@ class _StartingPageState extends State<StartingPage>
                   SizedBox(height: size.height * 0.2),
 
                   // ── Illustration ────────────────────────────────────────
-                  SvgPicture.asset(
+                  Image.asset(
                     'assets/images/boxes.svg',
                     width: imageWidth,
                     fit: BoxFit.contain,

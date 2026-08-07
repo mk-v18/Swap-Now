@@ -7,6 +7,25 @@
   "client": [
     {
       "client_info": {
+        "mobilesdk_app_id": "1:404379512829:android:7741ca94a665370016f394",
+        "android_client_info": {
+          "package_name": "com.amoebaofficial.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCJjhZRoObbLakiSyWt8HPXwlJJh86wTI4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
         "mobilesdk_app_id": "1:404379512829:android:63374ce93fb7b9b216f394",
         "android_client_info": {
           "package_name": "com.example.credbro"

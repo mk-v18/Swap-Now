@@ -1,3 +1,5 @@
+// ignore_for_file: unawaited_futures
+import 'dart:async';
 import 'package:amoeba/logs/banned_page.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -60,13 +62,18 @@ class Wrapper extends StatelessWidget {
 
       final cachedUid = prefs.getString('cached_uid');
       if (cachedUid != null && cachedUid != user.uid) {
-        // FIX(perf): three independent key removals — run them concurrently
-        // instead of three sequential awaits.
-        await Future.wait([
+        // FIX(perf): this used to be `await Future.wait([...])`, which
+        // blocked returning the routed widget on three SharedPreferences
+        // writes that only matter for the NEXT app launch, not this one —
+        // nothing below depends on the removal having finished. Firing it
+        // without awaiting shaves that round trip off every account-switch
+        // case without changing behavior (the removal still happens, just
+        // concurrently with the rest of routing instead of gating it).
+        unawaited(Future.wait([
           prefs.remove('role'),
           prefs.remove('cached_uid'),
           prefs.remove('onboarding_step'),
-        ]);
+        ]));
       }
 
       // NOTE: we intentionally do NOT short-circuit on a cached role here
@@ -96,12 +103,15 @@ class Wrapper extends StatelessWidget {
 
       // Admins skip the consumer onboarding flow entirely.
       if (role == 'admin') {
-        // FIX(perf): three independent writes — fire together, await once.
-        await Future.wait([
+        // FIX(perf): fire-and-forget — same reasoning as above. These
+        // three writes only exist to warm the cache for the NEXT launch;
+        // the routing decision for THIS launch (AdminBottomNavigation)
+        // doesn't need to wait on them landing on disk first.
+        unawaited(Future.wait([
           prefs.setString('role', role),
           prefs.setString('cached_uid', user.uid),
           prefs.setString('onboarding_step', 'done'),
-        ]);
+        ]));
         return const AdminBottomNavigation();
       }
 
@@ -116,12 +126,12 @@ class Wrapper extends StatelessWidget {
       if (!profileComplete) return const PersonalDetailsPage();
       if (step != 'done') return const StartingPage();
 
-      // FIX(perf): same three-writes-in-parallel treatment here.
-      await Future.wait([
+      // FIX(perf): same fire-and-forget treatment here.
+      unawaited(Future.wait([
         prefs.setString('role', role),
         prefs.setString('cached_uid', user.uid),
         prefs.setString('onboarding_step', 'done'),
-      ]);
+      ]));
       return BannedGate(uid: user.uid, child: const BottomNavigation());
     } catch (e) {
       debugPrint("Wrapper error: $e");
@@ -159,7 +169,10 @@ class Wrapper extends StatelessWidget {
       stream: FirebaseAuth.instance.authStateChanges(),
       builder: (context, authSnapshot) {
         if (authSnapshot.connectionState == ConnectionState.waiting) {
-          return const _LoadingScreen();
+          // INSTANT: no spinner while waiting for the very first auth
+          // event — just show a blank white frame so there's no visible
+          // "wait" state flashing before we know if there's a user.
+          return const _InstantScreen();
         }
         if (!authSnapshot.hasData) {
           _clearCache();
@@ -218,7 +231,10 @@ class _WrapperBodyState extends State<_WrapperBody> {
       future: _future,
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
-          return const _LoadingScreen();
+          // INSTANT: routing decision resolves in the background with no
+          // circular spinner shown — just a blank white frame so the
+          // transition to the resolved screen feels immediate.
+          return const _InstantScreen();
         }
         if (snapshot.hasError) {
           return _ErrorScreen(onRetry: _retry);
@@ -229,16 +245,18 @@ class _WrapperBodyState extends State<_WrapperBody> {
   }
 }
 
-class _LoadingScreen extends StatelessWidget {
-  const _LoadingScreen();
+/// Replaces the old CircularProgressIndicator loading screen. Routing
+/// still resolves asynchronously under the hood, but the user never sees
+/// a spinner — just a blank white frame — so the eventual screen appears
+/// to load instantly instead of showing a visible "wait" state.
+class _InstantScreen extends StatelessWidget {
+  const _InstantScreen();
 
   @override
   Widget build(BuildContext context) {
     return const Scaffold(
       backgroundColor: Colors.white,
-      body: Center(
-        child: CircularProgressIndicator(color: Color(0xFF5800B3)),
-      ),
+      body: SizedBox.shrink(),
     );
   }
 }

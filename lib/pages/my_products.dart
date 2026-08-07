@@ -260,23 +260,46 @@ class MyProductsPage extends StatelessWidget {
           final products = snapshot.data!.docs;
 
           if (products.isEmpty) {
+            final iconSize = isSmall ? 52.0 : 64.0;
+            const accent = Color(0xFF4A148C);
+
             return Center(
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 32),
+                padding: const EdgeInsets.symmetric(horizontal: 36),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Icon(Icons.inventory_2_outlined,
-                        size: isSmall ? 52 : 64,
-                        color: Colors.grey.shade300),
-                    const SizedBox(height: 16),
+                    Container(
+                      width: iconSize + 40,
+                      height: iconSize + 40,
+                      decoration: BoxDecoration(
+                        color: accent.withOpacity(0.08),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        Icons.inventory_2_outlined,
+                        size: iconSize * 0.5,
+                        color: accent.withOpacity(0.6),
+                      ),
+                    ),
+                    SizedBox(height: isSmall ? 16 : 20),
                     Text(
                       'No products uploaded yet',
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        color: Colors.grey.shade400,
-                        fontSize: isSmall ? 14 : 15,
-                        fontWeight: FontWeight.w500,
+                        color: Colors.grey.shade800,
+                        fontSize: isSmall ? 15 : 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'List an item to start swapping with others',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.grey.shade500,
+                        fontSize: isSmall ? 12 : 13,
+                        height: 1.4,
                       ),
                     ),
                   ],

@@ -116,6 +116,8 @@ class _EditProductPageState extends State<EditProductPage> {
   String? _category;
   String? _condition;
   String  _location = '';
+  // Display-only — never edited on this page. See initState for why.
+  double? _price;
 
   // FIX(gap): same gap as the listing page — GPS coordinates were fetched
   // and then discarded, so edited products never got lat/lng persisted and
@@ -151,6 +153,10 @@ class _EditProductPageState extends State<EditProductPage> {
     super.initState();
     _titleController       = TextEditingController(text: (widget.data['title'] as String?) ?? '');
     _descriptionController = TextEditingController(text: (widget.data['description'] as String?) ?? '');
+    // Price is fixed at publish time (it's what the listing fee was
+    // calculated from) — shown here for reference only, never editable.
+    final savedPrice = widget.data['price'];
+    _price = savedPrice is num ? savedPrice.toDouble() : null;
     _location              = (widget.data['location'] as String?) ?? '';
     _locationController    = TextEditingController(text: _location);
 
@@ -674,6 +680,15 @@ class _EditProductPageState extends State<EditProductPage> {
                           hintText: "Condition, features, reason for swapping…",
                           prefixIcon: Icons.notes_rounded,
                           alignLabelWithHint: true,
+                        ),
+                        SizedBox(height: rl.sectionGap),
+                        _FieldLabel(text: "Price (₹)", rl: rl),
+                        _ReadOnlyField(
+                          rl: rl,
+                          text: _price != null
+                              ? "₹${_price!.toStringAsFixed(_price! % 1 == 0 ? 0 : 2)}"
+                              : "Not set",
+                          prefixIcon: Icons.currency_rupee_rounded,
                         ),
                       ],
                     ),
@@ -1280,6 +1295,45 @@ class _DropdownField extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 4),
+      ]),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  READ-ONLY FIELD (price)
+// ══════════════════════════════════════════════════════════════════════════════
+/// Looks like a form field but is display-only — no controller, no
+/// TextField, so there's nothing for the user to tap into or type in.
+class _ReadOnlyField extends StatelessWidget {
+  final _RL      rl;
+  final String   text;
+  final IconData? prefixIcon;
+  const _ReadOnlyField({required this.rl, required this.text, this.prefixIcon});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFFF7F5FB), // slightly greyed vs. the white editable fields
+        border: Border.all(color: _kBorder, width: 1.3),
+        borderRadius: BorderRadius.circular(rl.fieldRadius),
+      ),
+      padding: EdgeInsets.symmetric(
+          horizontal: rl.fieldContentPadding.horizontal,
+          vertical: rl.fieldContentPadding.vertical),
+      child: Row(children: [
+        if (prefixIcon != null) ...[
+          Icon(prefixIcon, color: _kSubtext, size: 17),
+          const SizedBox(width: 8),
+        ],
+        Expanded(
+          child: Text(text,
+              style: TextStyle(
+                  fontSize: rl.fieldFontSize, color: _kLabel.withOpacity(0.75),
+                  fontWeight: FontWeight.w600)),
+        ),
+        Icon(Icons.lock_outline_rounded, color: _kSubtext.withOpacity(0.7), size: 15),
       ]),
     );
   }

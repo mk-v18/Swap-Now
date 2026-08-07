@@ -1,4 +1,4 @@
-package com.example.credbro
+package com.amoebaofficial.app
 
 import io.flutter.embedding.android.FlutterActivity
 

@@ -43,11 +43,21 @@ class _R {
 class PaymentSuccessPage extends StatefulWidget {
   final String paymentId;
   final String time;
+  // Optional — lets other payment flows (e.g. the product-listing fee)
+  // reuse this same screen with their own copy instead of the
+  // registration-flow default below.
+  final String? subtitle;
+  // Optional — when provided, Continue calls this instead of navigating to
+  // StartingPage. The callback owns what happens next (e.g. finish
+  // publishing a listing, then pop back to where the flow started).
+  final Future<void> Function()? onContinue;
 
   const PaymentSuccessPage({
     super.key,
     required this.paymentId,
     required this.time,
+    this.subtitle,
+    this.onContinue,
   });
 
   @override
@@ -323,7 +333,8 @@ class _PaymentSuccessPageState extends State<PaymentSuccessPage>
                           ),
                           SizedBox(height: r.hf(0.008, min: 4, max: 10)),
                           Text(
-                            "Your account has been activated successfully.",
+                            widget.subtitle ??
+                                "Your account has been activated successfully.",
                             textAlign: TextAlign.center,
                             style: TextStyle(
                               fontSize: r.bodySz - 0.5,
@@ -452,6 +463,13 @@ class _PaymentSuccessPageState extends State<PaymentSuccessPage>
 
   Future<void> _onContinue() async {
     setState(() => _isLoading = true);
+    if (widget.onContinue != null) {
+      // The caller owns what "continue" means here (e.g. finish publishing
+      // a listing, then pop back) — including its own navigation. Nothing
+      // further to do on this page once it returns.
+      await widget.onContinue!.call();
+      return;
+    }
     // pushReplacement instead of push: a user landing back on "Payment
     // Successful" via the back button after they've already continued
     // is confusing and lets them re-trigger downstream onboarding logic.

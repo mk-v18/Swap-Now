@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:amoeba/pages/wishlistpage.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -102,6 +103,15 @@ class _HomePageState extends State<HomePage> {
   bool _isProcessingItems = false;
   List<QueryDocumentSnapshot>? _lastDocs;
   String _lastDocsFingerprint = '';
+
+  // Fingerprint of the docs that _processItems has actually FINISHED
+  // processing (stamped inside the setState at the end of _processItems).
+  // Comparing this against `_lastDocsFingerprint` (which is set the
+  // instant new docs are SEEN, synchronously during build) gives a
+  // reliable "processing is still pending" signal that doesn't depend on
+  // `_isProcessingItems` having flipped true yet — see the big comment in
+  // `_buildProductStream` for why that distinction matters.
+  String _processedFingerprint = '';
 
   // Count of listings that are neither the current user's own nor
   // 'exchanged' — computed BEFORE the search/category filters are
@@ -370,6 +380,11 @@ class _HomePageState extends State<HomePage> {
     if (_isProcessingItems) return;
     _isProcessingItems = true;
 
+    // Captured up front so the setState below can stamp exactly which
+    // "version" of the doc list this run finished processing — see
+    // `_processedFingerprint`.
+    final fp = _fingerprint(docs);
+
     final currentUser = FirebaseAuth.instance.currentUser;
     final query = _searchQuery;
     // Set instead of List: filter membership checks below go from O(n) to
@@ -484,6 +499,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _processedItems = candidates;
         _availableCount = availableCount;
+        _processedFingerprint = fp;
         if (_visibleCount < _pageSize) _visibleCount = _pageSize;
       });
     }
@@ -603,11 +619,9 @@ class _HomePageState extends State<HomePage> {
       width: double.infinity,
       color: Colors.white,
       child: Image.asset(
-        'assets/images/trust_banner.webp',
+        'assets/images/trust_banner.png',
         width: double.infinity,
         fit: BoxFit.fitWidth,
-        errorBuilder: (context, error, stackTrace) =>
-        const SizedBox.shrink(),
       ),
     );
   }
@@ -719,13 +733,11 @@ class _HomePageState extends State<HomePage> {
             Positioned(
               right: isTablet ? 0 : 12,
               top: isTablet ? 48 : 54,
-              child: SvgPicture.asset(
-                'assets/images/items.svg',
+              child: Image.asset(
+                'assets/images/items.png',
                 width: isTablet ? 160 : 120,
                 height: isTablet ? 160 : 120,
                 fit: BoxFit.contain,
-                errorBuilder: (context, error, stackTrace) =>
-                const SizedBox.shrink(),
               ),
             ),
 
@@ -759,32 +771,35 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-      clipBehavior: Clip.antiAlias,
-      child: profileImageUrl.isNotEmpty
-          ? Image.network(
-        profileImageUrl,
-        fit: BoxFit.cover,
-        cacheWidth: (size * 2).toInt(),
-        loadingBuilder: (context, child, progress) {
-          if (progress == null) return child;
-          return const Center(
-            child: SizedBox(
-              width: 14,
-              height: 14,
-              child: CircularProgressIndicator(strokeWidth: 2),
+      child: ClipOval(
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: profileImageUrl.isNotEmpty
+              ? CachedNetworkImage(
+            imageUrl: profileImageUrl,
+            fit: BoxFit.cover,
+            memCacheWidth: (size * 2).toInt(),
+            fadeInDuration: const Duration(milliseconds: 150),
+            placeholder: (context, url) => const Center(
+              child: SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
             ),
-          );
-        },
-        errorBuilder: (context, error, stackTrace) => Icon(
-          Icons.person,
-          size: size * 0.6,
-          color: _kPrimaryDark,
+            errorWidget: (context, url, error) => Icon(
+              Icons.person,
+              size: size * 0.6,
+              color: _kPrimaryDark,
+            ),
+          )
+              : Icon(
+            Icons.person,
+            size: size * 0.6,
+            color: _kPrimaryDark,
+          ),
         ),
-      )
-          : Icon(
-        Icons.person,
-        size: size * 0.6,
-        color: _kPrimaryDark,
       ),
     );
   }
@@ -1165,7 +1180,7 @@ class _HomePageState extends State<HomePage> {
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
-              asset: 'assets/images/error_state.svg',
+              assetPath: 'assets/images/error_state.png',
               fallbackIcon: Icons.error_outline,
             ),
           );
@@ -1173,14 +1188,11 @@ class _HomePageState extends State<HomePage> {
 
         if (snapshot.connectionState == ConnectionState.waiting &&
             _processedItems.isEmpty) {
-          return const SliverToBoxAdapter(
-            child: Center(
-              child: Padding(
-                padding: EdgeInsets.all(40),
-                child: CircularProgressIndicator(color: _kPrimaryDark),
-              ),
-            ),
-          );
+          // Skeleton grid instead of a spinner: the layout the real grid
+          // will occupy is already on screen (same columns, same card
+          // shape), just with shimmering placeholders instead of content.
+          // Reads as "loading in" rather than "nothing has happened yet".
+          return _buildSkeletonSliver(context);
         }
 
         if (snapshot.hasData && snapshot.data!.docs.isNotEmpty) {
@@ -1199,21 +1211,33 @@ class _HomePageState extends State<HomePage> {
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
-              asset: 'assets/images/no_items.svg',
+              assetPath: 'assets/images/no_items.png',
               fallbackIcon: Icons.inventory_2_outlined,
             ),
           );
         }
 
-        if (_isProcessingItems && _processedItems.isEmpty) {
-          return const SliverToBoxAdapter(
-            child: Center(
-              child: Padding(
-                padding: EdgeInsets.all(40),
-                child: CircularProgressIndicator(color: _kPrimaryDark),
-              ),
-            ),
-          );
+        // FIX (flash): the old check here was just
+        // `if (_isProcessingItems && _processedItems.isEmpty)`.
+        // `_isProcessingItems` is a plain field, not wired through
+        // setState — it only becomes true once `_processItems` actually
+        // starts running, which happens a frame LATER via the
+        // postFrameCallback above. So on the very frame fresh docs first
+        // arrived, `_isProcessingItems` was still false and
+        // `_processedItems` was still empty, which fell straight through
+        // to the "no items" placeholder below for one frame before
+        // flipping back to a spinner and then finally the real grid:
+        // spinner -> "no products" flash -> spinner -> grid.
+        //
+        // Comparing fingerprints closes that gap: `_lastDocsFingerprint`
+        // is stamped synchronously the instant new docs are seen (right
+        // above), while `_processedFingerprint` is only stamped once
+        // `_processItems` finishes. So `docsPending` is true for the
+        // entire window between "docs arrived" and "processing done",
+        // with no frame in between where the placeholder can sneak in.
+        final docsPending = _lastDocsFingerprint != _processedFingerprint;
+        if ((docsPending || _isProcessingItems) && _processedItems.isEmpty) {
+          return _buildSkeletonSliver(context);
         }
 
         if (_processedItems.isEmpty) {
@@ -1233,7 +1257,7 @@ class _HomePageState extends State<HomePage> {
             return SliverToBoxAdapter(
               child: _buildStatePlaceholder(
                 context,
-                asset: 'assets/images/no_items.svg',
+                assetPath: 'assets/images/no_items.png',
                 fallbackIcon: Icons.inventory_2_outlined,
               ),
             );
@@ -1241,9 +1265,9 @@ class _HomePageState extends State<HomePage> {
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
-              asset: _searchQuery.isNotEmpty
-                  ? 'assets/images/no_search_results.svg'
-                  : 'assets/images/no_nearby_items.svg',
+              assetPath: _searchQuery.isNotEmpty
+                  ? 'assets/images/no_search_results.png'
+                  : 'assets/images/no_nearby_items.png',
               fallbackIcon: _searchQuery.isNotEmpty
                   ? Icons.search_off
                   : Icons.location_off_outlined,
@@ -1271,7 +1295,7 @@ class _HomePageState extends State<HomePage> {
           return SliverToBoxAdapter(
             child: _buildStatePlaceholder(
               context,
-              asset: 'assets/images/no_nearby_items.svg',
+              assetPath: 'assets/images/no_nearby_items.png',
               fallbackIcon: Icons.location_off_outlined,
             ),
           );
@@ -1335,25 +1359,17 @@ class _HomePageState extends State<HomePage> {
   /// in `_buildHeader`) so these actually render as vector graphics.
   Widget _buildStatePlaceholder(
       BuildContext context, {
-        required String asset,
+        required String assetPath,
         required IconData fallbackIcon,
       }) {
     return Padding(
       padding: const EdgeInsets.all(40),
       child: Center(
-        child: SvgPicture.asset(
-          asset,
+        child: Image.asset(
+          assetPath,
           width: 200,
           height: 200,
           fit: BoxFit.contain,
-          // Shown briefly while the SVG is being parsed/decoded.
-          placeholderBuilder: (context) => Icon(
-            fallbackIcon,
-            size: 80,
-            color: Colors.grey[400],
-          ),
-          // Shown only if the asset genuinely fails to load (missing file,
-          // malformed SVG, etc.) — same fallback as before.
           errorBuilder: (context, error, stackTrace) => Icon(
             fallbackIcon,
             size: 80,
@@ -1396,6 +1412,39 @@ class _HomePageState extends State<HomePage> {
             );
           },
           childCount: items.length,
+          addAutomaticKeepAlives: false,
+          addRepaintBoundaries: true,
+          addSemanticIndexes: false,
+        ),
+      ),
+    );
+  }
+
+  // ─── Skeleton grid (shown instead of a spinner while loading) ─────────────
+
+  /// Same column count, spacing, and card aspect ratio as `_buildGridSliver`
+  /// — so when real data swaps in, nothing shifts or resizes, it just
+  /// looks like the placeholders "become" the real cards.
+  Widget _buildSkeletonSliver(BuildContext context) {
+    final cols = _BP.gridCols(context);
+    final hPad = _BP.isTablet(context) ? 16.0 : 12.0;
+    final spacing = _BP.isTablet(context) ? 14.0 : 12.0;
+    // Enough tiles to fill a typical first screen without overbuilding —
+    // two rows' worth per column count.
+    final count = cols * 3;
+
+    return SliverPadding(
+      padding: EdgeInsets.symmetric(horizontal: hPad),
+      sliver: SliverGrid(
+        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: cols,
+          mainAxisSpacing: spacing,
+          crossAxisSpacing: spacing,
+          childAspectRatio: _BP.cardAspectRatio(context),
+        ),
+        delegate: SliverChildBuilderDelegate(
+              (context, index) => const _SkeletonProductCard(),
+          childCount: count,
           addAutomaticKeepAlives: false,
           addRepaintBoundaries: true,
           addSemanticIndexes: false,
@@ -1740,6 +1789,91 @@ class _LocationEditSheetState extends State<_LocationEditSheet> {
           );
         },
       ),
+    );
+  }
+}
+
+// ─── Skeleton widgets ────────────────────────────────────────────────────
+// Shimmering grey placeholders shown in place of a spinner while the
+// product grid is still loading — see _buildSkeletonSliver above.
+
+/// A single shimmering block. Owns its own AnimationController rather than
+/// sharing one across the grid — cards are cheap enough that this is
+/// simpler than threading a shared controller down, and it matches how
+/// `_ProductCard` is already built (self-contained, no external ticker).
+class _ShimmerBox extends StatefulWidget {
+  final double? width;
+  final double height;
+  final BorderRadius borderRadius;
+
+  const _ShimmerBox({
+    this.width,
+    required this.height,
+    this.borderRadius = const BorderRadius.all(Radius.circular(8)),
+  });
+
+  @override
+  State<_ShimmerBox> createState() => _ShimmerBoxState();
+}
+
+class _ShimmerBoxState extends State<_ShimmerBox>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        return Container(
+          width: widget.width,
+          height: widget.height,
+          decoration: BoxDecoration(
+            borderRadius: widget.borderRadius,
+            color: Color.lerp(
+              Colors.grey.shade200,
+              Colors.grey.shade100,
+              _controller.value,
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Placeholder card matching `UserProductListing`'s rough shape (image
+/// block + title line + price line) so the skeleton grid reads as "product
+/// cards loading" rather than generic grey boxes.
+class _SkeletonProductCard extends StatelessWidget {
+  const _SkeletonProductCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: _ShimmerBox(
+            width: double.infinity,
+            height: double.infinity,
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+        const SizedBox(height: 8),
+        const _ShimmerBox(width: double.infinity, height: 13),
+        const SizedBox(height: 6),
+        const _ShimmerBox(width: 70, height: 12),
+      ],
     );
   }
 }
