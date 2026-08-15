@@ -16,10 +16,10 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the refurbished_product and file versions while build-number is used as the build suffix.
-version: 1.0.0+1
+version: 1.0.0+7
 
 environment:
-  sdk: ^3.8.1
+  sdk: ">=3.8.0 <4.0.0"
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -57,17 +57,14 @@ dependencies:
   firebase_messaging: ^15.2.10
   path: ^1.9.1
   googleapis_auth: ^2.0.0
-  google_fonts: ^6.3.2
   cached_network_image: ^3.4.1
   flutter_local_notifications: ^19.5.0
   uuid: ^4.5.1
-  video_player: ^2.10.1
   shared_preferences: ^2.5.4
   flutter_svg: ^2.2.4
   record: ^6.2.0
   encrypt: ^5.0.3
   flutter_secure_storage: ^10.0.0
-  chewie: ^1.13.1
   flutter_map: ^8.3.0
   latlong2: ^0.9.1
   media_kit: ^1.1.11
@@ -132,14 +129,14 @@ flutter:
   fonts:
     - family: Poppins
       fonts:
-        - asset: fonts/Poppins-Bold.ttf
-          weight: 700
+        - asset: fonts/Poppins-Regular.ttf
+          weight: 400
         - asset: fonts/Poppins-Medium.ttf
           weight: 500
-        - asset: fonts/Poppins-Regular.ttf
-          weight: 600
         - asset: fonts/Poppins-SemiBold.ttf
-          weight: 400
+          weight: 600
+        - asset: fonts/Poppins-Bold.ttf
+          weight: 700
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package

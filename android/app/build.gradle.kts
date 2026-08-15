@@ -3,13 +3,14 @@ import java.io.FileInputStream
 
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
+
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
 
 plugins {
     id("com.android.application")
-    id("kotlin-android")
+    id("org.jetbrains.kotlin.android")
     id("dev.flutter.flutter-gradle-plugin")
     id("com.google.gms.google-services")
 }
@@ -30,34 +31,36 @@ android {
     }
 
     defaultConfig {
-        // FIX: was "com.example.credbro" — Flutter's default template value.
-        // Must match the package name registered in your Firebase project
-        // and, eventually, your Play Store listing exactly.
         applicationId = "com.amoebaofficial.app"
-        minSdk = flutter.minSdkVersion
+        minSdk = 24
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         multiDexEnabled = true
+
+        // Reduce app size by excluding emulator ABI
+        ndk {
+            abiFilters += setOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     signingConfigs {
         create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String?
-            keyPassword = keystoreProperties["keyPassword"] as String?
-            storeFile = keystoreProperties["storeFile"]?.let { file(it as String) }
-            storePassword = keystoreProperties["storePassword"] as String?
+            keyAlias = keystoreProperties["keyAlias"] as String
+            keyPassword = keystoreProperties["keyPassword"] as String
+            storeFile = file(keystoreProperties["storeFile"] as String)
+            storePassword = keystoreProperties["storePassword"] as String
         }
     }
 
     buildTypes {
-        getByName("release") {
-            // FIX: was signingConfigs.getByName("debug") — release builds
-            // were being signed with the shared Flutter debug key, which
-            // Play Store will reject and which offers no real protection.
+        release {
             signingConfig = signingConfigs.getByName("release")
+
+            // App size optimization
             isMinifyEnabled = true
             isShrinkResources = true
+
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -72,11 +75,13 @@ flutter {
 
 dependencies {
     implementation(platform("com.google.firebase:firebase-bom:33.16.0"))
+
     implementation("com.google.firebase:firebase-auth")
     implementation("com.google.firebase:firebase-appcheck-playintegrity")
-    implementation ("com.google.android.gms:play-services-auth:20.7.0")
-    implementation ("com.google.android.gms:play-services-auth-api-phone:18.0.2")
 
-    // ✅ Add this for desugaring support
+    implementation("com.google.android.gms:play-services-auth:20.7.0")
+    implementation("com.google.android.gms:play-services-auth-api-phone:18.0.2")
+
+    // Java 8+ APIs support
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }

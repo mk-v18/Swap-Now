@@ -6,10 +6,10 @@ import 'package:amoeba/start/privacy_policy.dart';
 import 'package:amoeba/start/terms_of_use.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'; // DEBUG: needed for debugPrint
 import 'package:flutter/services.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_svg/flutter_svg.dart';
-import 'package:otp_autofill/otp_autofill.dart'; // NEW — SMS User Consent API autofill
 import '../start/personal_details.dart';
 import 'package:flutter/gestures.dart';
 
@@ -28,30 +28,39 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   static const _purpleShadow    = Color(0x4D5800B3); // ~30% opacity
   static const _purpleBoxShadow = Color(0x0F5800B3); // ~6%  opacity
 
+  // DEBUG(internal-testing): when true, the app prints the raw
+  // FirebaseAuthException (code + message) to the console via debugPrint
+  // AND shows that raw text in the error snackbar instead of the friendly
+  // copy from `_friendlyError`. Flip this back to `false` before shipping
+  // — that's the only change needed to restore user-facing friendly
+  // messages; `_friendlyError` itself is untouched below.
+  static const bool _debugShowExactErrors = true;
+
   // FIX(perf): compiled once instead of on every call to _sendOtp /
   // _fillBoxesVisually (each of which can fire multiple times per OTP flow).
   static final RegExp _nonDigits = RegExp(r'\D');
 
-  // NEW — compiled once. Used to pull a 6-digit code out of the raw SMS
-  // body handed to us by the SMS User Consent API below.
-  static final RegExp _sixDigitCode = RegExp(r'\d{6}');
-
   // ── Firebase ──────────────────────────────────────────────────────────────
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
-  // NEW — Drives Android's SMS User Consent API. Unlike the SMS Retriever
-  // API (which is what the `AutofillHints.oneTimeCode` fields below quietly
-  // rely on via the OS Autofill framework), this does NOT require the app's
-  // signing certificate hash to be registered anywhere. That makes it the
-  // reliable path: if the app's release SHA-256 fingerprint isn't (yet)
-  // registered in the Firebase console — a very common gap right after
-  // switching to a new release keystore — the Retriever-based paths silently
-  // never fire, and the user is left typing the OTP by hand and sitting
-  // through 30s resend cooldowns (this is what the screen recording showed).
-  // With this listener running, the moment the OTP SMS arrives Android shows
-  // a one-tap "Allow SwapNow to read this message?" sheet, and tapping it
-  // fills all 6 boxes and auto-verifies immediately.
-  final OTPInteractor _otpInteractor = OTPInteractor();
+  // REMOVED — the otp_autofill `OTPInteractor` / SMS User Consent listener
+  // was removed on purpose. It registers its own broadcast receiver for the
+  // Android `SMS_RETRIEVED` action. FirebaseAuth.verifyPhoneNumber() *also*
+  // auto-registers its own receiver for that exact same broadcast action
+  // internally (that's what powers `verificationCompleted` below). Having
+  // both listeners alive at once means Firebase Auth's own closed-source
+  // receiver (`zzafy`) can receive the User-Consent-flavored broadcast (the
+  // one that fires after the "Allow app to read this message?" dialog) and
+  // crash with a NullPointerException, because it expects Retriever-API
+  // extras, not Consent-API extras. That crash killed the whole process,
+  // which is why the debugger showed "Lost connection to device."
+  //
+  // Now that the release SHA-256 fingerprint is registered in the Firebase
+  // console, Firebase's own built-in auto-retrieval (SMS Retriever API)
+  // works on its own — the SMS Firebase's backend sends already contains
+  // the app hash it needs. `verificationCompleted` below fires automatically
+  // once that SMS arrives, with `credential.smsCode` already populated —
+  // no permission dialog, no second receiver, no crash.
 
   // ── Controllers / nodes ───────────────────────────────────────────────────
   final TextEditingController _phoneController = TextEditingController();
@@ -139,11 +148,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   @override
   void dispose() {
-    // NEW — stop the SMS User Consent listener. Not strictly required
-    // (Android times it out after 5 minutes on its own) but avoids a
-    // dangling native receiver + a stray callback firing after this State
-    // is gone.
-    _otpInteractor.stopListenForCode();
     for (final c in _otpControllers) c.dispose(); // also removes listeners
     _phoneController.dispose();
     for (final f in _focusNodes)       f.dispose();
@@ -175,25 +179,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     }
   }
 
-  // NEW — Starts listening for the OTP SMS via Android's SMS User Consent
-  // API. This is the primary, reliable autofill path (see field doc comment
-  // above for why). Called once per OTP send (fresh listener per code, since
-  // a resend means a brand-new code is on its way).
-  void _listenForIncomingOtp() {
-    _otpInteractor.stopListenForCode();
-    _otpInteractor
-        .startListenUserConsent(null) // pass a sender phone number here if you have one to filter by
-        .then((code) {
-      if (!mounted) return;
-      final extracted = _sixDigitCode.firstMatch(code ?? '')?.group(0);
-      if (extracted != null && extracted.length == 6) {
-        _fillBoxesVisually(extracted);
-      }
-    }).catchError((e) {
-      debugPrint('[SwapNow] SMS User Consent listener ended: $e');
-    });
-  }
-
   // ── Error mapping ─────────────────────────────────────────────────────────
   String _friendlyError(String code) {
     switch (code) {
@@ -216,6 +201,22 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       default:
         return 'Something went wrong. Please try again.';
     }
+  }
+
+  // DEBUG(internal-testing): Central place that decides what a FirebaseAuth
+  // error shows as. Always logs the raw code+message via debugPrint (so it
+  // shows up in `flutter run` / `adb logcat` regardless of the flag), and
+  // returns either the raw text or the friendly copy depending on
+  // `_debugShowExactErrors`. To go back to friendly-only in production,
+  // set `_debugShowExactErrors = false` above — nothing else needs to change.
+  String _resolveAuthError(FirebaseAuthException e) {
+    debugPrint(
+        '[OTP][FirebaseAuthException] code=${e.code} message=${e.message} '
+            'plugin=${e.plugin}');
+    if (_debugShowExactErrors) {
+      return '[${e.code}] ${e.message ?? 'no message'}';
+    }
+    return _friendlyError(e.code);
   }
 
   // ── Snack helpers ─────────────────────────────────────────────────────────
@@ -263,7 +264,11 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         behavior:        SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
         margin:   const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        duration: const Duration(seconds: 3),
+        // DEBUG(internal-testing): exact-error messages can run long
+        // (code + full Firebase message), so give them more time on screen
+        // than the normal 3s. Purely cosmetic — safe to leave as-is even
+        // after flipping `_debugShowExactErrors` back to false.
+        duration: Duration(seconds: _debugShowExactErrors ? 6 : 3),
       ));
   }
 
@@ -345,6 +350,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       forceResendingToken: isResend ? _resendToken : null,
       timeout:             const Duration(seconds: 60),
 
+      // This fires automatically the moment Firebase's own SMS Retriever
+      // detects the incoming OTP SMS (now that the release SHA-256 is
+      // registered) — no dialog, no extra permission, no second receiver.
       verificationCompleted: (PhoneAuthCredential credential) async {
         if (!mounted) return;
 
@@ -373,7 +381,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       verificationFailed: (FirebaseAuthException e) {
         if (!mounted) return;
         setState(() => _isSendingOtp = false);
-        _showErrorSnack(_friendlyError(e.code));
+        // DEBUG(internal-testing): routed through _resolveAuthError so this
+        // shows the exact code/message during testing; see flag above.
+        _showErrorSnack(_resolveAuthError(e));
       },
 
       codeSent: (String verificationId, int? resendToken) {
@@ -386,12 +396,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         });
         _slideCtrl.forward();
         _startResendTimer();
-        // NEW — start the SMS User Consent listener the instant the code is
-        // actually sent, so it's already armed and waiting when the SMS
-        // arrives (rather than relying solely on the OS Autofill framework
-        // hints on the TextFields, which — as seen in testing — silently
-        // don't trigger on every device/OEM).
-        _listenForIncomingOtp();
         _showSuccessSnack('OTP sent to +91 $phone');
         Future.delayed(
           const Duration(milliseconds: 350),
@@ -471,15 +475,30 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       // (e.g. user was mid-typing when an auto-verify attempt failed, or
       // wants to resubmit) instead of it being silently blocked forever.
       _lastAttemptedCode = '';
-      if (mounted) _showErrorSnack(_friendlyError(e.code));
-    } on TimeoutException {
+      // DEBUG(internal-testing): routed through _resolveAuthError so this
+      // shows the exact code/message during testing; see flag above.
+      if (mounted) _showErrorSnack(_resolveAuthError(e));
+    } on TimeoutException catch (e) {
       _lastAttemptedCode = '';
+      // DEBUG(internal-testing): log the raw timeout too, so a hung
+      // verification is distinguishable from a slow-but-alive one in logs.
+      debugPrint('[OTP][TimeoutException] $e');
       if (mounted) {
-        _showErrorSnack('Request timed out. Please check your connection.');
+        _showErrorSnack(_debugShowExactErrors
+            ? 'Timeout: $e'
+            : 'Request timed out. Please check your connection.');
       }
-    } catch (_) {
+    } catch (e, st) {
       _lastAttemptedCode = '';
-      if (mounted) _showErrorSnack('Something went wrong. Please try again.');
+      // DEBUG(internal-testing): catch-all — logs type + stack so an
+      // unexpected exception shape (not FirebaseAuthException) is still
+      // visible during testing instead of collapsing into a generic snack.
+      debugPrint('[OTP][UnhandledException] $e\n$st');
+      if (mounted) {
+        _showErrorSnack(_debugShowExactErrors
+            ? 'Error: $e'
+            : 'Something went wrong. Please try again.');
+      }
     } finally {
       _verificationInFlight = false;
       if (mounted) setState(() => _isVerifying = false);
@@ -499,9 +518,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   void _goBackToPhone() {
     _resendTimer?.cancel();
     _resendCooldownNotifier.value = 0;
-    // NEW — user backed out of this OTP; stop waiting for a code that no
-    // longer matters so a late/stray SMS can't silently fill stale boxes.
-    _otpInteractor.stopListenForCode();
 
     _slideCtrl.reverse().then((_) {
       if (!mounted) return;
@@ -742,6 +758,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                                 controller:      _phoneController,
                                 keyboardType:    TextInputType.phone,
                                 textInputAction: TextInputAction.done,
+                                autofocus:       true,
                                 onSubmitted:     (_) =>
                                 _isSendingOtp ? null : _sendOtp(),
                                 inputFormatters: [
