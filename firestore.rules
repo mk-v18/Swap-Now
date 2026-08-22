@@ -168,6 +168,18 @@ service cloud.firestore {
       match /wishlist/{productId} {
         allow read, write: if isOwner(uid);
       }
+
+      // Notification inbox — written only by Cloud Functions (Admin SDK
+      // bypasses these rules) whenever a push notification is sent to this
+      // user; see _writeNotificationDoc in functions/index.js. The owner
+      // may read their own inbox, flip `read`, and delete individual
+      // notifications (or clear all), but can never author one directly.
+      match /notifications/{notificationId} {
+        allow read, delete: if isOwner(uid);
+        allow update: if isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+        allow create: if false;
+      }
     }
 
     // ---------------- UserProductList (marketplace listings) ----------------

@@ -12,24 +12,65 @@ import 'otp.dart';
 import '../pages/bottom_navigation.dart';
 import '../start/personal_details.dart';
 // REMOVED: import '../start/payment.dart';
-// Payment is no longer part of the onboarding routing chain — it'll be
+// Payment is no longer part of the onboarding routing chain -- it'll be
 // wired in separately elsewhere, so Wrapper doesn't need to know about it.
 
+/// FIX (white-screen after splash): caches the "which screen should this
+/// user land on" resolution (a SharedPreferences read + a Firestore
+/// `users/{uid}` read) so it can be *started early* -- SplashScreen kicks
+/// it off during its own animation -- and *reused* by [Wrapper] instead of
+/// being redone from scratch the instant Wrapper mounts.
+///
+/// Before this existed, Wrapper always started a brand-new resolution the
+/// moment it appeared on screen, so that network round trip only began
+/// AFTER the splash screen had already disappeared -- leaving the user
+/// looking at a second blank frame with nothing on it while it ran. Now,
+/// as long as the splash's ~4.5s on-screen time was enough for this to
+/// finish in the background, Wrapper picks up an already-completed
+/// result and skips the wait entirely.
+class RouteResolver {
+  RouteResolver._();
+  static final RouteResolver instance = RouteResolver._();
+
+  String? _cachedUid;
+  Future<Widget>? _cachedFuture;
+
+  /// Starts (or reuses the existing) resolution for [user]. Safe to call
+  /// more than once for the same uid -- e.g. once from SplashScreen to
+  /// warm the cache, then again from Wrapper -- it returns the same
+  /// in-flight or already-completed Future rather than hitting Firestore
+  /// a second time.
+  Future<Widget> resolve(User user) {
+    if (_cachedUid == user.uid && _cachedFuture != null) {
+      return _cachedFuture!;
+    }
+    _cachedUid = user.uid;
+    _cachedFuture = Wrapper.resolveDestination(user);
+    return _cachedFuture!;
+  }
+
+  /// Drops the cached resolution. Called on sign-out so a later sign-in
+  /// (possibly a different account) never reuses a stale result.
+  void clear() {
+    _cachedUid = null;
+    _cachedFuture = null;
+  }
+}
 
 class Wrapper extends StatelessWidget {
   const Wrapper({super.key});
 
-  /// Errors that genuinely mean "this session is no longer valid" — only
+  /// Errors that genuinely mean "this session is no longer valid" -- only
   /// these should force a sign-out. Everything else (permission-denied from
   /// Firestore rules, network hiccups, timeouts, etc.) must NOT sign the
-  /// user out — it should just show a retryable error screen. This matters
+  /// user out -- it should just show a retryable error screen. This matters
   /// a lot for banned users: if your Firestore rules deny reads based on a
   /// `banned` field, that throws a `permission-denied` FirebaseException,
-  /// which used to be caught here and treated as a reason to sign out —
+  /// which used to be caught here and treated as a reason to sign out --
   /// silently kicking banned users out of their own session (and breaking
   /// things like the in-app Help Center, which needs `currentUser` to stay
   /// non-null).
-  bool _isSessionInvalid(Object error) {
+  static bool _isSessionInvalid(Object error) {
     if (error is FirebaseAuthException) {
       const invalidCodes = {
         'user-disabled',
@@ -43,11 +84,16 @@ class Wrapper extends StatelessWidget {
     return false;
   }
 
-  Future<Widget> _checkUser(User user) async {
+  /// CHANGED: was the private instance method `_checkUser`. Made static
+  /// and public (renamed `resolveDestination`) so [RouteResolver] --
+  /// and therefore SplashScreen -- can call it directly to warm the cache
+  /// ahead of time, instead of it only being reachable once a Wrapper
+  /// instance exists on screen.
+  static Future<Widget> resolveDestination(User user) async {
     try {
       // FIX(perf): Kick off the SharedPreferences load and the Firestore
       // read at the same time instead of awaiting them one after another.
-      // They don't depend on each other — the old code paid for two full
+      // They don't depend on each other -- the old code paid for two full
       // sequential round trips (a platform-channel hop for prefs, then a
       // network hop for Firestore) on every single app start / auth event,
       // when it only needed to pay for whichever one is slower.
@@ -64,7 +110,7 @@ class Wrapper extends StatelessWidget {
       if (cachedUid != null && cachedUid != user.uid) {
         // FIX(perf): this used to be `await Future.wait([...])`, which
         // blocked returning the routed widget on three SharedPreferences
-        // writes that only matter for the NEXT app launch, not this one —
+        // writes that only matter for the NEXT app launch, not this one --
         // nothing below depends on the removal having finished. Firing it
         // without awaiting shaves that round trip off every account-switch
         // case without changing behavior (the removal still happens, just
@@ -80,7 +126,7 @@ class Wrapper extends StatelessWidget {
       // anymore. Role can be changed out-of-band (e.g. an admin flips a
       // user's `role` field directly in the Firestore console), and a
       // cached-role fast path would keep routing the user based on stale
-      // data until the cache was manually cleared — which is exactly the
+      // data until the cache was manually cleared -- which is exactly the
       // bug that caused a Firestore-promoted admin to keep landing on the
       // regular BottomNavigation instead of AdminBottomNavigation. Role
       // must always come from a fresh Firestore read.
@@ -89,7 +135,7 @@ class Wrapper extends StatelessWidget {
 
       final data = doc.data() ?? {};
       final role = data['role']?.toString().trim().toLowerCase() ?? 'user';
-      // REMOVED: `hasPaid` no longer gates onboarding — payment is being
+      // REMOVED: `hasPaid` no longer gates onboarding -- payment is being
       // moved to a separate place in the app, not the signup funnel.
       final name = data['name']?.toString().trim() ?? '';
       final email = data['email']?.toString().trim() ?? '';
@@ -103,7 +149,7 @@ class Wrapper extends StatelessWidget {
 
       // Admins skip the consumer onboarding flow entirely.
       if (role == 'admin') {
-        // FIX(perf): fire-and-forget — same reasoning as above. These
+        // FIX(perf): fire-and-forget -- same reasoning as above. These
         // three writes only exist to warm the cache for the NEXT launch;
         // the routing decision for THIS launch (AdminBottomNavigation)
         // doesn't need to wait on them landing on disk first.
@@ -139,10 +185,14 @@ class Wrapper extends StatelessWidget {
       // Only sign out for errors that mean the session itself is actually
       // invalid. Everything else (e.g. Firestore permission-denied for a
       // banned user, transient network failures) should NOT sign the user
-      // out — show a retryable error screen instead so they keep their
+      // out -- show a retryable error screen instead so they keep their
       // session (and can still reach things like the banned-account page
       // or Help Center).
       if (_isSessionInvalid(e)) {
+        // FIX: clear the routing cache too -- otherwise a later sign-in
+        // (maybe a different account) could pick up this uid's stale
+        // cached result if uids ever collided across a fast sign-out/in.
+        RouteResolver.instance.clear();
         await FirebaseAuth.instance.signOut();
         return const OtpSignupPage();
       }
@@ -170,20 +220,22 @@ class Wrapper extends StatelessWidget {
       builder: (context, authSnapshot) {
         if (authSnapshot.connectionState == ConnectionState.waiting) {
           // INSTANT: no spinner while waiting for the very first auth
-          // event — just show a blank white frame so there's no visible
+          // event -- just show a blank white frame so there's no visible
           // "wait" state flashing before we know if there's a user.
           return const _InstantScreen();
         }
         if (!authSnapshot.hasData) {
           _clearCache();
+          RouteResolver.instance.clear(); // FIX: no stale cache for next sign-in
           return const OtpSignupPage();
         }
         final user = authSnapshot.data!;
 
-        // StatefulWidget caches the future so FutureBuilder never reruns it
-        // unless the user's UID actually changes — prevents repeated
-        // Firestore reads / screen flicker on unrelated auth stream events.
-        return _WrapperBody(user: user, checkUser: _checkUser);
+        // CHANGED: was `checkUser: _checkUser` (a fresh call every time).
+        // Now routes through RouteResolver so it reuses whatever
+        // SplashScreen already kicked off/finished, instead of Wrapper
+        // starting the Firestore read cold the moment it mounts.
+        return _WrapperBody(user: user, checkUser: RouteResolver.instance.resolve);
       },
     );
   }
@@ -232,8 +284,10 @@ class _WrapperBodyState extends State<_WrapperBody> {
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           // INSTANT: routing decision resolves in the background with no
-          // circular spinner shown — just a blank white frame so the
-          // transition to the resolved screen feels immediate.
+          // circular spinner shown -- just a blank white frame so the
+          // transition to the resolved screen feels immediate. With
+          // RouteResolver warming this up during the splash animation,
+          // this branch should rarely even be visible anymore.
           return const _InstantScreen();
         }
         if (snapshot.hasError) {
@@ -247,7 +301,7 @@ class _WrapperBodyState extends State<_WrapperBody> {
 
 /// Replaces the old CircularProgressIndicator loading screen. Routing
 /// still resolves asynchronously under the hood, but the user never sees
-/// a spinner — just a blank white frame — so the eventual screen appears
+/// a spinner -- just a blank white frame -- so the eventual screen appears
 /// to load instantly instead of showing a visible "wait" state.
 class _InstantScreen extends StatelessWidget {
   const _InstantScreen();
@@ -314,7 +368,7 @@ class _ErrorScreen extends StatelessWidget {
               ),
               const SizedBox(height: 32),
 
-              // Retry button — keeps the current session instead of forcing
+              // Retry button -- keeps the current session instead of forcing
               // a sign-out, so e.g. a banned user doesn't lose access to
               // things like the Help Center just because a read failed.
               if (onRetry != null)
@@ -371,6 +425,7 @@ class _ErrorScreen extends StatelessWidget {
               // forced automatically.
               TextButton.icon(
                 onPressed: () async {
+                  RouteResolver.instance.clear(); // FIX: don't leak into next sign-in
                   await FirebaseAuth.instance.signOut();
                 },
                 icon: Icon(Icons.logout_rounded,

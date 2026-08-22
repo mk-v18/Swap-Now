@@ -17,6 +17,8 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_remote_config/firebase_remote_config.dart';
 import 'package:amoeba/start/payment_success.dart';
 import 'package:amoeba/start/payment_fail.dart';
+import 'package:amoeba/start/payment_processing.dart';
+import 'package:amoeba/pages/my_products.dart';
 
 // ─── Responsive Layout Helper ─────────────────────────────────────────────────
 class _RL {
@@ -98,14 +100,14 @@ const int    _kSuggestionCacheCap = 40;
 //   • Lifetime  — flat ₹49 once. On verified payment the server sets
 //                 hasLifetimeListingAccess, so every future listing skips
 //                 this dialog entirely.
-//   • Per-listing — 20% of the price the user is asking for THIS item,
+//   • Per-listing — 10% of the price the user is asking for THIS item,
 //                 capped at ₹100. Charged again on every future listing.
 // The actual charged amount is always computed server-side in
 // functions/index.js (createListingOrder) from these same numbers — this
 // copy is for showing the user an accurate preview before checkout opens,
 // never for deciding what Razorpay actually charges.
 const double _kLifetimeFeeRupees        = 49.0;
-const double _kPerListingFeeRate        = 0.20;
+const double _kPerListingFeeRate        = 0.10;
 const double _kPerListingFeeCapRupees   = 100.0;
 const double _kPerListingFeeMinRupees   = 1.0; // Razorpay's own order minimum
 
@@ -575,7 +577,7 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
   // ── Listing fee helpers ───────────────────────────────────────────────────
   double get _enteredPrice => double.tryParse(_priceController.text.trim()) ?? 0;
 
-  // 20% of the entered price, floored at Razorpay's ₹1 minimum and capped at
+  // 10% of the entered price, floored at Razorpay's ₹1 minimum and capped at
   // ₹100 — a preview only; functions/index.js computes the real charge.
   double get _perListingFeePreview {
     final raw = _enteredPrice * _kPerListingFeeRate;
@@ -746,6 +748,21 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     final signature = response.signature ?? '';
     final now = DateTime.now();
 
+    // ── Processing screen ──────────────────────────────────────────────
+    // Pushed the instant Razorpay hands back control, on top of the
+    // listing page. It just sits there (back-navigation blocked) while
+    // verifyListingPayment runs — no more silent gap / bare button spinner
+    // between "checkout closed" and "success or failure shown".
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const PaymentProcessingPage(
+          message:
+          "Please wait while we confirm your listing payment. This won't take long.",
+        ),
+      ),
+    );
+
     try {
       final callable = FirebaseFunctions.instance.httpsCallable('verifyListingPayment');
       final result = await callable.call({
@@ -760,7 +777,9 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
       if (!verified) throw Exception('Server did not confirm verification.');
 
       if (!mounted) return;
-      Navigator.push(
+      // pushReplacement: swaps the processing screen out for the success
+      // screen — the listing page stays underneath in the stack.
+      Navigator.pushReplacement(
         context,
         MaterialPageRoute(
           builder: (_) => PaymentSuccessPage(
@@ -769,14 +788,18 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
             subtitle: feeType == _ListingFeeType.lifetime
                 ? "Lifetime listing access unlocked — every future listing is free."
                 : "Listing fee received for this product.",
-            // Runs the actual publish (image upload + Firestore write) while
-            // this page's own Continue button shows its spinner, then pops
-            // back to the listing page — "back to where it started".
+            // Publishes the listing (image upload + Firestore write) while
+            // this page's own Continue button shows its spinner, then takes
+            // the user straight to My Products to see it live — instead of
+            // dropping them back on the (now-empty) upload form.
             onContinue: () async {
               if (user != null) {
                 await _publishListing(user, feeTypeCharged: feeType);
               }
-              if (mounted) Navigator.of(context).pop();
+              if (!mounted) return;
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(builder: (_) => const MyProductsPage()),
+              );
             },
           ),
         ),
@@ -784,13 +807,14 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     } on FirebaseFunctionsException catch (e) {
       debugPrint('verifyListingPayment rejected: ${e.code} ${e.message}');
       if (!mounted) return;
-      Navigator.push(
+      Navigator.pushReplacement(
         context,
         MaterialPageRoute(
           builder: (_) => PaymentFailedPage(
             errorCode: e.code,
             errorMessage:
             "Payment received but verification failed. Contact support with payment ID: $paymentId",
+            // Back to the upload form only — no partial listing was created.
             onRetry: () => Navigator.of(context).pop(),
           ),
         ),
@@ -798,13 +822,14 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     } catch (e) {
       debugPrint('verifyListingPayment call error: $e');
       if (!mounted) return;
-      Navigator.push(
+      Navigator.pushReplacement(
         context,
         MaterialPageRoute(
           builder: (_) => PaymentFailedPage(
             errorCode: "VERIFY_ERROR",
             errorMessage:
             "Couldn't confirm payment. Contact support with payment ID: $paymentId if this persists.",
+            // Back to the upload form only — no partial listing was created.
             onRetry: () => Navigator.of(context).pop(),
           ),
         ),
@@ -1392,7 +1417,7 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
 // ══════════════════════════════════════════════════════════════════════════════
 /// Shown before Publish whenever the signed-in user doesn't already have
 /// hasLifetimeListingAccess. Lets them pick between a one-time ₹49 lifetime
-/// unlock, or a per-listing fee (20% of their asking price, capped ₹100).
+/// unlock, or a per-listing fee (10% of their asking price, capped ₹100).
 class _ListingFeeDialog extends StatefulWidget {
   final double perListingFeePreview;
   const _ListingFeeDialog({required this.perListingFeePreview});

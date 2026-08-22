@@ -23,49 +23,72 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   debugPrint('[FCM] Background message: ${message.messageId}');
 }
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Only the bare minimum needed before the first frame can paint.
-  // IMPORTANT: never rethrow here. If Firebase.initializeApp() fails
-  // (bad google-services.json, no network on first launch, a stripped
-  // class from a misconfigured ProGuard rule, etc.) the old code used
-  // to rethrow, which crashes the whole app before runApp() is ever
-  // called — on a release build that shows up to the user as nothing
-  // but a black screen and no way to know why. Now we always get pixels
-  // on screen: either the real app, or a clear error screen with a
-  // retry button.
-  bool firebaseReady = true;
+  // FIX (white-screen root cause): Firebase.initializeApp() is a fast,
+  // local SDK init -- fine to await before runApp(). It's NOT the thing
+  // causing the 3-5s blank screen.
+  bool coreFirebaseFailed = false;
   try {
-    if (Firebase.apps.isEmpty) {
-      await Firebase.initializeApp();
-    }
+    await Firebase.initializeApp();
+    // Only needs Firebase.initializeApp() to have succeeded -- doesn't
+    // need to wait on AppCheck too, so it's registered right here.
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
   } catch (e) {
-    debugPrint('[SwapNow] Firebase.initializeApp() failed: $e');
-    firebaseReady = false;
+    debugPrint('[SwapNow] Firebase.initializeApp failed: $e');
+    coreFirebaseFailed = true;
   }
 
-  if (!firebaseReady) {
-    runApp(const _StartupErrorApp());
-    return;
+  // FIX (white-screen root cause): FirebaseAppCheck.instance.activate() is
+  // a genuine network round trip -- Play Integrity on Android / DeviceCheck
+  // on iOS -- and used to be `await`-ed here, BEFORE runApp() was ever
+  // called. Flutter can't paint anything until runApp() runs, so for
+  // however long that attestation call took, the user was staring at the
+  // bare native launch background (plain white by default). That's almost
+  // certainly the 3-5s blank screen being reported.
+  //
+  // It's now fired without awaiting: it finishes in the background, hidden
+  // behind the splash screen's own ~4.5s on-screen animation instead of
+  // blocking the first frame. Nothing before this point needs an AppCheck
+  // token yet.
+  if (!coreFirebaseFailed) {
+    _activateAppCheck();
   }
 
-  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+  // FIX (dead code): _StartupErrorApp was defined but never actually
+  // shown anywhere -- Firebase failures were swallowed and the app
+  // launched normally regardless, meaning a user whose Firebase truly
+  // failed to init would hit broken auth/Firestore calls further in with
+  // no explanation. Now it's actually used for that case.
+  runApp(
+    coreFirebaseFailed
+        ? const _StartupErrorApp()
+        : SwapNowApp(navigatorKey: navigatorKey),
+  );
 
-  // Get pixels on screen ASAP — splash screen shows immediately.
-  runApp(SwapNowApp(navigatorKey: navigatorKey));
-
-  // Everything below runs AFTER the first frame is drawn, so it can
-  // never block or delay the splash screen from appearing.
-  _deferAppCheckInit();
   _deferMediaKitInit();
   _deferAdsInit();
 }
 
-/// Shown only if Firebase itself fails to initialize — a rare, genuinely
+void _activateAppCheck() {
+  FirebaseAppCheck.instance
+      .activate(
+    androidProvider:
+    kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+    appleProvider:
+    kDebugMode ? AppleProvider.debug : AppleProvider.deviceCheck,
+  )
+      .catchError((e) {
+    // Non-fatal: app still works without AppCheck, just less protected.
+    debugPrint('[SwapNow] AppCheck activation failed: $e');
+  });
+}
+
+/// Shown only if Firebase.initializeApp() itself fails -- a rare, genuinely
 /// unrecoverable-without-retry scenario (e.g. device has no network on
-/// first cold start and Firebase can't fetch remote config). Gives the
-/// user a way to retry instead of seeing a silent black screen.
+/// first cold start). Gives the user a way to retry instead of a broken
+/// app with silent Firebase failures downstream.
 class _StartupErrorApp extends StatelessWidget {
   const _StartupErrorApp();
 
@@ -115,21 +138,6 @@ class _StartupErrorApp extends StatelessWidget {
       ),
     );
   }
-}
-
-void _deferAppCheckInit() {
-  WidgetsBinding.instance.addPostFrameCallback((_) async {
-    try {
-      await FirebaseAppCheck.instance.activate(
-        androidProvider:
-        kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
-        appleProvider:
-        kDebugMode ? AppleProvider.debug : AppleProvider.deviceCheck,
-      );
-    } catch (e) {
-      debugPrint('[SwapNow] AppCheck activation error: $e');
-    }
-  });
 }
 
 void _deferMediaKitInit() {
@@ -200,7 +208,7 @@ class SwapNowApp extends StatelessWidget {
         }
 
         // Admin "new help query submitted" notifications deep-link here.
-        // No arguments needed — AdminHelpQueriesPage streams the full
+        // No arguments needed -- AdminHelpQueriesPage streams the full
         // list itself; the admin taps the relevant card once inside.
         if (settings.name == '/admin-help-queries') {
           return MaterialPageRoute(builder: (_) => const AdminHelpQueriesPage());
@@ -221,7 +229,7 @@ class SwapNowApp extends StatelessWidget {
         // NEW: "new suggestion submitted" notifications deep-link here.
         // There's no dedicated suggestions-review screen yet, so this
         // lands the admin on the categories hub as the closest existing
-        // screen — build a SuggestionsAdminPage + register its own route
+        // screen -- build a SuggestionsAdminPage + register its own route
         // if you want a direct deep link instead.
         if (settings.name == '/admin-categories') {
           return MaterialPageRoute(builder: (_) => const AdminCategoriesPage());

@@ -830,6 +830,12 @@ class NotificationService {
     nav.pushNamed('/admin-categories');
   }
 
+  // Public wrapper so NotificationsPage (the in-app inbox) can route a
+  // tapped row using the exact same type→screen logic a tapped OS push
+  // notification uses, instead of duplicating the switch.
+  void routeFromNotificationData(Map<String, dynamic> data) =>
+      _routeNotification(data);
+
   // ── ACTIVE CHAT MANAGEMENT ────────────────────────────────────────────────
   void setActiveChatId(String? chatId) => _currentChatId = chatId;
 

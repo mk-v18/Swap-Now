@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:amoeba/chats/notification_service.dart';
 import 'package:amoeba/logs/wrapper.dart';
 
@@ -55,6 +56,21 @@ class _SplashScreenState extends State<SplashScreen>
 
     _buildParticles();
     _setupAnimations();
+
+    // FIX (white-screen after splash): warm Wrapper's routing decision now,
+    // in parallel with this splash animation, instead of letting it start
+    // cold the moment Wrapper mounts 4.5s from now. This is a
+    // SharedPreferences read + a Firestore `users/{uid}` read -- previously
+    // that round trip only began AFTER the splash screen had already
+    // disappeared, so the user saw a second blank frame right after this
+    // one. RouteResolver caches the result so Wrapper just picks it up.
+    FirebaseAuth.instance.authStateChanges().first.then((user) {
+      if (user != null) {
+        RouteResolver.instance.resolve(user); // fire-and-forget cache warm-up
+      }
+    }).catchError((e) {
+      debugPrint('[SwapNow] Splash route prefetch failed: $e');
+    });
 
     // Start entry animation after first frame settles
     Future.delayed(const Duration(milliseconds: 200), () {

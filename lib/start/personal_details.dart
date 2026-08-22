@@ -443,6 +443,15 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
   }
 
   // ── Submit ─────────────────────────────────────────────────────────────────
+  // FIX(perf): This used to await putFile() -> getDownloadURL() -> Firestore
+  // set() -> (maybe) referral transaction, all before navigating — so the
+  // user sat on a spinner for the full Storage round trip (often the
+  // slowest step on a weak connection) even though nothing on the next
+  // page (StartingPage/Wrapper) actually needs the photo to be uploaded
+  // yet. Now: write the core profile doc (fast, no Storage dependency),
+  // navigate immediately, and let the image upload + referral increment
+  // finish in the background via _finishImageUpload, which patches
+  // `profileImage` into the same doc once it resolves.
   Future<void> _submitDetails() async {
     // FIX: Guard re-entry at the top synchronously — prevents double-tap
     // submitting while the first async call is in-flight.
@@ -484,25 +493,14 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
         return;
       }
 
-      final ref = FirebaseStorage.instance
-          .ref()
-          .child('profile_images/$uid.jpg');
-      await ref.putFile(
-        imageFile,
-        // FIX(security): Set explicit content type — prevents Storage from
-        // serving an arbitrary MIME type supplied by the client device.
-        SettableMetadata(contentType: 'image/jpeg'),
-      );
-      final imageUrl = await ref.getDownloadURL();
+      final referralStatus  = _referralStatusNotifier.value;
+      final referralCode    = referralStatus.isValid ? _referralController.text.trim() : null;
+      final referralDocId   = referralStatus.isValid ? _referralDocId : null;
 
-      final referralStatus = _referralStatusNotifier.value;
-
-      // FIX: Batch user doc write and referral update — reduces round-trips.
-      // User doc uses set+merge so it is idempotent on retry.
-      //
-      // CHANGED: onboardingStep now advances straight to 'starting_page'
-      // instead of 'payment' — payment is no longer part of this chain,
-      // so Wrapper's next stop for this user is StartingPage.
+      // FIX(perf): Core doc write — everything the app needs to route and
+      // display the user, minus the photo. This is a single small Firestore
+      // write, not a multi-MB upload, so it resolves quickly even on a
+      // slow connection.
       await FirebaseFirestore.instance.collection('users').doc(uid).set({
         'uid':              uid,
         'phone':            user.phoneNumber,
@@ -513,32 +511,23 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
         // home_page.dart can sort nearby products without a live geocode.
         'lat':              _latitude,
         'lng':              _longitude,
-        'profileImage':     imageUrl,
-        'referralCodeUsed': referralStatus.isValid
-            ? _referralController.text.trim()
-            : null,
+        // FIX(perf): left null here on purpose — filled in by
+        // _finishImageUpload once the Storage upload completes.
+        'profileImage':     null,
+        'referralCodeUsed': referralCode,
         'role':             'user',
         'onboardingStep':   'starting_page', // CHANGED: was 'payment'
         'createdAt':        FieldValue.serverTimestamp(),
       }, SetOptions(merge: true)); // FIX: merge:true → idempotent on retry
 
-      if (referralStatus.isValid && _referralDocId != null) {
-        final refDoc = FirebaseFirestore.instance
-            .collection('referrals')
-            .doc(_referralDocId!);
-        await FirebaseFirestore.instance.runTransaction((tx) async {
-          final snapshot = await tx.get(refDoc);
-          if (snapshot.exists) {
-            final data   = snapshot.data() as Map<String, dynamic>;
-            final joined =
-            (data['joinedUsers'] is int) ? data['joinedUsers'] as int : 0;
-            tx.update(refDoc, {
-              'joinedUsers':  joined + 1,
-              'lastJoinedAt': FieldValue.serverTimestamp(),
-            });
-          }
-        });
-      }
+      // FIX(perf): Fire-and-forget — deliberately not awaited. Runs after
+      // this function returns/navigates, so the photo upload and referral
+      // increment no longer sit on the critical path to StartingPage.
+      unawaited(_finishImageUpload(
+        uid:           uid,
+        imageFile:     imageFile,
+        referralDocId: referralDocId,
+      ));
 
       if (!mounted) return;
 
@@ -554,6 +543,61 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
       if (mounted) _showErrorSnack('Something went wrong. Please try again.');
     } finally {
       if (mounted) _isLoadingNotifier.value = false;
+    }
+  }
+
+  // FIX(perf/gap): Extracted background continuation for the slow part of
+  // submit (Storage upload + download URL + referral transaction).
+  // Deliberately does NOT check `mounted` or touch `context` — by the time
+  // this resolves, the user is very likely already on StartingPage (or has
+  // backgrounded the app), and this task must keep running regardless of
+  // this widget's lifecycle. Failures here are swallowed by design: the
+  // user doc already has everything required to use the app without a
+  // photo, and a missing profileImage can be retried/backfilled later
+  // (e.g. next time they open their profile) rather than blocking signup.
+  Future<void> _finishImageUpload({
+    required String uid,
+    required File imageFile,
+    required String? referralDocId,
+  }) async {
+    try {
+      final ref = FirebaseStorage.instance
+          .ref()
+          .child('profile_images/$uid.jpg');
+      await ref.putFile(
+        imageFile,
+        // FIX(security): Set explicit content type — prevents Storage from
+        // serving an arbitrary MIME type supplied by the client device.
+        SettableMetadata(contentType: 'image/jpeg'),
+      );
+      final imageUrl = await ref.getDownloadURL();
+
+      await FirebaseFirestore.instance.collection('users').doc(uid).set(
+        {'profileImage': imageUrl},
+        SetOptions(merge: true),
+      );
+
+      if (referralDocId != null) {
+        final refDoc = FirebaseFirestore.instance
+            .collection('referrals')
+            .doc(referralDocId);
+        await FirebaseFirestore.instance.runTransaction((tx) async {
+          final snapshot = await tx.get(refDoc);
+          if (snapshot.exists) {
+            final data   = snapshot.data() as Map<String, dynamic>;
+            final joined =
+            (data['joinedUsers'] is int) ? data['joinedUsers'] as int : 0;
+            tx.update(refDoc, {
+              'joinedUsers':  joined + 1,
+              'lastJoinedAt': FieldValue.serverTimestamp(),
+            });
+          }
+        });
+      }
+    } catch (_) {
+      // FIX(gap): Swallow silently — this is a detached background task,
+      // there's no UI left to show an error on. profileImage stays null
+      // and can be backfilled from the profile screen.
     }
   }
 

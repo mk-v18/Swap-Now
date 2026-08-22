@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:amoeba/pages/wishlistpage.dart';
+import 'package:amoeba/pages/notifications_page.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -73,6 +74,22 @@ const List<String> _kCategories = [
 // ─── Brand colours ────────────────────────────────────────────────────────────
 const Color _kPrimary = Color(0xFF5800B3);
 const Color _kPrimaryDark = Color(0xFF26004D);
+
+// Kept in sync with notifications_page.dart's `_kNonChatTypes` — used only
+// to exclude chat-message notifications from the bell's unread badge count,
+// matching what NotificationsPage itself displays.
+const Set<String> _kNonChatNotificationTypes = {
+  'swap_request',
+  'swap_accepted',
+  'swap_declined',
+  'exchange_completed',
+  'exchange_cancelled',
+  'help_query',
+  'ad_request_submitted',
+  'ad_request_approved',
+  'ad_request_rejected',
+  'new_suggestion',
+};
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -554,6 +571,9 @@ class _HomePageState extends State<HomePage> {
                         ),
                         Row(
                           children: [
+                            _notificationBell(context),
+                            SizedBox(
+                                width: _BP.isTablet(context) ? 10 : 8),
                             _iconBtn(context, 'assets/icons/favourite.svg',
                                 const WishlistPage()),
                             SizedBox(
@@ -664,6 +684,8 @@ class _HomePageState extends State<HomePage> {
                   if (!_showPinnedSearch)
                     Row(
                       children: [
+                        _notificationBell(context),
+                        SizedBox(width: isTablet ? 14 : 12),
                         _iconBtn(context, 'assets/icons/favourite.svg',
                             const WishlistPage()),
                         SizedBox(width: isTablet ? 14 : 12),
@@ -907,6 +929,86 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
       ),
+    );
+  }
+
+  /// Bell icon with an unread-count badge, sourced from
+  /// `users/{uid}/notifications` (see NotificationsPage). Mirrors
+  /// `_iconBtn`'s look, but uses a Material icon (no bell asset exists yet)
+  /// and overlays the live unread count.
+  Widget _notificationBell(BuildContext context) {
+    final size = _BP.iconBtnSize(context);
+    final user = FirebaseAuth.instance.currentUser;
+
+    final button = Material(
+      color: Colors.transparent,
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        splashColor: _kPrimaryDark.withOpacity(0.1),
+        highlightColor: _kPrimaryDark.withOpacity(0.05),
+        onTap: () => Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const NotificationsPage()),
+        ),
+        child: _circleIcon(
+          Icon(Icons.notifications_none_rounded,
+              size: size + 2, color: _kPrimaryDark),
+        ),
+      ),
+    );
+
+    if (user == null) return button;
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        button,
+        Positioned(
+          top: -2,
+          right: -2,
+          child: StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance
+                .collection('users')
+                .doc(user.uid)
+                .collection('notifications')
+                .where('read', isEqualTo: false)
+                .snapshots(),
+            builder: (context, snap) {
+              // Excludes chat notifications from the count, matching what
+              // NotificationsPage itself shows (see _kNonChatTypes there).
+              final count = (snap.data?.docs ?? []).where((d) {
+                final data = d.data() as Map<String, dynamic>? ?? {};
+                final routeData = (data['data'] is Map)
+                    ? Map<String, dynamic>.from(data['data'] as Map)
+                    : <String, dynamic>{};
+                return _kNonChatNotificationTypes
+                    .contains(routeData['type'] as String? ?? 'text');
+              }).length;
+              if (count == 0) return const SizedBox.shrink();
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE53935),
+                  borderRadius: BorderRadius.circular(9),
+                  border: Border.all(color: Colors.white, width: 1.5),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  count > 9 ? '9+' : '$count',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    height: 1,
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
     );
   }
 

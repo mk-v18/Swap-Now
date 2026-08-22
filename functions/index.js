@@ -90,6 +90,14 @@ exports.sendChatNotification = onDocumentCreated(
         return;
       }
 
+      // Persist to the recipient's notification inbox regardless of
+      // whether they have a push token — see _writeNotificationDoc.
+      await _writeNotificationDoc(uid, {
+        title: senderName,
+        body,
+        data: { chatId, senderId, receiverId: uid, senderName, senderPhoto, type },
+      });
+
       const fcmToken = userData.fcmToken;
       if (!fcmToken) return;
 
@@ -184,6 +192,33 @@ function _safeImageUrl(url) {
     // invalid URL
   }
   return undefined;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Notification inbox — persists every push we send as a document under
+// users/{uid}/notifications, so the app has an in-app history of them
+// (NotificationsPage) independent of the OS notification shade, which the
+// user can clear at any time. `data` is stored as-is — it's the exact same
+// map NotificationService's client-side routing switch already expects
+// (it always carries a `type` key), so a tapped inbox row can reuse the
+// identical routing logic a tapped push notification uses.
+//
+// Written even when the recipient has no fcmToken (so the inbox still
+// reflects it) — only skipped for banned users, same as the push itself.
+// ══════════════════════════════════════════════════════════════════════
+async function _writeNotificationDoc(uid, { title, body, data = {} }) {
+  if (!uid) return;
+  try {
+    await db.collection("users").doc(uid).collection("notifications").add({
+      title: title || "",
+      body: body || "",
+      data,
+      read: false,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error(`Failed to write notification doc for ${uid}:`, err.message);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -298,7 +333,7 @@ exports.verifyPayment = onCall(
 //   'lifetime'   — flat ₹49 one-time. On verified payment we set
 //                  hasLifetimeListingAccess so every future publish skips
 //                  this fee entirely.
-//   'perListing' — 20% of the price they're listing THIS item at, capped
+//   'perListing' — 10% of the price they're listing THIS item at, capped
 //                  at ₹100 and floored at Razorpay's own ₹1 minimum.
 //                  Charged again on every future listing.
 //
@@ -309,7 +344,7 @@ exports.verifyPayment = onCall(
 // access is only ever granted after verifyListingPayment's HMAC check.
 // ══════════════════════════════════════════════════════════════════════
 const LISTING_LIFETIME_FEE_PAISE = 4900; // ₹49.00 — keep in sync with _kLifetimeFeeRupees in product_page.dart
-const LISTING_PERLISTING_FEE_RATE = 0.20; // 20% — keep in sync with _kPerListingFeeRate
+const LISTING_PERLISTING_FEE_RATE = 0.10; // 10% — keep in sync with _kPerListingFeeRate
 const LISTING_PERLISTING_FEE_CAP_PAISE = 10000; // ₹100.00 cap — keep in sync with _kPerListingFeeCapRupees
 const LISTING_PERLISTING_FEE_MIN_PAISE = 100; // ₹1.00 — Razorpay's own order minimum
 
@@ -481,6 +516,10 @@ async function _sendPushToUser(uid, { title, body, data = {}, channelId = "chat_
 
   const userData = userDoc.data();
   if (userData.banned === true) return;
+
+  // Persist to the recipient's notification inbox regardless of whether
+  // they have a push token — see _writeNotificationDoc.
+  await _writeNotificationDoc(uid, { title, body, data });
 
   const fcmToken = userData.fcmToken;
   if (!fcmToken) return;
