@@ -101,14 +101,29 @@ class _NotificationsPageState extends State<NotificationsPage> {
     final collection = _collection;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF7F5FB),
+      backgroundColor: const Color(0xFFFFFFFF),
       appBar: AppBar(
-        backgroundColor: _kPrimary,
-        foregroundColor: Colors.white,
+        scrolledUnderElevation: 0,
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
         elevation: 0,
+        centerTitle: true,
         title: const Text(
           'Notifications',
-          style: TextStyle(fontWeight: FontWeight.w700),
+          style: TextStyle(
+            color: Colors.black,
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        bottom: const PreferredSize(
+          preferredSize: Size.fromHeight(1),
+          child: Divider(height: 1, thickness: 1, color: Color(0xFFF0ECFF)),
+        ),
+        leading: IconButton(
+          icon:
+          const Icon(Icons.arrow_back_ios, color: Colors.black, size: 18),
+          onPressed: () => Navigator.pop(context),
         ),
         actions: [
           if (collection != null)
@@ -128,8 +143,9 @@ class _NotificationsPageState extends State<NotificationsPage> {
                   child: const Text(
                     'Mark all read',
                     style: TextStyle(
-                      color: Colors.white,
+                      color: _kPrimary,
                       fontWeight: FontWeight.w600,
+                      fontSize: 13,
                     ),
                   ),
                 );
@@ -207,28 +223,68 @@ class _EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 64, color: _kPrimary.withOpacity(0.35)),
-            const SizedBox(height: 14),
-            Text(
-              title,
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-                color: _kPrimaryDark,
+      child: SingleChildScrollView(
+        physics: const NeverScrollableScrollPhysics(),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Layered tinted badge — soft outer ring + solid inner
+              // circle, matching the empty-state pattern used across
+              // chats/wishlist/payments/listings/support.
+              Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: 128,
+                    height: 128,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _kPrimary.withOpacity(0.06),
+                    ),
+                  ),
+                  Container(
+                    width: 92,
+                    height: 92,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _kPrimary.withOpacity(0.10),
+                    ),
+                  ),
+                  Container(
+                    width: 64,
+                    height: 64,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _kPrimary.withOpacity(0.14),
+                    ),
+                    child: Icon(icon, size: 30, color: _kPrimaryDark),
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              subtitle,
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
-            ),
-          ],
+              const SizedBox(height: 24),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+                  color: _kPrimaryDark,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  height: 1.4,
+                  color: Colors.grey.shade600,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

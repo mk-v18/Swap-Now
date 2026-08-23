@@ -3,7 +3,6 @@ import 'package:amoeba/chats/chatservice.dart';
 import 'package:amoeba/custom_loader.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_svg/svg.dart';
 import 'package:intl/intl.dart';
 import '../chats/chatscreen.dart';
 
@@ -145,7 +144,7 @@ class ChatsPage extends StatefulWidget {
 
 class _ChatsPageState extends State<ChatsPage> {
   final ChatService _chatService = ChatService();
-  final String _currentUserId = FirebaseAuth.instance.currentUser!.uid;
+  String get _currentUserId => FirebaseAuth.instance.currentUser?.uid ?? '';
 
   // ── Cache: avoid re-fetching user docs on every outer stream emit ──────────
   // Maps receiverId → snapshot so rebuilds don't hit Firestore again.
@@ -268,20 +267,44 @@ class _ChatsPageState extends State<ChatsPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    width: rl.emptyIconSize+30,
-                    height: rl.emptyIconSize+30,
-                    decoration: BoxDecoration(
-                      color: Color(0xFF4A148C).withOpacity(0.08),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      Icons.chat_bubble_outline_rounded,
-                      size: rl.emptyIconSize * 0.6,
-                      color: Color(0xFF4A148C).withOpacity(0.6),
-                    ),
+                  // Layered tinted badge — soft outer ring + solid inner
+                  // circle, matching the empty-state pattern used across
+                  // chats/wishlist/payments/listings/support.
+                  Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Container(
+                        width: rl.emptyIconSize + 66,
+                        height: rl.emptyIconSize + 66,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: const Color(0xFF4A148C).withOpacity(0.06),
+                        ),
+                      ),
+                      Container(
+                        width: rl.emptyIconSize + 46,
+                        height: rl.emptyIconSize + 46,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: const Color(0xFF4A148C).withOpacity(0.10),
+                        ),
+                      ),
+                      Container(
+                        width: rl.emptyIconSize + 30,
+                        height: rl.emptyIconSize + 30,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: const Color(0xFF4A148C).withOpacity(0.14),
+                        ),
+                        child: Icon(
+                          Icons.chat_bubble_outline_rounded,
+                          size: rl.emptyIconSize * 0.6,
+                          color: const Color(0xFF4A148C),
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 24),
                   Text(
                     'No chats yet',
                     style: TextStyle(
@@ -290,7 +313,7 @@ class _ChatsPageState extends State<ChatsPage> {
                       fontWeight: FontWeight.w700,
                     ),
                   ),
-                  const SizedBox(height: 6),
+                  const SizedBox(height: 8),
                   Text(
                     'Start a conversation to see it here',
                     style: TextStyle(

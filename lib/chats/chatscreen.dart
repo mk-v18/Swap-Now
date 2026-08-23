@@ -49,7 +49,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final AudioRecorder _audioRecorder = AudioRecorder();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  double _uploadProgress = 0.0;
+  // Replaces the old single `_uploadProgress` double (which drove one
+  // app-wide bottom progress bar) with a list of in-flight local sends —
+  // each picked photo/video/voice-note gets its own entry so it can render
+  // immediately from the local file with its own progress ring, WhatsApp-
+  // style, instead of everyone waiting on one shared bar at the bottom.
+  final List<_PendingUpload> _pendingUploads = [];
   final Map<String, String> _geocodeCache = {};
   final Map<String, double?> _downloadProgress = {};
   final Set<String> _downloadLock = {}; // prevents duplicate downloads of same file
@@ -62,6 +67,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Duration _recordDuration = Duration.zero;
   Timer? _recordTimer;
   String? _currentlyPlayingUrl;
+  // FIX (voice messages): tracks the URL currently being connected to, so
+  // the play button can show a spinner instead of sitting on the old
+  // play-arrow icon (looking "stuck"/unresponsive) during the network
+  // handshake before playback actually starts.
+  String? _connectingAudioUrl;
   bool _isPlaying = false;
   Duration _audioDuration = Duration.zero;
   Duration _audioPosition = Duration.zero;
@@ -291,15 +301,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         imageQuality: 80,
       );
       if (picked == null) return;
-      final file = File(picked.path);
-      final ext = picked.path.split('.').last;
-      final path = 'chat_media/${widget.chatId}/${DateTime.now().millisecondsSinceEpoch}.$ext';
-      setState(() => _uploadProgress = 0.01);
-      final url = await _chatService.uploadFile(
-          file: file, path: path, onProgress: (p) => setState(() => _uploadProgress = p));
-      await _chatService.sendMessage(
-          chatId: widget.chatId, receiverId: widget.receiverId, type: 'image', fileUrl: url);
-      setState(() => _uploadProgress = 0.0);
+      // FIX (thin progress bar): previously this awaited the FULL upload
+      // before the image appeared anywhere, driving one shared bar at the
+      // bottom of the screen in the meantime. Now the picked file shows up
+      // instantly as its own bubble (see _buildPendingBubble) and uploads
+      // in the background — same feel as WhatsApp/Telegram.
+      _startUpload(file: File(picked.path), type: 'image');
     } catch (_) {
       _snack('Error picking image', error: true);
     }
@@ -312,18 +319,69 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         maxDuration: const Duration(minutes: 5),
       );
       if (picked == null) return;
-      final file = File(picked.path);
-      final ext = picked.path.split('.').last;
-      final path = 'chat_videos/${widget.chatId}/${DateTime.now().millisecondsSinceEpoch}.$ext';
-      setState(() => _uploadProgress = 0.01);
-      final url = await _chatService.uploadFile(
-          file: file, path: path, onProgress: (p) => setState(() => _uploadProgress = p));
-      await _chatService.sendMessage(
-          chatId: widget.chatId, receiverId: widget.receiverId, type: 'video', fileUrl: url);
-      setState(() => _uploadProgress = 0.0);
+      _startUpload(file: File(picked.path), type: 'video');
     } catch (_) {
       _snack('Error picking video', error: true);
     }
+  }
+
+  // ── Optimistic upload pipeline ───────────────────────────────────────────
+  // Queues a local file for instant display + background upload. This is
+  // shared by images, videos, and voice notes — anything that needs
+  // Storage upload before it can be written to Firestore.
+  void _startUpload({required File file, required String type, Map<String, dynamic>? extra}) {
+    final pending = _PendingUpload(
+      id: '${DateTime.now().millisecondsSinceEpoch}_${_pendingUploads.length}',
+      file: file,
+      type: type,
+      extra: extra,
+    );
+    setState(() => _pendingUploads.add(pending));
+    _runUpload(pending);
+  }
+
+  Future<void> _runUpload(_PendingUpload pending) async {
+    try {
+      final folder = switch (pending.type) {
+        'image' => 'chat_media',
+        'video' => 'chat_videos',
+        _ => 'chat_audio',
+      };
+      final ext = pending.type == 'audio' ? 'm4a' : pending.file.path.split('.').last;
+      final path = '$folder/${widget.chatId}/${DateTime.now().millisecondsSinceEpoch}.$ext';
+
+      final url = await _chatService.uploadFile(
+        file: pending.file,
+        path: path,
+        onProgress: (p) {
+          if (mounted) setState(() => pending.progress = p);
+        },
+      );
+
+      await _chatService.sendMessage(
+        chatId: widget.chatId,
+        receiverId: widget.receiverId,
+        type: pending.type,
+        fileUrl: url,
+        extra: pending.extra,
+      );
+
+      if (mounted) setState(() => _pendingUploads.remove(pending));
+    } catch (_) {
+      // Leave the bubble in place, but flip it into a failed/retry state
+      // rather than silently discarding a photo/video/voice note the
+      // person clearly intended to send.
+      if (mounted) setState(() => pending.failed = true);
+      _snack('Upload failed — tap to retry', error: true);
+    }
+  }
+
+  void _retryPendingUpload(_PendingUpload pending) {
+    setState(() {
+      pending.failed = false;
+      pending.progress = 0.0;
+    });
+    _runUpload(pending);
   }
 
   Future<void> _sendLocation() async {
@@ -342,6 +400,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   // ── Recording ─────────────────────────────────────────────────────────────
+  // CHANGED: voice notes are now started with a normal TAP (not a
+  // long-press) on the mic button — see the send/mic button in
+  // _buildInputBar(). The recording bar (cancel / waveform / send) is
+  // unchanged, so once recording starts the person taps the red trash icon
+  // to cancel or the send button to finish, same as before.
   Future<void> _startRecording() async {
     if (!await _audioRecorder.hasPermission()) {
       _snack('Microphone permission denied', error: true);
@@ -362,19 +425,27 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final recordedDuration = _recordDuration; // capture before it resets
     setState(() { _isRecording = false; _recordDuration = Duration.zero; });
     if (path == null) return;
-    final storagePath = 'chat_audio/${widget.chatId}/${DateTime.now().millisecondsSinceEpoch}.m4a';
-    setState(() => _uploadProgress = 0.01);
-    final url = await _chatService.uploadFile(
-        file: File(path),
-        path: storagePath,
-        onProgress: (p) => setState(() => _uploadProgress = p));
-    await _chatService.sendMessage(
-        chatId: widget.chatId,
-        receiverId: widget.receiverId,
-        type: 'audio',
-        fileUrl: url,
-        extra: {'durationMs': recordedDuration.inMilliseconds});
-    setState(() => _uploadProgress = 0.0);
+
+    // FIX (voice messages): a tap-and-immediate-release used to still
+    // start/stop the recorder and upload/send whatever the ~0ms file
+    // contained — an unplayable, near-silent clip with a 0:00 duration
+    // that just looked "broken" in the thread. Bail out and clean up the
+    // temp file instead of sending something unusable.
+    if (recordedDuration.inMilliseconds < 500) {
+      _snack('Recording too short', error: true);
+      final tmp = File(path);
+      if (await tmp.exists()) await tmp.delete();
+      return;
+    }
+
+    // Same optimistic pipeline as images/videos — the voice note shows up
+    // immediately as a "Sending…" bubble instead of behind the shared
+    // bottom progress bar.
+    _startUpload(
+      file: File(path),
+      type: 'audio',
+      extra: {'durationMs': recordedDuration.inMilliseconds},
+    );
   }
 
   Future<void> _cancelRecording() async {
@@ -390,10 +461,37 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       } else {
         await _audioPlayer.resume(); // resume, don't replay from start
       }
-    } else {
-      setState(() { _audioPosition = Duration.zero; _audioDuration = Duration.zero; });
+      return;
+    }
+
+    // FIX (voice messages, bug 1): `_currentlyPlayingUrl = url;` used to be
+    // set OUTSIDE of setState, right below a setState() call for the other
+    // two fields. That meant tapping a second voice note while a first was
+    // playing didn't repaint this bubble as "now loading/playing" until
+    // some unrelated stream event happened to trigger a rebuild — it could
+    // look like the tap did nothing.
+    setState(() {
+      _audioPosition = Duration.zero;
+      _audioDuration = Duration.zero;
       _currentlyPlayingUrl = url;
+      _connectingAudioUrl = url;
+    });
+
+    // FIX (voice messages, bug 2): a failed/slow network fetch of the audio
+    // file used to throw here with nothing catching it — the play button
+    // would just sit there looking unresponsive with no error shown.
+    try {
       await _audioPlayer.play(UrlSource(url));
+    } catch (e) {
+      debugPrint('Voice message playback failed: $e'); // TEMP DEBUG
+      if (mounted) {
+        setState(() {
+          if (_currentlyPlayingUrl == url) _currentlyPlayingUrl = null;
+        });
+        _snack('Could not play voice message — check your connection', error: true);
+      }
+    } finally {
+      if (mounted) setState(() => _connectingAudioUrl = null);
     }
   }
 
@@ -916,14 +1014,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               child: Column(
                 children: [
                   if (_intent != null) _buildIntentBanner(),
+                  // FIX (thin progress line): the shared bottom
+                  // LinearProgressIndicator is gone — each in-flight
+                  // image/video/voice note now carries its own progress
+                  // ring directly on its bubble (see _pendingUploads /
+                  // _buildPendingBubble), so sends feel instant instead of
+                  // gated behind one bar at the bottom of the screen.
                   Expanded(child: _buildMessageList()),
-                  if (_uploadProgress > 0 && _uploadProgress < 1)
-                    LinearProgressIndicator(
-                      value: _uploadProgress,
-                      backgroundColor: _lightPurple,
-                      color: _purple,
-                      minHeight: 3,
-                    ),
                   _isRecording ? _buildRecordingBar() : _buildInputBar(),
                 ],
               ),
@@ -1645,7 +1742,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           return const SizedBox.shrink();
         }
         final docs = snapshot.data!.docs;
-        if (docs.isEmpty) {
+        if (docs.isEmpty && _pendingUploads.isEmpty) {
           return Center(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -1686,14 +1783,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           );
         }
 
+        // Locally-queued image/video/voice sends render first (index 0..n),
+        // ahead of anything that's actually landed in Firestore yet — this
+        // is what makes a picked photo appear instantly instead of only
+        // after the upload + write round-trip completes. Most-recently-
+        // queued pending item goes at index 0 (bottom of screen, list is
+        // reverse:true) same as a newly-arrived real message would.
+        final pendingCount = _pendingUploads.length;
+
         return ListView.builder(
           controller: _scrollController,
           reverse: true,
           padding: EdgeInsets.symmetric(
               horizontal: _isTablet ? _sw * 0.08 : 10, vertical: 8),
-          itemCount: docs.length,
+          itemCount: docs.length + pendingCount,
           itemBuilder: (context, i) {
-            final doc = docs[i];
+            if (i < pendingCount) {
+              final pending = _pendingUploads[pendingCount - 1 - i];
+              return _buildPendingBubble(pending);
+            }
+
+            final docIndex = i - pendingCount;
+            final doc = docs[docIndex];
             // FIX (bug 4): use the pending-writes-aware resolver so a
             // message that hasn't been acked by the server yet still gets
             // a usable timestamp (the device clock) instead of null, which
@@ -1702,20 +1813,42 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
             bool showDateChip = false;
             if (ts != null) {
-              if (i == docs.length - 1) {
+              if (docIndex == docs.length - 1) {
                 showDateChip = true;
               } else {
-                final prevTs = _resolveTimestamp(docs[i + 1]);
+                final prevTs = _resolveTimestamp(docs[docIndex + 1]);
                 if (prevTs != null && _dateLabel(ts) != _dateLabel(prevTs)) {
                   showDateChip = true;
                 }
               }
             }
 
+            // WHATSAPP-STYLE GROUPING: only show the time/tick row on the
+            // LAST message of a consecutive run from the same sender sent
+            // close together in time — not on every single message. Since
+            // the query is ordered descending (newest first) and the list
+            // is reverse:true, `docs[docIndex - 1]` is the NEXT message
+            // chronologically (i.e. the one sent right after this one).
+            // If that next message is from the same sender and landed
+            // within a short window, this bubble is "mid-burst" and hides
+            // its time/tick row; only the last bubble in the burst shows it.
+            bool showMeta = true;
+            if (docIndex > 0) {
+              final nextDoc = docs[docIndex - 1];
+              final currentData = doc.data() as Map<String, dynamic>;
+              final nextData = nextDoc.data() as Map<String, dynamic>;
+              final sameSender = nextData['senderId'] == currentData['senderId'];
+              final nextTs = _resolveTimestamp(nextDoc);
+              final closeInTime = ts != null &&
+                  nextTs != null &&
+                  nextTs.difference(ts).inSeconds.abs() < 60;
+              showMeta = !(sameSender && closeInTime);
+            }
+
             return Column(
               children: [
                 if (showDateChip && ts != null) _buildDateChip(_dateLabel(ts)),
-                _buildMessage(doc),
+                _buildMessage(doc, showMeta: showMeta),
               ],
             );
           },
@@ -1765,7 +1898,128 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildMessage(DocumentSnapshot doc) {
+  // ── Pending (optimistic) media bubble ─────────────────────────────────────
+  // Renders a locally-picked image/video/voice note immediately, using the
+  // on-device file, with a progress ring laid directly over the thumbnail
+  // (WhatsApp-style) instead of a separate app-wide progress bar. Tap the
+  // ring after a failure to retry that single upload.
+  Widget _buildPendingBubble(_PendingUpload pending) {
+    Widget content;
+    switch (pending.type) {
+      case 'image':
+        content = SizedBox(
+          width: _mediaW,
+          height: _mediaH,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Image.file(pending.file, fit: BoxFit.cover),
+              _buildUploadOverlay(pending),
+            ],
+          ),
+        );
+        break;
+      case 'video':
+        content = SizedBox(
+          width: _mediaW,
+          height: _mediaH * 0.72,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Container(color: Colors.black87, child: const Icon(Icons.movie, size: 60, color: Colors.white24)),
+              _buildUploadOverlay(pending),
+            ],
+          ),
+        );
+        break;
+      case 'audio':
+      default:
+        content = Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 22,
+                height: 22,
+                child: pending.failed
+                    ? const Icon(Icons.error_outline, color: Colors.white, size: 20)
+                    : CircularProgressIndicator(
+                    strokeWidth: 2, color: Colors.white,
+                    value: pending.progress > 0 ? pending.progress : null),
+              ),
+              const SizedBox(width: 10),
+              Icon(Icons.mic, size: 14, color: Colors.white70),
+              const SizedBox(width: 6),
+              Text(
+                pending.failed ? 'Failed — tap to retry' : 'Sending voice message…',
+                style: const TextStyle(color: Colors.white70, fontSize: 12.5),
+              ),
+            ],
+          ),
+        );
+        break;
+    }
+
+    return GestureDetector(
+      onTap: pending.failed ? () => _retryPendingUpload(pending) : null,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Align(
+          alignment: Alignment.centerRight,
+          child: Container(
+            constraints: BoxConstraints(maxWidth: _bubbleMax),
+            decoration: BoxDecoration(
+              color: _purple,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(18),
+                topRight: Radius.circular(18),
+                bottomLeft: Radius.circular(18),
+                bottomRight: Radius.circular(4),
+              ),
+              boxShadow: [
+                BoxShadow(color: Colors.black.withOpacity(0.08), blurRadius: 4, offset: const Offset(0, 2)),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(18),
+                topRight: Radius.circular(18),
+                bottomLeft: Radius.circular(18),
+                bottomRight: Radius.circular(4),
+              ),
+              child: content,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUploadOverlay(_PendingUpload pending) {
+    return Container(
+      color: Colors.black26,
+      child: Center(
+        child: pending.failed
+            ? Container(
+          padding: const EdgeInsets.all(10),
+          decoration: const BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
+          child: const Icon(Icons.refresh_rounded, color: Colors.white, size: 26),
+        )
+            : SizedBox(
+          width: 34,
+          height: 34,
+          child: CircularProgressIndicator(
+            strokeWidth: 2.5,
+            color: Colors.white,
+            value: pending.progress > 0 ? pending.progress : null,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMessage(DocumentSnapshot doc, {required bool showMeta}) {
     final data = doc.data() as Map<String, dynamic>;
     final isMe = data['senderId'] == FirebaseAuth.instance.currentUser!.uid;
     final type = (data['type'] ?? 'text') as String;
@@ -1792,12 +2046,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       text = _encReady ? _enc.decrypt(text) : '🔒 Decrypting…';
     }
 
+    // WHATSAPP-STYLE MULTI-SELECT: once selection mode is active (any
+    // message already selected), a plain TAP on any other message toggles
+    // it in/out of the selection too — no need to long-press each one.
+    // Long-press still works to both start selection mode and toggle.
+    final selectionMode = _selectedMessageIds.isNotEmpty;
+    void toggleSelected() => setState(() {
+      _selectedMessageIds.contains(doc.id)
+          ? _selectedMessageIds.remove(doc.id)
+          : _selectedMessageIds.add(doc.id);
+    });
+
     return GestureDetector(
-      onLongPress: () => setState(() {
-        _selectedMessageIds.contains(doc.id)
-            ? _selectedMessageIds.remove(doc.id)
-            : _selectedMessageIds.add(doc.id);
-      }),
+      onLongPress: toggleSelected,
+      onTap: selectionMode ? toggleSelected : null,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         color: selected ? _purple.withOpacity(0.12) : Colors.transparent,
@@ -1829,22 +2091,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     bottomLeft: Radius.circular(isMe ? 18 : 4),
                     bottomRight: Radius.circular(isMe ? 4 : 18),
                   ),
-                  child: _messageWidget(type, text, fileUrl, extra, isMe),
+                  // While selecting, absorb taps on the media/text content
+                  // itself (image open, video open, audio play, location
+                  // launch) so a tap here toggles selection instead of
+                  // triggering that content's own action.
+                  child: AbsorbPointer(
+                    absorbing: selectionMode,
+                    child: _messageWidget(type, text, fileUrl, extra, isMe),
+                  ),
                 ),
               ),
-              const SizedBox(height: 3),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // FIX (bug 3): removed the small lock icon that used to
-                  // render next to the timestamp for encrypted text
-                  // messages. `encrypted` is still used above to decide
-                  // whether to decrypt the text — it's just no longer
-                  // shown as an icon here.
-                  Text(time, style: TextStyle(fontSize: 11, color: Colors.grey[500])),
-                  if (isMe) ...[const SizedBox(width: 4), _buildTick(status)],
-                ],
-              ),
+              // WHATSAPP-STYLE GROUPING: only render the time/tick row when
+              // this is the last bubble in a same-sender burst (showMeta).
+              // Mid-burst bubbles get a small spacer instead, so consecutive
+              // messages sit tighter together, like WhatsApp.
+              if (showMeta) ...[
+                const SizedBox(height: 3),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // FIX (bug 3): removed the small lock icon that used to
+                    // render next to the timestamp for encrypted text
+                    // messages. `encrypted` is still used above to decide
+                    // whether to decrypt the text — it's just no longer
+                    // shown as an icon here.
+                    Text(time, style: TextStyle(fontSize: 11, color: Colors.grey[500])),
+                    if (isMe) ...[const SizedBox(width: 4), _buildTick(status)],
+                  ],
+                ),
+              ] else
+                const SizedBox(height: 2),
             ],
           ),
         ),
@@ -1937,6 +2213,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       case 'audio':
         final isThisTrack = _currentlyPlayingUrl == fileUrl;
         final isThisPlaying = isThisTrack && _isPlaying;
+        final isConnecting = _connectingAudioUrl == fileUrl;
         final waveWidth = _isSmall ? 90.0 : 120.0;
 
         final storedMs = extra['durationMs'] as int?;
@@ -1963,12 +2240,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             mainAxisSize: MainAxisSize.min,
             children: [
               GestureDetector(
-                onTap: () => _toggleAudio(fileUrl),
+                // FIX (voice messages): disable the tap target while we're
+                // still connecting to the stream, instead of letting a
+                // second tap re-enter _toggleAudio and race the first call.
+                onTap: isConnecting ? null : () => _toggleAudio(fileUrl),
                 child: Container(
                   width: 40, height: 40,
                   decoration: BoxDecoration(
                       color: isMe ? Colors.white24 : _lightPurple, shape: BoxShape.circle),
-                  child: Icon(isThisPlaying ? Icons.pause : Icons.play_arrow,
+                  child: isConnecting
+                      ? Padding(
+                    padding: const EdgeInsets.all(11),
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: isMe ? Colors.white : _purple),
+                  )
+                      : Icon(isThisPlaying ? Icons.pause : Icons.play_arrow,
                       color: isMe ? Colors.white : _purple, size: 24),
                 ),
               ),
@@ -2115,6 +2401,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   // ── Input bar ─────────────────────────────────────────────────────────────
+  // CHANGED (WhatsApp-style layout): the "+" attach button and the camera
+  // shortcut now both live INSIDE the rounded message field itself (left
+  // and right respectively), instead of the "+" sitting outside the field.
+  // The outer circular button on the far right stays mic/send only.
   Widget _buildInputBar() {
     return Container(
       padding: EdgeInsets.only(
@@ -2130,28 +2420,45 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          IconButton(
-            icon: const Icon(Icons.add_circle_outline, color: _purple),
-            onPressed: _showAttachOptions,
-            padding: const EdgeInsets.all(8),
-          ),
           Expanded(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14),
               decoration: BoxDecoration(
                 color: const Color(0xFFF5F5F5),
                 borderRadius: BorderRadius.circular(26),
               ),
-              child: TextField(
-                controller: _messageController,
-                decoration: const InputDecoration(
-                  hintText: 'Message',
-                  border: InputBorder.none,
-                  contentPadding: EdgeInsets.symmetric(vertical: 10),
-                ),
-                minLines: 1,
-                maxLines: 5,
-                textCapitalization: TextCapitalization.sentences,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  // "+" attach button — now inside the field, on the left.
+                  IconButton(
+                    icon: const Icon(Icons.add_circle_outline, color: _purple),
+                    onPressed: _showAttachOptions,
+                    padding: const EdgeInsets.all(8),
+                    constraints: const BoxConstraints(),
+                  ),
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      decoration: const InputDecoration(
+                        hintText: 'Message',
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      minLines: 1,
+                      maxLines: 5,
+                      textCapitalization: TextCapitalization.sentences,
+                    ),
+                  ),
+                  // Camera shortcut — inside the field, on the right, opens
+                  // the camera directly (same path as the attach-sheet's
+                  // Camera option) without needing to open the sheet first.
+                  IconButton(
+                    icon: const Icon(Icons.camera_alt_outlined, color: _purple),
+                    onPressed: () => _pickMedia(fromCamera: true),
+                    padding: const EdgeInsets.all(8),
+                    constraints: const BoxConstraints(),
+                  ),
+                ],
               ),
             ),
           ),
@@ -2160,9 +2467,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             valueListenable: _messageController,
             builder: (_, value, __) {
               final hasText = value.text.trim().isNotEmpty;
+              // CHANGED: voice recording now starts on a normal TAP
+              // (previously onLongPress) — see _startRecording().
               return GestureDetector(
-                onTap: hasText ? _sendText : null,
-                onLongPress: hasText ? null : _startRecording,
+                onTap: hasText ? _sendText : _startRecording,
                 child: Container(
                   width: 44, height: 44,
                   decoration: const BoxDecoration(color: _purple, shape: BoxShape.circle),
@@ -2248,10 +2556,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceAround,
                   children: [
-                    _attachOption(Icons.camera_alt, 'Camera', Colors.pink, () {
-                      Navigator.pop(context);
-                      _pickMedia(fromCamera: true);
-                    }),
                     _attachOption(Icons.photo, 'Gallery', Colors.purple, () {
                       Navigator.pop(context);
                       _pickMedia(fromCamera: false);
@@ -2296,6 +2600,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+// ── Optimistic upload tracking ────────────────────────────────────────────────
+class _PendingUpload {
+  final String id;
+  final File file;
+  final String type; // image | video | audio
+  final Map<String, dynamic>? extra;
+  double progress;
+  bool failed;
+
+  _PendingUpload({
+    required this.id,
+    required this.file,
+    required this.type,
+    this.extra,
+    this.progress = 0.0,
+    this.failed = false,
+  });
 }
 
 // ── Background pattern painter ────────────────────────────────────────────────

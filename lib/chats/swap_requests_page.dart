@@ -1042,33 +1042,57 @@ class _SwapRequestsPageState extends State<SwapRequestsPage>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              width: 84,
-              height: 84,
-              decoration: BoxDecoration(
-                color: accent.withOpacity(0.08),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(icon, size: 36, color: accent.withOpacity(0.7)),
+            // Layered tinted badge — soft outer ring + solid inner
+            // circle, matching the empty-state pattern used across
+            // chats/wishlist/payments/listings/support.
+            Stack(
+              alignment: Alignment.center,
+              children: [
+                Container(
+                  width: 128,
+                  height: 128,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.06),
+                  ),
+                ),
+                Container(
+                  width: 92,
+                  height: 92,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.10),
+                  ),
+                ),
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.14),
+                  ),
+                  child: Icon(icon, size: 30, color: accent),
+                ),
+              ],
             ),
-            const SizedBox(height: 18),
+            const SizedBox(height: 24),
             Text(
               title,
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: _T.textDark,
-                fontSize: 15,
+                fontSize: 17,
                 fontWeight: FontWeight.w700,
               ),
             ),
             if (subtitle != null) ...[
-              const SizedBox(height: 6),
+              const SizedBox(height: 8),
               Text(
                 subtitle,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: Colors.grey[500],
-                  fontSize: 12.5,
+                  fontSize: 13.5,
                   height: 1.4,
                 ),
               ),

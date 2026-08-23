@@ -150,7 +150,7 @@ class _StartingPageState extends State<StartingPage>
 
                   // ── Illustration ────────────────────────────────────────
                   Image.asset(
-                    'assets/images/boxes.svg',
+                    'assets/images/boxes.png',
                     width: imageWidth,
                     fit: BoxFit.contain,
                   ),

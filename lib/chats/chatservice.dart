@@ -185,7 +185,13 @@ class ChatService {
   }
 
   Stream<QuerySnapshot> getUserChats() {
-    final user = _auth.currentUser!;
+    final user = _auth.currentUser;
+    if (user == null) {
+      // Not authenticated yet (or mid-logout) — return an empty stream
+      // instead of crashing. The page will just show "no chats" until
+      // the user rebuilds after auth is restored.
+      return const Stream.empty();
+    }
     return _firestore
         .collection('chats')
         .where('participants', arrayContains: user.uid)

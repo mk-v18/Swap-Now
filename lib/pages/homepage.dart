@@ -932,10 +932,10 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// Bell icon with an unread-count badge, sourced from
+  /// Bell icon with a small unread dot, sourced from
   /// `users/{uid}/notifications` (see NotificationsPage). Mirrors
-  /// `_iconBtn`'s look, but uses a Material icon (no bell asset exists yet)
-  /// and overlays the live unread count.
+  /// `_iconBtn`'s look, now using the notification SVG asset instead of a
+  /// Material icon, and a plain dot instead of a numeric badge.
   Widget _notificationBell(BuildContext context) {
     final size = _BP.iconBtnSize(context);
     final user = FirebaseAuth.instance.currentUser;
@@ -952,8 +952,15 @@ class _HomePageState extends State<HomePage> {
           MaterialPageRoute(builder: (_) => const NotificationsPage()),
         ),
         child: _circleIcon(
-          Icon(Icons.notifications_none_rounded,
-              size: size + 2, color: _kPrimaryDark),
+          SvgPicture.asset(
+            'assets/icons/notification.svg', // ← update to your actual asset path
+            width: size,
+            height: size,
+            colorFilter: const ColorFilter.mode(
+              _kPrimaryDark,
+              BlendMode.srcIn,
+            ),
+          ),
         ),
       ),
     );
@@ -965,8 +972,8 @@ class _HomePageState extends State<HomePage> {
       children: [
         button,
         Positioned(
-          top: -2,
-          right: -2,
+          top: 2,
+          right: 2,
           child: StreamBuilder<QuerySnapshot>(
             stream: FirebaseFirestore.instance
                 .collection('users')
@@ -975,34 +982,24 @@ class _HomePageState extends State<HomePage> {
                 .where('read', isEqualTo: false)
                 .snapshots(),
             builder: (context, snap) {
-              // Excludes chat notifications from the count, matching what
-              // NotificationsPage itself shows (see _kNonChatTypes there).
-              final count = (snap.data?.docs ?? []).where((d) {
+              // Same filtering as before — chat notifications don't count
+              // toward the indicator, matching NotificationsPage's inbox.
+              final hasUnread = (snap.data?.docs ?? []).any((d) {
                 final data = d.data() as Map<String, dynamic>? ?? {};
                 final routeData = (data['data'] is Map)
                     ? Map<String, dynamic>.from(data['data'] as Map)
                     : <String, dynamic>{};
                 return _kNonChatNotificationTypes
                     .contains(routeData['type'] as String? ?? 'text');
-              }).length;
-              if (count == 0) return const SizedBox.shrink();
+              });
+              if (!hasUnread) return const SizedBox.shrink();
               return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+                width: 10,
+                height: 10,
                 decoration: BoxDecoration(
                   color: const Color(0xFFE53935),
-                  borderRadius: BorderRadius.circular(9),
+                  shape: BoxShape.circle,
                   border: Border.all(color: Colors.white, width: 1.5),
-                ),
-                alignment: Alignment.center,
-                child: Text(
-                  count > 9 ? '9+' : '$count',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    height: 1,
-                  ),
                 ),
               );
             },
@@ -1407,7 +1404,32 @@ class _HomePageState extends State<HomePage> {
 
         return SliverMainAxisGroup(
           slivers: [
-            if (nearby.isNotEmpty) _buildGridSliver(context, nearby),
+            // If there are no items within the nearby (0-15km) bucket,
+            // show a small inline "No nearby items found" note instead of
+            // silently skipping straight to "Around You" — otherwise the
+            // section just vanishes with no explanation. Only reached when
+            // midRange isn't empty either (the combined empty case is
+            // handled above), so this never appears alongside a fully
+            // empty screen.
+            if (nearby.isNotEmpty)
+              _buildGridSliver(context, nearby)
+            else
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: _BP.hPad(context),
+                    vertical: 16,
+                  ),
+                  child: Text(
+                    "No nearby items found",
+                    style: TextStyle(
+                      fontSize: _BP.fontSize(context, 13),
+                      fontWeight: FontWeight.w500,
+                      color: Colors.grey[600],
+                    ),
+                  ),
+                ),
+              ),
             if (midRange.isNotEmpty) ...[
               SliverToBoxAdapter(
                 child: Padding(

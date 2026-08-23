@@ -6,7 +6,7 @@ import 'package:amoeba/start/privacy_policy.dart';
 import 'package:amoeba/start/terms_of_use.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart'; // DEBUG: needed for debugPrint
+import 'package:flutter/foundation.dart'; // kDebugMode + debugPrint
 import 'package:flutter/services.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_svg/flutter_svg.dart';
@@ -28,39 +28,39 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   static const _purpleShadow    = Color(0x4D5800B3); // ~30% opacity
   static const _purpleBoxShadow = Color(0x0F5800B3); // ~6%  opacity
 
-  // DEBUG(internal-testing): when true, the app prints the raw
-  // FirebaseAuthException (code + message) to the console via debugPrint
-  // AND shows that raw text in the error snackbar instead of the friendly
-  // copy from `_friendlyError`. Flip this back to `false` before shipping
-  // — that's the only change needed to restore user-facing friendly
-  // messages; `_friendlyError` itself is untouched below.
-  static const bool _debugShowExactErrors = true;
+  // In debug builds, error snacks show the exact FirebaseAuth/Firestore
+  // code + message (handy while testing). In release builds users only
+  // ever see the friendly copy from `_friendlyError`. The raw error is
+  // ALWAYS logged via debugPrint regardless of build mode, so nothing is
+  // lost for reading logs off a release build. Tied to `kDebugMode` so
+  // there's no flag to remember to flip before shipping.
+  static bool get _showExactErrors => kDebugMode;
 
-  // FIX(perf): compiled once instead of on every call to _sendOtp /
-  // _fillBoxesVisually (each of which can fire multiple times per OTP flow).
+  // Network-facing operations get a hard timeout so a slow/stalled
+  // connection fails fast with a clear message instead of leaving the
+  // user staring at a spinner indefinitely.
+  static const Duration _signInTimeout   = Duration(seconds: 15);
+  static const Duration _firestoreTimeout = Duration(seconds: 10);
+
+  // Compiled once instead of on every call to _sendOtp / _fillBoxesVisually
+  // (each of which can fire multiple times per OTP flow).
   static final RegExp _nonDigits = RegExp(r'\D');
 
   // ── Firebase ──────────────────────────────────────────────────────────────
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
-  // REMOVED — the otp_autofill `OTPInteractor` / SMS User Consent listener
-  // was removed on purpose. It registers its own broadcast receiver for the
-  // Android `SMS_RETRIEVED` action. FirebaseAuth.verifyPhoneNumber() *also*
-  // auto-registers its own receiver for that exact same broadcast action
-  // internally (that's what powers `verificationCompleted` below). Having
-  // both listeners alive at once means Firebase Auth's own closed-source
-  // receiver (`zzafy`) can receive the User-Consent-flavored broadcast (the
-  // one that fires after the "Allow app to read this message?" dialog) and
-  // crash with a NullPointerException, because it expects Retriever-API
-  // extras, not Consent-API extras. That crash killed the whole process,
-  // which is why the debugger showed "Lost connection to device."
-  //
-  // Now that the release SHA-256 fingerprint is registered in the Firebase
-  // console, Firebase's own built-in auto-retrieval (SMS Retriever API)
-  // works on its own — the SMS Firebase's backend sends already contains
-  // the app hash it needs. `verificationCompleted` below fires automatically
-  // once that SMS arrives, with `credential.smsCode` already populated —
-  // no permission dialog, no second receiver, no crash.
+  // NOTE: the otp_autofill `OTPInteractor` / SMS User Consent listener was
+  // intentionally left out. It registers its own broadcast receiver for the
+  // Android `SMS_RETRIEVED` action, and FirebaseAuth.verifyPhoneNumber()
+  // already auto-registers its own receiver for that same action internally
+  // (that's what powers `verificationCompleted` below). Running both at once
+  // let Firebase Auth's closed-source receiver pick up the User-Consent
+  // flavored broadcast and crash with a NullPointerException (Consent-API
+  // extras where it expected Retriever-API extras). Now that the release
+  // SHA-256 fingerprint is registered in the Firebase console, Firebase's
+  // built-in SMS Retriever auto-retrieval works on its own —
+  // `verificationCompleted` fires automatically with `credential.smsCode`
+  // already populated, no permission dialog, no second receiver, no crash.
 
   // ── Controllers / nodes ───────────────────────────────────────────────────
   final TextEditingController _phoneController = TextEditingController();
@@ -82,25 +82,23 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   int?   _resendToken;
   Timer? _resendTimer;
 
-  // FIX(perf): This used to be a plain int updated via setState() every
-  // second from the resend-cooldown Timer, which reran the ENTIRE page
-  // build() (MediaQuery reads, layout math, hero image, every text widget)
-  // once a second for up to 30 seconds after every OTP send. Now it's a
-  // ValueNotifier so only the tiny "Resend OTP in Ns" text rebuilds.
+  // ValueNotifier instead of a plain int updated via setState() every
+  // second — only the tiny "Resend OTP in Ns" text rebuilds, not the whole
+  // page (MediaQuery reads, layout math, hero image, every text widget).
   final ValueNotifier<int> _resendCooldownNotifier = ValueNotifier<int>(0);
 
   bool _verificationInFlight = false;
 
-  // FIX(reliability + perf): Single source of truth for the joined code,
-  // updated by ONE listener attached to all 6 controllers. Any UI that needs
-  // the live code (verify button, "all digits entered" badge) listens to
-  // this instead of the whole page rebuilding via setState.
+  // Single source of truth for the joined code, updated by ONE listener
+  // attached to all 6 controllers. Any UI that needs the live code (verify
+  // button, "all digits entered" badge) listens to this instead of the
+  // whole page rebuilding via setState.
   final ValueNotifier<String> _codeNotifier = ValueNotifier<String>('');
 
-  // FIX(reliability): Prevents re-triggering verification for the exact same
-  // 6-digit code repeatedly (e.g. redundant notifications), while still
-  // allowing a fresh attempt if the user edits and re-enters the same digits
-  // after a failure (cleared on failure below).
+  // Prevents re-triggering verification for the exact same 6-digit code
+  // repeatedly (e.g. redundant notifications), while still allowing a
+  // fresh attempt if the user edits and re-enters the same digits after a
+  // failure (cleared on failure below).
   String _lastAttemptedCode = '';
 
   // ── Animation ─────────────────────────────────────────────────────────────
@@ -136,11 +134,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         );
       };
 
-    // FIX(reliability + perf): This fires no matter HOW a controller's text
-    // changed — typed, pasted, or programmatically set via
-    // `_fillBoxesVisually` (SMS autofill / platform autofill / paste). That
-    // means auto-verify now works uniformly for every input path, instead of
-    // being wired separately (and inconsistently) into each one.
+    // Fires no matter HOW a controller's text changed — typed, pasted, or
+    // programmatically set via `_fillBoxesVisually` (SMS autofill /
+    // platform autofill / paste). Auto-verify works uniformly for every
+    // input path instead of being wired separately into each one.
     for (final c in _otpControllers) {
       c.addListener(_onOtpTextChanged);
     }
@@ -198,25 +195,37 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         return 'This account has been disabled. Contact support.';
       case 'operation-not-allowed':
         return 'Phone sign-in is not enabled. Contact support.';
+      case 'app-not-authorized':
+      case 'missing-client-identifier':
+        return 'This app is not authorized for phone sign-in right now. Please try again later.';
+      case 'web-context-cancelled':
+        return 'Verification was cancelled. Please try again.';
       default:
         return 'Something went wrong. Please try again.';
     }
   }
 
-  // DEBUG(internal-testing): Central place that decides what a FirebaseAuth
-  // error shows as. Always logs the raw code+message via debugPrint (so it
-  // shows up in `flutter run` / `adb logcat` regardless of the flag), and
-  // returns either the raw text or the friendly copy depending on
-  // `_debugShowExactErrors`. To go back to friendly-only in production,
-  // set `_debugShowExactErrors = false` above — nothing else needs to change.
+  // Central place that decides what a FirebaseAuth error shows as. Always
+  // logs the raw code+message via debugPrint (so it shows up in
+  // `flutter run` / `adb logcat` in any build), and returns either the raw
+  // text or the friendly copy depending on `_showExactErrors`.
   String _resolveAuthError(FirebaseAuthException e) {
     debugPrint(
         '[OTP][FirebaseAuthException] code=${e.code} message=${e.message} '
             'plugin=${e.plugin}');
-    if (_debugShowExactErrors) {
+    if (_showExactErrors) {
       return '[${e.code}] ${e.message ?? 'no message'}';
     }
     return _friendlyError(e.code);
+  }
+
+  // Firestore and other platform failures (e.g. permission-denied,
+  // unavailable) don't carry the same `.code` vocabulary as auth errors, so
+  // they get a generic — but still logged and still fast to fail — message.
+  String _resolveGenericError(Object e, StackTrace st, {required String context}) {
+    debugPrint('[OTP][$context] $e\n$st');
+    if (_showExactErrors) return 'Error: $e';
+    return 'Something went wrong. Please try again.';
   }
 
   // ── Snack helpers ─────────────────────────────────────────────────────────
@@ -264,11 +273,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         behavior:        SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
         margin:   const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        // DEBUG(internal-testing): exact-error messages can run long
-        // (code + full Firebase message), so give them more time on screen
-        // than the normal 3s. Purely cosmetic — safe to leave as-is even
-        // after flipping `_debugShowExactErrors` back to false.
-        duration: Duration(seconds: _debugShowExactErrors ? 6 : 3),
+        // Exact-error messages can run long (code + full Firebase message),
+        // so give them more time on screen than the normal 3s.
+        duration: Duration(seconds: _showExactErrors ? 6 : 3),
       ));
   }
 
@@ -292,10 +299,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     TextInput.finishAutofillContext();
   }
 
-  // FIX(perf): Ticks a ValueNotifier instead of calling setState() every
-  // second. Previously this rebuilt the entire page (MediaQuery lookups,
+  // Ticks a ValueNotifier instead of calling setState() every second.
+  // setState() here would rebuild the entire page (MediaQuery lookups,
   // layout math, hero image, all text) once a second for up to 30 seconds
-  // straight — by far the biggest perf cost in this screen.
+  // straight after every OTP send.
   void _startResendTimer() {
     _resendCooldownNotifier.value = 30;
     _resendTimer?.cancel();
@@ -316,15 +323,21 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   Future<void> _saveFCMToken(String uid) async {
     try {
-      final token = await FirebaseMessaging.instance.getToken();
+      final token = await FirebaseMessaging.instance
+          .getToken()
+          .timeout(_firestoreTimeout);
       if (token != null) {
         await FirebaseFirestore.instance
             .collection('users')
             .doc(uid)
-            .update({'fcmToken': token});
+            .update({'fcmToken': token})
+            .timeout(_firestoreTimeout);
       }
-    } catch (_) {
-      // Non-critical — silently ignore.
+    } catch (e, st) {
+      // Non-critical — the user is already signed in at this point, so a
+      // failure here should never block or interrupt the sign-in flow.
+      // Still logged so a missing token isn't a silent mystery later.
+      debugPrint('[OTP][SaveFCMTokenFailed] $e\n$st');
     }
   }
 
@@ -336,6 +349,8 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
   // ── Send OTP ──────────────────────────────────────────────────────────────
   Future<void> _sendOtp({bool isResend = false}) async {
+    if (_isSendingOtp) return; // guard against double-tap races
+
     final phone = _phoneController.text.trim().replaceAll(_nonDigits, '');
 
     if (!_isValidIndianNumber(phone)) {
@@ -345,70 +360,88 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     if (!mounted) return;
     setState(() => _isSendingOtp = true);
 
-    await _auth.verifyPhoneNumber(
-      phoneNumber:         '+91$phone',
-      forceResendingToken: isResend ? _resendToken : null,
-      timeout:             const Duration(seconds: 60),
+    // verifyPhoneNumber() itself can throw synchronously (e.g. no network,
+    // Play Integrity / App Check misconfiguration) before either callback
+    // ever fires. Without this try/catch that leaves `_isSendingOtp` stuck
+    // `true` forever and the user sees a dead "Continue" button with no
+    // explanation.
+    try {
+      await _auth.verifyPhoneNumber(
+        phoneNumber:         '+91$phone',
+        forceResendingToken: isResend ? _resendToken : null,
+        timeout:             const Duration(seconds: 60),
 
-      // This fires automatically the moment Firebase's own SMS Retriever
-      // detects the incoming OTP SMS (now that the release SHA-256 is
-      // registered) — no dialog, no extra permission, no second receiver.
-      verificationCompleted: (PhoneAuthCredential credential) async {
-        if (!mounted) return;
+        // Fires automatically the moment Firebase's own SMS Retriever
+        // detects the incoming OTP SMS (release SHA-256 is registered) —
+        // no dialog, no extra permission, no second receiver.
+        verificationCompleted: (PhoneAuthCredential credential) async {
+          if (!mounted) return;
 
-        if (!_otpSent) {
+          if (!_otpSent) {
+            setState(() {
+              _otpSent      = true;
+              _isSendingOtp = false;
+            });
+            _slideCtrl.forward();
+          } else {
+            setState(() => _isSendingOtp = false);
+          }
+
+          if (!mounted) return;
+
+          final smsCode = credential.smsCode;
+          if (smsCode != null && smsCode.length == 6) {
+            // This alone is enough — filling the boxes fires
+            // `_onOtpTextChanged` for the 6th box, which schedules
+            // `_verifyOtp()` on the next frame. Calling
+            // `_signInWithCredential` again immediately after is a no-op
+            // (guarded by `_verificationInFlight`), kept only as a
+            // fallback in case autofill listener wiring ever changes —
+            // no artificial delay needed for either path.
+            _fillBoxesVisually(smsCode);
+          }
+
+          if (mounted) await _signInWithCredential(credential);
+        },
+
+        verificationFailed: (FirebaseAuthException e) {
+          if (!mounted) return;
+          setState(() => _isSendingOtp = false);
+          _showErrorSnack(_resolveAuthError(e));
+        },
+
+        codeSent: (String verificationId, int? resendToken) {
+          if (!mounted) return;
           setState(() {
-            _otpSent      = true;
-            _isSendingOtp = false;
+            _verificationId = verificationId;
+            _resendToken    = resendToken;
+            _otpSent        = true;
+            _isSendingOtp   = false;
           });
           _slideCtrl.forward();
-          await Future.delayed(const Duration(milliseconds: 100));
-        } else {
-          if (mounted) setState(() => _isSendingOtp = false);
-        }
+          _startResendTimer();
+          _showSuccessSnack('OTP sent to +91 $phone');
+          Future.delayed(
+            const Duration(milliseconds: 320), // matches slide-in duration
+                () {
+              if (mounted) _focusNodes[0].requestFocus();
+            },
+          );
+        },
 
-        if (!mounted) return;
-
-        final smsCode = credential.smsCode;
-        if (smsCode != null && smsCode.length == 6) {
-          _fillBoxesVisually(smsCode);
-          await Future.delayed(const Duration(milliseconds: 300));
-        }
-
-        if (mounted) await _signInWithCredential(credential);
-      },
-
-      verificationFailed: (FirebaseAuthException e) {
-        if (!mounted) return;
-        setState(() => _isSendingOtp = false);
-        // DEBUG(internal-testing): routed through _resolveAuthError so this
-        // shows the exact code/message during testing; see flag above.
-        _showErrorSnack(_resolveAuthError(e));
-      },
-
-      codeSent: (String verificationId, int? resendToken) {
-        if (!mounted) return;
-        setState(() {
-          _verificationId = verificationId;
-          _resendToken    = resendToken;
-          _otpSent        = true;
-          _isSendingOtp   = false;
-        });
-        _slideCtrl.forward();
-        _startResendTimer();
-        _showSuccessSnack('OTP sent to +91 $phone');
-        Future.delayed(
-          const Duration(milliseconds: 350),
-              () {
-            if (mounted) _focusNodes[0].requestFocus();
-          },
-        );
-      },
-
-      codeAutoRetrievalTimeout: (String verificationId) {
-        if (mounted) _verificationId = verificationId;
-      },
-    );
+        codeAutoRetrievalTimeout: (String verificationId) {
+          if (mounted) _verificationId = verificationId;
+        },
+      );
+    } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
+      setState(() => _isSendingOtp = false);
+      _showErrorSnack(_resolveAuthError(e));
+    } catch (e, st) {
+      if (!mounted) return;
+      setState(() => _isSendingOtp = false);
+      _showErrorSnack(_resolveGenericError(e, st, context: 'SendOtpException'));
+    }
   }
 
   // ── Verify OTP ────────────────────────────────────────────────────────────
@@ -437,16 +470,19 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     setState(() => _isVerifying = true);
 
     try {
-      final userCredential =
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      final userCredential = await FirebaseAuth.instance
+          .signInWithCredential(credential)
+          .timeout(_signInTimeout);
       final user = userCredential.user;
       if (user == null || !mounted) return;
 
+      // Fire-and-forget — never let a token save delay navigation, and
+      // never let it fail the sign-in flow (see try/catch inside).
       _saveFCMToken(user.uid);
 
       final userRef =
       FirebaseFirestore.instance.collection('users').doc(user.uid);
-      final doc = await userRef.get();
+      final doc = await userRef.get().timeout(_firestoreTimeout);
       if (!mounted) return;
 
       if (doc.exists) {
@@ -459,7 +495,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
           'uid':       user.uid,
           'phone':     user.phoneNumber,
           'createdAt': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
+        }, SetOptions(merge: true)).timeout(_firestoreTimeout);
 
         if (!mounted) return;
 
@@ -471,33 +507,34 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
       _verificationId = '';
     } on FirebaseAuthException catch (e) {
-      // FIX(reliability): Allow retrying the same code after a failure
-      // (e.g. user was mid-typing when an auto-verify attempt failed, or
-      // wants to resubmit) instead of it being silently blocked forever.
+      // Allow retrying the same code after a failure (e.g. user was
+      // mid-typing when an auto-verify attempt failed, or wants to
+      // resubmit) instead of it being silently blocked forever.
       _lastAttemptedCode = '';
-      // DEBUG(internal-testing): routed through _resolveAuthError so this
-      // shows the exact code/message during testing; see flag above.
       if (mounted) _showErrorSnack(_resolveAuthError(e));
-    } on TimeoutException catch (e) {
+    } on TimeoutException catch (e, st) {
       _lastAttemptedCode = '';
-      // DEBUG(internal-testing): log the raw timeout too, so a hung
-      // verification is distinguishable from a slow-but-alive one in logs.
-      debugPrint('[OTP][TimeoutException] $e');
+      debugPrint('[OTP][TimeoutException] $e\n$st');
       if (mounted) {
-        _showErrorSnack(_debugShowExactErrors
+        _showErrorSnack(_showExactErrors
             ? 'Timeout: $e'
-            : 'Request timed out. Please check your connection.');
+            : 'This is taking longer than expected. Please check your connection and try again.');
+      }
+    } on FirebaseException catch (e, st) {
+      // Firestore-specific failures (permission-denied, unavailable,
+      // etc.) — distinct from auth failures so the log makes it obvious
+      // which layer broke.
+      _lastAttemptedCode = '';
+      debugPrint('[OTP][FirestoreException] code=${e.code} message=${e.message}');
+      if (mounted) {
+        _showErrorSnack(_showExactErrors
+            ? '[${e.code}] ${e.message ?? 'no message'}'
+            : 'Signed in, but we could not finish setting up your account. Please try again.');
       }
     } catch (e, st) {
       _lastAttemptedCode = '';
-      // DEBUG(internal-testing): catch-all — logs type + stack so an
-      // unexpected exception shape (not FirebaseAuthException) is still
-      // visible during testing instead of collapsing into a generic snack.
-      debugPrint('[OTP][UnhandledException] $e\n$st');
       if (mounted) {
-        _showErrorSnack(_debugShowExactErrors
-            ? 'Error: $e'
-            : 'Something went wrong. Please try again.');
+        _showErrorSnack(_resolveGenericError(e, st, context: 'UnhandledException'));
       }
     } finally {
       _verificationInFlight = false;
@@ -528,9 +565,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   }
 
   // ── OTP box widget ────────────────────────────────────────────────────────
-  // FIX(perf): Wrapped in AnimatedBuilder listening ONLY to this box's own
-  // controller. Typing a digit now only rebuilds this one small widget,
-  // instead of setState() rebuilding the entire page on every keystroke.
+  // Wrapped in AnimatedBuilder listening ONLY to this box's own controller.
+  // Typing a digit only rebuilds this one small widget, instead of
+  // setState() rebuilding the entire page on every keystroke.
   Widget _buildOtpBox(int index, double boxSize) {
     return SizedBox(
       width:  boxSize,
@@ -582,11 +619,11 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                     ? const Color(0xFFF5F0FF)
                     : Colors.white,
               ),
-              // FIX(reliability + perf): onChanged now ONLY handles focus
-              // movement and paste distribution — nothing else. Fill color
-              // is handled above via AnimatedBuilder, and auto-verify is
-              // handled centrally by `_onOtpTextChanged`, so this can never
-              // get out of sync with what the controllers actually contain.
+              // onChanged ONLY handles focus movement and paste
+              // distribution — nothing else. Fill color is handled above
+              // via AnimatedBuilder, and auto-verify is handled centrally
+              // by `_onOtpTextChanged`, so this can never get out of sync
+              // with what the controllers actually contain.
               onChanged: (value) {
                 if (value.length > 1) {
                   final digits = value.replaceAll(_nonDigits, '');
@@ -622,7 +659,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   // ── Build ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    // FIX(perf): Split MediaQuery.of(context) into scoped aspect accessors.
+    // Split MediaQuery.of(context) into scoped aspect accessors.
     // MediaQuery.of() ties this whole build() to EVERY MediaQuery field
     // (size, viewInsets, padding, textScale, gestureSettings, ...), so any
     // unrelated change (e.g. system text-scale, a padding tweak from a
@@ -632,7 +669,6 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     final screenW           = screenSize.width;
     final screenH           = screenSize.height;
     final viewInsetsBottom  = MediaQuery.viewInsetsOf(context).bottom;
-    final devicePixelRatio  = MediaQuery.devicePixelRatioOf(context);
 
     final hPad  = screenW < 380 ? 16.0 : 22.0;
     final heroH = screenH < 680
@@ -645,17 +681,13 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     final rawBoxW   = (otpTotalW - 5 * 8) / 6;
     final boxSize   = rawBoxW.clamp(36.0, 52.0);
 
-    // REMOVED: this used to short-circuit the whole build() with a
-    // full-screen "Verifying…" Scaffold whenever `_isVerifying` was true —
-    // swapping out the entire OTP page (boxes, header, everything) for a
-    // centered spinner the instant the 6th digit landed. That's jarring:
-    // the OTP boxes the user just filled in visibly vanish for however
-    // long sign-in + the Firestore user-doc lookup take. The Verify button
-    // below already renders its own inline spinner via `isLoading:
-    // _isVerifying` (see `_PurpleButton`), so "verifying" now stays
-    // anchored to that one spot instead of taking over the screen.
+    // Verification progress stays anchored to the Verify button's own
+    // inline spinner (`isLoading: _isVerifying`, see `_PurpleButton`)
+    // rather than swapping out the whole page for a full-screen spinner —
+    // the OTP boxes the user just filled in shouldn't visibly vanish while
+    // sign-in + the Firestore user-doc lookup are in flight.
     return Scaffold(
-      backgroundColor:          Colors.white,
+      backgroundColor:Colors.white,
       resizeToAvoidBottomInset: true,
       body: SafeArea(
         child: Column(
@@ -765,9 +797,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                                   FilteringTextInputFormatter.digitsOnly,
                                   LengthLimitingTextInputFormatter(10),
                                 ],
-                                // FIX(perf): No more setState() here — the
-                                // Continue button below listens to this
-                                // controller directly via AnimatedBuilder.
+                                // No setState() here — the Continue button
+                                // below listens to this controller directly
+                                // via AnimatedBuilder.
                                 style: const TextStyle(
                                     fontSize:      16,
                                     fontWeight:    FontWeight.w500,
@@ -789,9 +821,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
                       const SizedBox(height: 24),
 
-                      // FIX(perf): Only this button rebuilds as the phone
-                      // number is typed, via AnimatedBuilder on
-                      // _phoneController — not the whole page.
+                      // Only this button rebuilds as the phone number is
+                      // typed, via AnimatedBuilder on _phoneController —
+                      // not the whole page.
                       AnimatedBuilder(
                         animation: _phoneController,
                         builder: (context, _) => _PurpleButton(
@@ -864,12 +896,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                             ),
                             const SizedBox(height: 28),
 
-                            // FIX: OTP boxes are now disabled (not editable)
-                            // while verification is in flight, since the
-                            // full-screen takeover that used to make this
-                            // moot is gone — without this, a user could keep
-                            // editing digits while a sign-in request for the
-                            // previous code was still in the air.
+                            // OTP boxes are disabled (not editable) while
+                            // verification is in flight, so a user can't
+                            // keep editing digits while a sign-in request
+                            // for the previous code is still in the air.
                             AbsorbPointer(
                               absorbing: _isVerifying,
                               child: AutofillGroup(
@@ -884,9 +914,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
                             const SizedBox(height: 8),
 
-                            // FIX(perf): Only this small badge rebuilds as
-                            // digits are entered, via ValueListenableBuilder
-                            // on _codeNotifier.
+                            // Only this small badge rebuilds as digits are
+                            // entered, via ValueListenableBuilder on
+                            // _codeNotifier.
                             ValueListenableBuilder<String>(
                               valueListenable: _codeNotifier,
                               builder: (context, code, _) => AnimatedOpacity(
@@ -924,9 +954,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
                             const SizedBox(height: 20),
 
-                            // FIX(perf): This used to rebuild the whole page
-                            // every second via setState(). Now the tick is
-                            // isolated to just this small ValueListenableBuilder.
+                            // Isolated to just this small
+                            // ValueListenableBuilder instead of rebuilding
+                            // the whole page every second.
                             Center(
                               child: _isSendingOtp
                                   ? const SizedBox(

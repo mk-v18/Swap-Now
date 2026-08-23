@@ -387,34 +387,58 @@ class _EmptyState extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              width: 80,
-              height: 80,
-              decoration: BoxDecoration(
-                color: accent.withOpacity(0.08),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(icon, size: 34, color: accent.withOpacity(0.65)),
+            // Layered tinted badge — soft outer ring + solid inner
+            // circle, matching the empty-state pattern used across
+            // chats/wishlist/payments/listings/support.
+            Stack(
+              alignment: Alignment.center,
+              children: [
+                Container(
+                  width: 128,
+                  height: 128,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.06),
+                  ),
+                ),
+                Container(
+                  width: 92,
+                  height: 92,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.10),
+                  ),
+                ),
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.14),
+                  ),
+                  child: Icon(icon, size: 30, color: accent),
+                ),
+              ],
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 24),
             Text(
               title,
               textAlign: TextAlign.center,
               style: TextStyle(
-                fontSize: 14.5,
+                fontSize: 17,
                 fontWeight: FontWeight.w700,
-                color: Colors.grey.shade800,
+                color: accent,
               ),
             ),
             if (subtitle != null) ...[
-              const SizedBox(height: 6),
+              const SizedBox(height: 8),
               Text(
                 subtitle!,
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 12.5,
+                  fontSize: 13.5,
                   height: 1.4,
-                  color: Colors.grey.shade500,
+                  color: Colors.grey.shade600,
                 ),
               ),
             ],

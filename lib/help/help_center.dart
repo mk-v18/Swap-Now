@@ -811,34 +811,57 @@ class _CenteredMessage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final badgeSize = r.w(80);
     return Center(
       child: Padding(
         padding: EdgeInsets.symmetric(horizontal: r.w(32)),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              width: badgeSize,
-              height: badgeSize,
-              decoration: BoxDecoration(
-                color: accent.withOpacity(0.08),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(icon, size: r.w(34), color: accent.withOpacity(0.65)),
+            // Layered tinted badge — soft outer ring + solid inner
+            // circle, matching the empty-state pattern used across
+            // chats/wishlist/payments/listings/support.
+            Stack(
+              alignment: Alignment.center,
+              children: [
+                Container(
+                  width: r.w(128),
+                  height: r.w(128),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.06),
+                  ),
+                ),
+                Container(
+                  width: r.w(92),
+                  height: r.w(92),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.10),
+                  ),
+                ),
+                Container(
+                  width: r.w(64),
+                  height: r.w(64),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: accent.withOpacity(0.14),
+                  ),
+                  child: Icon(icon, size: r.w(30), color: accent),
+                ),
+              ],
             ),
-            SizedBox(height: r.h(16)),
+            SizedBox(height: r.h(24)),
             Text(
               title,
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: Colors.grey.shade800,
-                fontSize: r.sp(14.5),
+                fontSize: r.sp(17),
                 fontWeight: FontWeight.w700,
               ),
             ),
             if (subtitle != null) ...[
-              SizedBox(height: r.h(6)),
+              SizedBox(height: r.h(8)),
               Text(
                 subtitle!,
                 textAlign: TextAlign.center,

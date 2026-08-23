@@ -971,10 +971,13 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         backgroundColor: _kBg,
         elevation: 0,
         centerTitle: true,
-        leading: IconButton(
+        automaticallyImplyLeading: false, // don't auto-add a back arrow
+        leading: Navigator.canPop(context)
+            ? IconButton(
           icon: const Icon(Icons.arrow_back_ios, color: Colors.black, size: 18),
           onPressed: () => Navigator.pop(context),
-        ),
+        )
+            : null,
         title: Column(
           mainAxisSize: MainAxisSize.min,
           children: [

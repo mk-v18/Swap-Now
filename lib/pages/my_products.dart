@@ -269,18 +269,42 @@ class MyProductsPage extends StatelessWidget {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Container(
-                      width: iconSize + 40,
-                      height: iconSize + 40,
-                      decoration: BoxDecoration(
-                        color: accent.withOpacity(0.08),
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(
-                        Icons.inventory_2_outlined,
-                        size: iconSize * 0.5,
-                        color: accent.withOpacity(0.6),
-                      ),
+                    // Layered tinted badge — soft outer ring + solid inner
+                    // circle, matching the empty-state pattern used across
+                    // chats/wishlist/payments/listings/support.
+                    Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Container(
+                          width: iconSize + 56,
+                          height: iconSize + 56,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: accent.withOpacity(0.06),
+                          ),
+                        ),
+                        Container(
+                          width: iconSize + 36,
+                          height: iconSize + 36,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: accent.withOpacity(0.10),
+                          ),
+                        ),
+                        Container(
+                          width: iconSize + 20,
+                          height: iconSize + 20,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: accent.withOpacity(0.14),
+                          ),
+                          child: Icon(
+                            Icons.inventory_2_outlined,
+                            size: iconSize * 0.5,
+                            color: accent,
+                          ),
+                        ),
+                      ],
                     ),
                     SizedBox(height: isSmall ? 16 : 20),
                     Text(

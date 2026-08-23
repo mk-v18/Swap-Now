@@ -60,36 +60,60 @@ class ExchangeHistoryPage extends StatelessWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Container(
-                      width: 80,
-                      height: 80,
-                      decoration: BoxDecoration(
-                        color: _T.deepPurple.withOpacity(0.08),
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(
-                        Icons.history_rounded,
-                        size: 34,
-                        color: _T.deepPurple.withOpacity(0.65),
-                      ),
+                    // Layered tinted badge — soft outer ring + solid inner
+                    // circle, matching the empty-state pattern used across
+                    // chats/wishlist/payments/listings/support.
+                    Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Container(
+                          width: 128,
+                          height: 128,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _T.deepPurple.withOpacity(0.06),
+                          ),
+                        ),
+                        Container(
+                          width: 92,
+                          height: 92,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _T.deepPurple.withOpacity(0.10),
+                          ),
+                        ),
+                        Container(
+                          width: 64,
+                          height: 64,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _T.deepPurple.withOpacity(0.14),
+                          ),
+                          child: Icon(
+                            Icons.history_rounded,
+                            size: 30,
+                            color: _T.deepPurple,
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 24),
                     Text(
                       'No completed exchanges yet',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         color: Colors.grey[800],
-                        fontSize: 14.5,
+                        fontSize: 17,
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    const SizedBox(height: 6),
+                    const SizedBox(height: 8),
                     Text(
                       'Your finished swaps will be listed here',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         color: Colors.grey[500],
-                        fontSize: 12.5,
+                        fontSize: 13.5,
                         height: 1.4,
                       ),
                     ),
