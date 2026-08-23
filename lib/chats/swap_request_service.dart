@@ -244,6 +244,11 @@ class SwapRequestService {
         'type': 'swap',
         'listedProduct': data['listedProduct'],
         'swapProducts': data['offeredProducts'],
+        // Direction of the deal — without these the chat screen can't tell
+        // who asked for what, and ends up showing the same "wants X /
+        // offering Y" text to both sides regardless of which side they're on.
+        'fromUserId': fromUserId,
+        'toUserId': toUserId,
         'updatedAt': FieldValue.serverTimestamp(),
       }
     }, SetOptions(merge: true));

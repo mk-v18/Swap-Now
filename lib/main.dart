@@ -23,49 +23,38 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   debugPrint('[FCM] Background message: ${message.messageId}');
 }
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // FIX (white-screen root cause): Firebase.initializeApp() is a fast,
-  // local SDK init -- fine to await before runApp(). It's NOT the thing
-  // causing the 3-5s blank screen.
-  bool coreFirebaseFailed = false;
-  try {
-    await Firebase.initializeApp();
-    // Only needs Firebase.initializeApp() to have succeeded -- doesn't
-    // need to wait on AppCheck too, so it's registered right here.
-    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-  } catch (e) {
-    debugPrint('[SwapNow] Firebase.initializeApp failed: $e');
-    coreFirebaseFailed = true;
-  }
-
-  // FIX (white-screen root cause): FirebaseAppCheck.instance.activate() is
-  // a genuine network round trip -- Play Integrity on Android / DeviceCheck
-  // on iOS -- and used to be `await`-ed here, BEFORE runApp() was ever
-  // called. Flutter can't paint anything until runApp() runs, so for
-  // however long that attestation call took, the user was staring at the
-  // bare native launch background (plain white by default). That's almost
-  // certainly the 3-5s blank screen being reported.
+  // FIX (white-screen root cause, round 2): the earlier fix moved
+  // FirebaseAppCheck.activate() off the blocking path, but
+  // `await Firebase.initializeApp()` was still sitting BEFORE runApp().
+  // Nothing paints -- not even the splash animation -- until runApp()
+  // runs, so whatever the OS shows as its native launch background
+  // (plain white unless launch_background.xml / LaunchScreen.storyboard
+  // has been customized) is exactly what the user sees for however long
+  // Firebase.initializeApp() takes. That's the "still white for a long
+  // time" report: it happens BEFORE Flutter ever gets a chance to draw
+  // the purple splash screen, so none of the previous splash-side fixes
+  // touch it at all.
   //
-  // It's now fired without awaiting: it finishes in the background, hidden
-  // behind the splash screen's own ~4.5s on-screen animation instead of
-  // blocking the first frame. Nothing before this point needs an AppCheck
-  // token yet.
-  if (!coreFirebaseFailed) {
-    _activateAppCheck();
-  }
+  // Fix: start Firebase.initializeApp() but don't block on it here. Call
+  // runApp() immediately so the splash paints on the very first frame,
+  // and hand SplashScreen the in-flight Future so it can await it
+  // internally before touching anything that needs Firebase core to be
+  // ready (FirebaseAuth, Firestore).
+  final firebaseInit = Firebase.initializeApp();
 
-  // FIX (dead code): _StartupErrorApp was defined but never actually
-  // shown anywhere -- Firebase failures were swallowed and the app
-  // launched normally regardless, meaning a user whose Firebase truly
-  // failed to init would hit broken auth/Firestore calls further in with
-  // no explanation. Now it's actually used for that case.
-  runApp(
-    coreFirebaseFailed
-        ? const _StartupErrorApp()
-        : SwapNowApp(navigatorKey: navigatorKey),
-  );
+  firebaseInit.then((_) {
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+    _activateAppCheck();
+  }).catchError((e) {
+    debugPrint('[SwapNow] Firebase.initializeApp failed: $e');
+    // SplashScreen awaits this same future and shows its own retry UI --
+    // no separate navigation needed here.
+  });
+
+  runApp(SwapNowApp(navigatorKey: navigatorKey, firebaseInit: firebaseInit));
 
   _deferMediaKitInit();
   _deferAdsInit();
@@ -83,61 +72,6 @@ void _activateAppCheck() {
     // Non-fatal: app still works without AppCheck, just less protected.
     debugPrint('[SwapNow] AppCheck activation failed: $e');
   });
-}
-
-/// Shown only if Firebase.initializeApp() itself fails -- a rare, genuinely
-/// unrecoverable-without-retry scenario (e.g. device has no network on
-/// first cold start). Gives the user a way to retry instead of a broken
-/// app with silent Firebase failures downstream.
-class _StartupErrorApp extends StatelessWidget {
-  const _StartupErrorApp();
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        backgroundColor: Colors.white,
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.wifi_off_rounded,
-                    size: 56, color: Color(0xFF5800B3)),
-                const SizedBox(height: 20),
-                const Text(
-                  "Couldn't start SwapNow",
-                  style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.black87),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  "Please check your internet connection and try again.",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF5800B3),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 32, vertical: 14),
-                  ),
-                  onPressed: () => main(),
-                  child: const Text('Try again'),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 void _deferMediaKitInit() {
@@ -162,7 +96,12 @@ void _deferAdsInit() {
 
 class SwapNowApp extends StatelessWidget {
   final GlobalKey<NavigatorState> navigatorKey;
-  const SwapNowApp({super.key, required this.navigatorKey});
+  final Future<FirebaseApp> firebaseInit;
+  const SwapNowApp({
+    super.key,
+    required this.navigatorKey,
+    required this.firebaseInit,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -176,7 +115,10 @@ class SwapNowApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF6A0DAD)),
         useMaterial3: true,
       ),
-      home: SplashScreen(navigatorKey: navigatorKey),
+      // firebaseInit is now the source of truth for "is Firebase ready" --
+      // SplashScreen awaits it before touching FirebaseAuth/Firestore, and
+      // renders its own retry UI if it fails.
+      home: SplashScreen(navigatorKey: navigatorKey, firebaseInit: firebaseInit),
       onGenerateRoute: (settings) {
         if (settings.name == '/chat') {
           final args = settings.arguments as Map<String, dynamic>? ?? {};

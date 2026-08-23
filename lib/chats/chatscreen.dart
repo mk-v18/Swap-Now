@@ -257,10 +257,49 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           .doc(widget.chatId)
           .get();
       if (!mounted) return;
-      if (doc.exists) {
-        final intent = (doc.data() as Map<String, dynamic>)['intent'] as Map<String, dynamic>?;
-        if (intent != null) setState(() => _intent = intent);
+      if (!doc.exists) return;
+      var intent = (doc.data() as Map<String, dynamic>)['intent'] as Map<String, dynamic>?;
+      if (intent == null) return;
+
+      // Chats accepted before `fromUserId`/`toUserId` were added to `intent`
+      // (see swap_request_service.dart's acceptRequest) still show the same
+      // un-personalized "wants X / offering Y" text to both participants —
+      // this fix only applies going forward for new writes. Self-heal those
+      // older chats the first time either person opens them: look up the
+      // direction from the matching accepted swapRequests doc and patch it
+      // onto the chat, so this only ever has to run once per chat, from
+      // either side.
+      if (intent['type'] == 'swap' && intent['fromUserId'] == null) {
+        final myUid = FirebaseAuth.instance.currentUser?.uid;
+        if (myUid != null) {
+          final reqSnap = await FirebaseFirestore.instance
+              .collection('swapRequests')
+              .where('chatId', isEqualTo: widget.chatId)
+              .where('participants', arrayContains: myUid)
+              .where('status', isEqualTo: 'accepted')
+              .limit(1)
+              .get();
+          if (reqSnap.docs.isNotEmpty) {
+            final reqData = reqSnap.docs.first.data();
+            final fromUserId = reqData['fromUserId'] as String?;
+            final toUserId = reqData['toUserId'] as String?;
+            if (fromUserId != null && toUserId != null) {
+              intent = {...intent, 'fromUserId': fromUserId, 'toUserId': toUserId};
+              // Best-effort — don't block showing the banner on this write,
+              // and don't fail the load if it can't write for some reason.
+              unawaited(FirebaseFirestore.instance
+                  .collection('chats')
+                  .doc(widget.chatId)
+                  .set({
+                'intent': {'fromUserId': fromUserId, 'toUserId': toUserId}
+              }, SetOptions(merge: true))
+                  .catchError((_) {}));
+            }
+          }
+        }
       }
+
+      if (mounted) setState(() => _intent = intent);
     } on FirebaseException catch (_) {
       // chat deleted or no longer accessible — nothing to show
     }
@@ -1046,10 +1085,30 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final icon = isBuy ? Icons.shopping_bag_outlined : Icons.swap_horiz_rounded;
     final label = isBuy ? 'Wants to Buy' : 'Wants to Swap';
 
-    final listedProduct = _intent!['listedProduct'] as Map<String, dynamic>?;
-    final swapProductsRaw = _intent!['swapProducts'] as List?;
-    final swapProducts =
-        swapProductsRaw?.map((e) => Map<String, dynamic>.from(e as Map)).toList() ?? [];
+    final rawListedProduct = _intent!['listedProduct'] as Map<String, dynamic>?;
+    final rawSwapProductsList = _intent!['swapProducts'] as List?;
+    final rawSwapProducts = rawSwapProductsList
+        ?.map((e) => Map<String, dynamic>.from(e as Map))
+        .toList() ??
+        [];
+
+    // Stored data is direction-fixed: `listedProduct` is always the item the
+    // request was made FOR (belongs to whoever received the request), and
+    // `swapProducts` is always what was offered in return (belongs to
+    // whoever sent the request). But the banner should always show YOUR OWN
+    // listed item under "Wants in exchange for" and the OTHER person's item
+    // under "Offering" — so for the recipient the raw data already lines up,
+    // while for the requester the two need to be swapped before display.
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+    final fromUserId = _intent!['fromUserId'] as String?;
+    final iAmRequester = fromUserId != null && myUid == fromUserId;
+
+    final listedProduct = (!isBuy && iAmRequester)
+        ? (rawSwapProducts.isNotEmpty ? rawSwapProducts.first : null)
+        : rawListedProduct;
+    final swapProducts = (!isBuy && iAmRequester)
+        ? (rawListedProduct != null ? [rawListedProduct] : <Map<String, dynamic>>[])
+        : rawSwapProducts;
 
     return AnimatedSize(
       duration: const Duration(milliseconds: 280),
@@ -1501,9 +1560,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         children: [
           Icon(icon, size: 15, color: Colors.black54),
           const SizedBox(width: 6),
-          Text(
-            label,
-            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.black87),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.black87),
+            ),
           ),
         ],
       ),

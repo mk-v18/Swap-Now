@@ -172,6 +172,25 @@
       "density": "SPARSE_ALL"
     },
     {
+      "collectionGroup": "swapRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "chatId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "participants",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
       "collectionGroup": "UserProductList",
       "queryScope": "COLLECTION",
       "fields": [

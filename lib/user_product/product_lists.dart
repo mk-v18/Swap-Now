@@ -739,11 +739,25 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
       // widget.productId is the real Firestore doc id (passed in explicitly
       // by the caller) — this is what lets ProductDetailPage's "mark
       // exchange successful" lookup match this request back to the listing.
+      //
+      // Carries the same fields as `offeredProducts` below (condition,
+      // category, location, description) even though the original chat
+      // banner only ever showed this one in a compact, non-tappable chip.
+      // ChatScreen's intent banner now shows each viewer their OWN listed
+      // item vs. the other person's — which means this exact map can end up
+      // rendered in the tappable "Offering" tile (via _showSwapProductDetail)
+      // depending on who's viewing. Leaving these fields out made that
+      // detail sheet look broken (title/image only, no condition/category/
+      // location/description) whenever this product landed in that slot.
       final listedProduct = {
         'id': widget.productId,
         'title': widget.productData['title'] ?? '',
         'price': widget.productData['price'] ?? '',
-        'images': ((widget.productData['images'] as List?)?.take(1).toList()) ?? [],
+        'images': (widget.productData['images'] as List?) ?? [],
+        'condition': widget.productData['condition'] ?? '',
+        'category': widget.productData['category'] ?? '',
+        'location': widget.productData['location'] ?? '',
+        'description': widget.productData['description'] ?? '',
       };
 
       final offeredProducts = swapProducts.map((p) => {

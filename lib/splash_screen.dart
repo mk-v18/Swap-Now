@@ -1,13 +1,24 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter_svg/svg.dart';
 import 'package:amoeba/chats/notification_service.dart';
 import 'package:amoeba/logs/wrapper.dart';
 
 class SplashScreen extends StatefulWidget {
   // C1 fix: navigatorKey passed directly — no unsafe widget tree cast
   final GlobalKey<NavigatorState> navigatorKey;
-  const SplashScreen({super.key, required this.navigatorKey});
+  // NEW: the in-flight Firebase.initializeApp() future from main(). Splash
+  // now owns awaiting this instead of main.dart awaiting it before
+  // runApp() — see the fix note in main.dart for why that mattered.
+  final Future<FirebaseApp> firebaseInit;
+
+  const SplashScreen({
+    super.key,
+    required this.navigatorKey,
+    required this.firebaseInit,
+  });
 
   @override
   State<SplashScreen> createState() => _SplashScreenState();
@@ -49,16 +60,45 @@ class _SplashScreenState extends State<SplashScreen>
 
   // ── State ─────────────────────────────────────────────────────
   bool _showContent = false;
+  bool _initFailed = false;
+  late Future<FirebaseApp> _firebaseInit;
 
   @override
   void initState() {
     super.initState();
 
+    _firebaseInit = widget.firebaseInit;
+
     _buildParticles();
     _setupAnimations();
 
+    // Purely visual -- doesn't touch Firebase -- so it starts on the very
+    // first frame regardless of whether Firebase.initializeApp() has
+    // resolved yet.
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (!mounted) return;                          // C2 fix: mounted guard
+      _entryController.forward();
+      setState(() => _showContent = true);
+    });
+
+    // Everything that actually needs Firebase core (FirebaseAuth,
+    // Firestore, notifications, and the eventual navigation to Wrapper)
+    // is gated behind this instead of assuming Firebase.initializeApp()
+    // already finished before this widget was even built.
+    _bootstrapAfterFirebase();
+  }
+
+  Future<void> _bootstrapAfterFirebase() async {
+    try {
+      await _firebaseInit;
+    } catch (e) {
+      debugPrint('[SwapNow] Splash: Firebase.initializeApp failed: $e');
+      if (mounted) setState(() => _initFailed = true);
+      return;
+    }
+
     // FIX (white-screen after splash): warm Wrapper's routing decision now,
-    // in parallel with this splash animation, instead of letting it start
+    // in parallel with the splash animation, instead of letting it start
     // cold the moment Wrapper mounts 4.5s from now. This is a
     // SharedPreferences read + a Firestore `users/{uid}` read -- previously
     // that round trip only began AFTER the splash screen had already
@@ -70,13 +110,6 @@ class _SplashScreenState extends State<SplashScreen>
       }
     }).catchError((e) {
       debugPrint('[SwapNow] Splash route prefetch failed: $e');
-    });
-
-    // Start entry animation after first frame settles
-    Future.delayed(const Duration(milliseconds: 200), () {
-      if (!mounted) return;                          // C2 fix: mounted guard
-      _entryController.forward();
-      setState(() => _showContent = true);
     });
 
     // M2 fix: wrapped in try/catch so a notification init failure
@@ -109,6 +142,14 @@ class _SplashScreenState extends State<SplashScreen>
         ),
       );
     });
+  }
+
+  void _retryFirebaseInit() {
+    setState(() {
+      _initFailed = false;
+      _firebaseInit = Firebase.initializeApp();
+    });
+    _bootstrapAfterFirebase();
   }
 
   void _setupAnimations() {
@@ -294,14 +335,72 @@ class _SplashScreenState extends State<SplashScreen>
             animation: _ringController,
             builder: (context, _) => _buildRings(size, logoSize),
           ),
-          if (_showContent)
+          if (_showContent && !_initFailed)
             _buildContent(
               size: size,
               logoSize: logoSize,
               taglineFontSize: taglineFontSize,
               subtitleFontSize: subtitleFontSize,
             ),
+          // NEW: rendered on top of the still-visible animated background
+          // (not a separate blank screen) if Firebase.initializeApp()
+          // itself fails -- e.g. no network on a genuinely cold first
+          // launch. Previously this case wasn't handled at splash level at
+          // all.
+          if (_initFailed) _buildInitFailedOverlay(),
         ],
+      ),
+    );
+  }
+
+  Widget _buildInitFailedOverlay() {
+    return Container(
+      color: const Color(0xFF0D001A).withOpacity(0.92),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SvgPicture.asset(
+                'assets/images/no_connection.svg',
+                width: 72,
+                height: 72,
+                fit: BoxFit.contain,
+                placeholderBuilder: (context) => const Icon(
+                  Icons.wifi_off_rounded,
+                  size: 56,
+                  color: Color(0xFFBB66FF),
+                ),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                "Couldn't start SwapNow",
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                "Please check your internet connection and try again.",
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 14, color: Colors.white.withOpacity(0.6)),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF6A0DAD),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
+                ),
+                onPressed: _retryFirebaseInit,
+                child: const Text('Try again'),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
