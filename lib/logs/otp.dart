@@ -6,10 +6,9 @@ import 'package:amoeba/start/privacy_policy.dart';
 import 'package:amoeba/start/terms_of_use.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart'; // kDebugMode + debugPrint
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 import '../start/personal_details.dart';
 import 'package:flutter/gestures.dart';
 

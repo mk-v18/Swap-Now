@@ -12,6 +12,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import '../user_product/product_lists.dart';
 import '../user_product/model/user_product_listing.dart';
+import '../Advertisement/location_ad.dart';
 
 /// Centralised breakpoints — tweak once, affects everything.
 class _BP {
@@ -1479,42 +1480,81 @@ class _HomePageState extends State<HomePage> {
 
   // ─── Grid (real sliver, lazily built) ──────────────────────────────────────
 
+  // Ads are inserted as a full-width banner after every `_adInterval`
+  // product cards. The banner is `LocationAdWidget`, which itself:
+  //   1. Looks up the docs in the Firestore `ads` collection (the ones
+  //      published from `AdvertisementPage` / the ad uploader) and shows
+  //      the nearest one within `_radiusKm` of the user's GPS position.
+  //   2. Falls back to an AdMob banner when no nearby custom ad matches.
+  // So "ads posted from the ad uploader" and "location ad" are the same
+  // widget — the uploader writes the doc, `LocationAdWidget` reads it.
+  static const int _adInterval = 4;
+
   Widget _buildGridSliver(
       BuildContext context, List<Map<String, dynamic>> items) {
     final cols = _BP.gridCols(context);
     final hPad = _BP.isTablet(context) ? 16.0 : 12.0;
     final spacing = _BP.isTablet(context) ? 14.0 : 12.0;
 
-    return SliverPadding(
-      padding: EdgeInsets.symmetric(horizontal: hPad),
-      sliver: SliverGrid(
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: cols,
-          mainAxisSpacing: spacing,
-          crossAxisSpacing: spacing,
-          childAspectRatio: _BP.cardAspectRatio(context),
+    final slivers = <Widget>[];
+
+    for (var start = 0; start < items.length; start += _adInterval) {
+      final end = (start + _adInterval < items.length)
+          ? start + _adInterval
+          : items.length;
+      final chunk = items.sublist(start, end);
+
+      slivers.add(
+        SliverPadding(
+          padding: EdgeInsets.symmetric(horizontal: hPad),
+          sliver: SliverGrid(
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: cols,
+              mainAxisSpacing: spacing,
+              crossAxisSpacing: spacing,
+              childAspectRatio: _BP.cardAspectRatio(context),
+            ),
+            delegate: SliverChildBuilderDelegate(
+                  (context, index) {
+                final doc = chunk[index]['doc'] as QueryDocumentSnapshot;
+                // Cards are stateless and cheap to rebuild, so we don't need
+                // Flutter to keep them alive off-screen — disabling that
+                // bookkeeping saves work on large grids. RepaintBoundary is
+                // still on (the default) so scrolling doesn't repaint the
+                // whole grid every frame, just the cards that changed.
+                return _ProductCard(
+                  key: ValueKey(doc.id),
+                  doc: doc,
+                  favoriteIdsListenable: _favoriteIds,
+                );
+              },
+              childCount: chunk.length,
+              addAutomaticKeepAlives: false,
+              addRepaintBoundaries: true,
+              addSemanticIndexes: false,
+            ),
+          ),
         ),
-        delegate: SliverChildBuilderDelegate(
-              (context, index) {
-            final doc = items[index]['doc'] as QueryDocumentSnapshot;
-            // Cards are stateless and cheap to rebuild, so we don't need
-            // Flutter to keep them alive off-screen — disabling that
-            // bookkeeping saves work on large grids. RepaintBoundary is
-            // still on (the default) so scrolling doesn't repaint the
-            // whole grid every frame, just the cards that changed.
-            return _ProductCard(
-              key: ValueKey(doc.id),
-              doc: doc,
-              favoriteIdsListenable: _favoriteIds,
-            );
-          },
-          childCount: items.length,
-          addAutomaticKeepAlives: false,
-          addRepaintBoundaries: true,
-          addSemanticIndexes: false,
-        ),
-      ),
-    );
+      );
+
+      // Only drop an ad after a FULL batch of `_adInterval` products —
+      // never after a trailing partial batch at the very end of the list,
+      // so we don't tack an ad onto the bottom of the feed just because
+      // it happened to end mid-group.
+      if (chunk.length == _adInterval) {
+        slivers.add(
+          SliverToBoxAdapter(
+            child: Padding(
+              key: ValueKey('ad_after_${start + chunk.length}'),
+              padding: EdgeInsets.symmetric(horizontal: hPad, vertical: 10),
+              child: const LocationAdWidget(),
+            ),
+          ),
+        );
+      }
+    }
+
+    return SliverMainAxisGroup(slivers: slivers);
   }
 
   // ─── Skeleton grid (shown instead of a spinner while loading) ─────────────

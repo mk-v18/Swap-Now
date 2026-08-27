@@ -216,6 +216,17 @@ class Wrapper extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
+      // FIX (root cause of "asks for login again after closing the app for
+      // a while"): seed the stream with whatever FirebaseAuth already has
+      // cached natively, instead of starting from null every time this
+      // widget subscribes. On a cold start after Android/iOS has killed the
+      // process (which is exactly what "closed for some time" triggers),
+      // the native SDK needs a moment to restore the persisted session
+      // from disk. `authStateChanges()`'s very FIRST emission can land as a
+      // transient `null` a beat before that restore finishes -- not because
+      // the session is actually gone. The old code treated that transient
+      // null exactly like a real sign-out.
+      initialData: FirebaseAuth.instance.currentUser,
       stream: FirebaseAuth.instance.authStateChanges(),
       builder: (context, authSnapshot) {
         if (authSnapshot.connectionState == ConnectionState.waiting) {
@@ -224,12 +235,19 @@ class Wrapper extends StatelessWidget {
           // "wait" state flashing before we know if there's a user.
           return const _InstantScreen();
         }
-        if (!authSnapshot.hasData) {
+
+        // FIX: don't trust a `null` snapshot by itself -- double-check
+        // against FirebaseAuth's own synchronous `currentUser`. If that
+        // still reports a user, the null we just saw from the stream was
+        // stale/transient, not a genuine sign-out, so keep the session
+        // instead of wiping the cache and forcing the user back to OTP.
+        final user = authSnapshot.data ?? FirebaseAuth.instance.currentUser;
+
+        if (user == null) {
           _clearCache();
           RouteResolver.instance.clear(); // FIX: no stale cache for next sign-in
           return const OtpSignupPage();
         }
-        final user = authSnapshot.data!;
 
         // CHANGED: was `checkUser: _checkUser` (a fresh call every time).
         // Now routes through RouteResolver so it reuses whatever
