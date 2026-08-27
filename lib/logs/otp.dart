@@ -321,6 +321,23 @@ class _OtpSignupPageState extends State<OtpSignupPage>
     });
   }
 
+  // FIX: this must only ever be called once the users/{uid} document is
+  // known to exist. The Firestore rules' `update` branch reads
+  // resource.data (role/banned/hasPaid/hasLifetimeListingAccess) to prove
+  // the caller isn't smuggling in a privilege change — if the doc doesn't
+  // exist yet, resource.data is null and that read throws inside the rule
+  // evaluator, which Firestore surfaces as PERMISSION_DENIED (not
+  // "not-found"). Previously this was fired immediately after sign-in, in
+  // parallel with the doc-existence check/creation below, so on a brand
+  // new signup it could race ahead of the doc actually being created.
+  // Call sites now only invoke this AFTER `doc.exists` is true or the
+  // initial profile doc has just been written (see _signInWithCredential).
+  //
+  // Also switched from `.update()` to `.set(..., merge: true)` as a second
+  // line of defense: if this is ever somehow reached before the doc
+  // exists, Firestore treats the merge as a `create`, which the rules will
+  // (correctly) reject for missing required fields (uid/role/banned)
+  // instead of masquerading as a confusing PERMISSION_DENIED on update.
   Future<void> _saveFCMToken(String uid) async {
     try {
       final token = await FirebaseMessaging.instance
@@ -330,7 +347,7 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         await FirebaseFirestore.instance
             .collection('users')
             .doc(uid)
-            .update({'fcmToken': token})
+            .set({'fcmToken': token}, SetOptions(merge: true))
             .timeout(_firestoreTimeout);
       }
     } catch (e, st) {
@@ -476,9 +493,15 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       final user = userCredential.user;
       if (user == null || !mounted) return;
 
-      // Fire-and-forget — never let a token save delay navigation, and
-      // never let it fail the sign-in flow (see try/catch inside).
-      _saveFCMToken(user.uid);
+      // FIX: _saveFCMToken() used to fire here, immediately after sign-in
+      // and in parallel with the doc-existence check below. For a brand
+      // new user, the users/{uid} doc doesn't exist yet at this point, so
+      // that update() raced the doc creation and hit PERMISSION_DENIED
+      // (see _saveFCMToken's doc comment for why the rules reject an
+      // update against a nonexistent doc). It's now called further down,
+      // once in each branch, only after the doc is confirmed to exist —
+      // still fire-and-forget, still never blocks navigation or fails the
+      // sign-in flow.
 
       final userRef =
       FirebaseFirestore.instance.collection('users').doc(user.uid);
@@ -486,6 +509,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
       if (!mounted) return;
 
       if (doc.exists) {
+        // Doc already exists — safe to save the token now.
+        _saveFCMToken(user.uid);
+
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (_) => const Wrapper()),
@@ -498,6 +524,9 @@ class _OtpSignupPageState extends State<OtpSignupPage>
         }, SetOptions(merge: true)).timeout(_firestoreTimeout);
 
         if (!mounted) return;
+
+        // Doc was just created — safe to save the token now.
+        _saveFCMToken(user.uid);
 
         Navigator.pushReplacement(
           context,

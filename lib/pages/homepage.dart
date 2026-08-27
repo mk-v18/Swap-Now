@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:amoeba/pages/wishlistpage.dart';
 import 'package:amoeba/pages/notifications_page.dart';
@@ -112,12 +111,19 @@ class _HomePageState extends State<HomePage> {
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = "";
   String name = "";
-  String profileImageUrl = "";
 
   Timer? _debounce;
   List<Map<String, dynamic>> _processedItems = [];
 
   bool _isProcessingItems = false;
+  // Set when a Firestore snapshot arrives while _processItems is already
+  // running for a previous snapshot. Without this, that update would just
+  // be silently dropped (the `if (_isProcessingItems) return;` guard below
+  // had no retry), which is why newly added items sometimes didn't show up
+  // until a manual pull-to-refresh forced a fresh call at a moment nothing
+  // was in flight. Now the latest pending docs are remembered and
+  // processed immediately once the in-flight run finishes.
+  List<QueryDocumentSnapshot>? _pendingDocs;
   List<QueryDocumentSnapshot>? _lastDocs;
   String _lastDocsFingerprint = '';
 
@@ -155,6 +161,18 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<QuerySnapshot>? _wishlistSub;
   final ValueNotifier<Set<String>> _favoriteIds = ValueNotifier({});
 
+  // Created once and reused for the lifetime of this State, instead of
+  // being built inline inside `_buildProductStream` (which runs on every
+  // rebuild). A fresh `.snapshots()` call returns a brand-new Stream
+  // object each time, so StreamBuilder was tearing down and resubscribing
+  // its Firestore listener on every rebuild (scrolling, filter changes,
+  // etc.) instead of keeping one stable subscription open.
+  late final Stream<QuerySnapshot> _productStream = FirebaseFirestore.instance
+      .collection('UserProductList')
+      .orderBy('createdAt', descending: true)
+      .limit(200)
+      .snapshots();
+
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   @override
@@ -162,8 +180,8 @@ class _HomePageState extends State<HomePage> {
     super.initState();
     // Product list renders immediately via its own StreamBuilder below —
     // location/profile data loads quietly in the background and patches
-    // in (header text, distance sorting, avatar) whenever it's ready,
-    // without blocking the first frame or the product grid.
+    // in (header text, distance sorting) whenever it's ready, without
+    // blocking the first frame or the product grid.
     _fetchUserData();
     _listenWishlist();
     _searchController.addListener(_onSearchChanged);
@@ -273,13 +291,11 @@ class _HomePageState extends State<HomePage> {
       if (data == null) return;
 
       final fetchedName = (data['name'] as String?) ?? '';
-      final fetchedImage = (data['profileImage'] as String?) ?? '';
 
-      // Push name/avatar to UI immediately — don't wait on geocoding.
+      // Push name to UI immediately — don't wait on geocoding.
       if (mounted) {
         setState(() {
           name = fetchedName;
-          profileImageUrl = fetchedImage;
         });
       }
 
@@ -394,7 +410,13 @@ class _HomePageState extends State<HomePage> {
   // ─── Item processing ──────────────────────────────────────────────────────
 
   Future<void> _processItems(List<QueryDocumentSnapshot> docs) async {
-    if (_isProcessingItems) return;
+    if (_isProcessingItems) {
+      // A run is already in flight — remember this newer snapshot instead
+      // of dropping it, and process it as soon as the current run ends
+      // (see the check at the bottom of this method).
+      _pendingDocs = docs;
+      return;
+    }
     _isProcessingItems = true;
 
     // Captured up front so the setState below can stamp exactly which
@@ -520,6 +542,14 @@ class _HomePageState extends State<HomePage> {
         if (_visibleCount < _pageSize) _visibleCount = _pageSize;
       });
     }
+
+    // If a newer snapshot came in while we were busy, run it now instead
+    // of waiting for the next unrelated rebuild/refresh to surface it.
+    if (_pendingDocs != null) {
+      final next = _pendingDocs!;
+      _pendingDocs = null;
+      _processItems(next);
+    }
   }
 
   // ─── Build ────────────────────────────────────────────────────────────────
@@ -571,16 +601,11 @@ class _HomePageState extends State<HomePage> {
                         ),
                         Row(
                           children: [
-                            _notificationBell(context),
-                            SizedBox(
-                                width: _BP.isTablet(context) ? 10 : 8),
                             _iconBtn(context, 'assets/icons/favourite.svg',
                                 const WishlistPage()),
                             SizedBox(
                                 width: _BP.isTablet(context) ? 10 : 8),
-                            _profileAvatar(context),
-                            SizedBox(
-                                width: _BP.isTablet(context) ? 10 : 8),
+                            _notificationBell(context),
                           ],
                         ),
                       ],
@@ -684,12 +709,10 @@ class _HomePageState extends State<HomePage> {
                   if (!_showPinnedSearch)
                     Row(
                       children: [
-                        _notificationBell(context),
-                        SizedBox(width: isTablet ? 14 : 12),
                         _iconBtn(context, 'assets/icons/favourite.svg',
                             const WishlistPage()),
                         SizedBox(width: isTablet ? 14 : 12),
-                        _profileAvatar(context),
+                        _notificationBell(context),
                       ],
                     ),
                 ],
@@ -771,57 +794,6 @@ class _HomePageState extends State<HomePage> {
             child: _buildSearchBar(context),
           ),
         ],
-      ),
-    );
-  }
-
-  /// Profile avatar — display only, no tap navigation.
-  Widget _profileAvatar(BuildContext context) {
-    final size = _BP.iconBtnSize(context) + 16;
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: Colors.white,
-        border: Border.all(color: Colors.white, width: 2),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.12),
-            blurRadius: 4,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: ClipOval(
-        child: SizedBox(
-          width: size,
-          height: size,
-          child: profileImageUrl.isNotEmpty
-              ? CachedNetworkImage(
-            imageUrl: profileImageUrl,
-            fit: BoxFit.cover,
-            memCacheWidth: (size * 2).toInt(),
-            fadeInDuration: const Duration(milliseconds: 150),
-            placeholder: (context, url) => const Center(
-              child: SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            ),
-            errorWidget: (context, url, error) => Icon(
-              Icons.person,
-              size: size * 0.6,
-              color: _kPrimaryDark,
-            ),
-          )
-              : Icon(
-            Icons.person,
-            size: size * 0.6,
-            color: _kPrimaryDark,
-          ),
-        ),
       ),
     );
   }
@@ -1109,7 +1081,12 @@ class _HomePageState extends State<HomePage> {
                 constraints: BoxConstraints(
                   maxWidth: isTablet ? 520 : double.infinity,
                 ),
-                padding: EdgeInsets.all(isTablet ? 24 : 18),
+                padding: EdgeInsets.fromLTRB(
+                  isTablet ? 24 : 18,
+                  isTablet ? 24 : 18,
+                  isTablet ? 24 : 18,
+                  (isTablet ? 24 : 18) + MediaQuery.of(context).padding.bottom + 15, // ← added
+                ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1268,11 +1245,7 @@ class _HomePageState extends State<HomePage> {
   /// they scroll into view.
   Widget _buildProductStream(BuildContext context) {
     return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance
-          .collection('UserProductList')
-          .orderBy('createdAt', descending: true)
-          .limit(200)
-          .snapshots(),
+      stream: _productStream,
       builder: (context, snapshot) {
         if (snapshot.hasError) {
           if (kDebugMode) debugPrint('Firestore error: ${snapshot.error}');

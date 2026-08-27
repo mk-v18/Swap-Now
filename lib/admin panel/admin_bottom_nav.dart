@@ -97,6 +97,11 @@ class _AdminBottomNavigationState extends State<AdminBottomNavigation> {
 
               return Expanded(
                 child: GestureDetector(
+                  // ✅ Fix: make the ENTIRE tile tappable, not just the
+                  // pixels its child happens to paint. Without this,
+                  // unselected tabs (decoration: null) have "dead" areas
+                  // in their padding/gaps that swallow the first tap.
+                  behavior: HitTestBehavior.opaque,
                   onTap: () => setState(() => _selectedIndex = index),
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 250),

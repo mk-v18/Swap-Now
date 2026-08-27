@@ -25,6 +25,7 @@ import 'chatservice.dart';
 ///   swapRequests: (fromUserId ASC, createdAt DESC)
 ///   swapRequests: (participants ARRAY_CONTAINS, fromUserId ASC, listedProduct.id ASC, status ASC)
 ///   swapRequests: (participants ARRAY_CONTAINS, status ASC, respondedAt DESC)
+///   swapRequests: (fromUserId ASC, toUserId ASC, status ASC)
 ///   exchangeHistory: (participants ARRAY_CONTAINS, completedAt DESC)
 ///
 ///   NOTE: the third index above changed shape (added `fromUserId ASC`) as
@@ -34,6 +35,12 @@ import 'chatservice.dart';
 ///   will prompt for a new composite index the first time this runs;
 ///   follow the console link (or update firestore.indexes.json) rather
 ///   than reusing the old index.
+///
+///   NOTE: the fifth index (fromUserId, toUserId, status) is used by
+///   getMyActiveRequestWithUser for the "one active swap per user pair"
+///   check — it covers both directions since the two uid values are just
+///   swapped between the two queries, so only one composite index is
+///   needed for all four of that method's point queries.
 ///
 /// FIRESTORE RULES NEEDED for swapRequests:
 ///   match /swapRequests/{requestId} {
@@ -111,9 +118,68 @@ class SwapRequestService {
     return existing != null;
   }
 
+  /// FIX(one-swap-per-user): returns the pending/accepted swap request that
+  /// already exists between me and [otherUserId] — on ANY product, in
+  /// EITHER direction (I sent it, or they sent it to me) — if one exists.
+  /// This is what stops a user from opening a second, unrelated swap with
+  /// someone they already have a live swap with; the pair has to resolve
+  /// (complete or cancel) the current one first.
+  ///
+  /// Two directions × two statuses = 4 point queries rather than a single
+  /// `whereIn`, mirroring getMyActiveRequestForProduct above — Firestore
+  /// can't combine `status in [...]` with the other equality filters
+  /// without a different composite index per combination anyway, so
+  /// separate queries keep the index list short and predictable.
+  Future<Map<String, dynamic>?> getMyActiveRequestWithUser(
+      String otherUserId) async {
+    final me = _auth.currentUser?.uid;
+    if (me == null || otherUserId.isEmpty) return null;
+
+    final results = await Future.wait([
+      _firestore
+          .collection('swapRequests')
+          .where('fromUserId', isEqualTo: me)
+          .where('toUserId', isEqualTo: otherUserId)
+          .where('status', isEqualTo: 'pending')
+          .limit(1)
+          .get(),
+      _firestore
+          .collection('swapRequests')
+          .where('fromUserId', isEqualTo: me)
+          .where('toUserId', isEqualTo: otherUserId)
+          .where('status', isEqualTo: 'accepted')
+          .limit(1)
+          .get(),
+      _firestore
+          .collection('swapRequests')
+          .where('fromUserId', isEqualTo: otherUserId)
+          .where('toUserId', isEqualTo: me)
+          .where('status', isEqualTo: 'pending')
+          .limit(1)
+          .get(),
+      _firestore
+          .collection('swapRequests')
+          .where('fromUserId', isEqualTo: otherUserId)
+          .where('toUserId', isEqualTo: me)
+          .where('status', isEqualTo: 'accepted')
+          .limit(1)
+          .get(),
+    ]);
+
+    for (final snap in results) {
+      if (snap.docs.isNotEmpty) {
+        final doc = snap.docs.first;
+        return {'id': doc.id, ...doc.data() as Map<String, dynamic>};
+      }
+    }
+    return null;
+  }
+
   /// Throws if I already have an active (pending/accepted) request for this
+  /// product, OR an active request with this same person on ANY OTHER
   /// product — prevents spamming the same seller from repeat visits to the
-  /// product page.
+  /// product page, and stops a second, unrelated swap from being opened
+  /// with someone the current swap hasn't been resolved with yet.
   Future<String> createSwapRequest({
     required String toUserId,
     required String toUserName,
@@ -126,6 +192,16 @@ class SwapRequestService {
 
     if (await _hasActiveRequest(productId)) {
       throw Exception('You already have an active swap request for this item.');
+    }
+
+    // FIX(one-swap-per-user): same check, but across the whole relationship
+    // with this person rather than just this product — this is the case
+    // where product A's swap is already pending/accepted between us and
+    // the user tries to start a fresh request on product B.
+    if (await getMyActiveRequestWithUser(toUserId) != null) {
+      throw Exception(
+          'You already have an active swap with this user on another item. '
+              'Complete or cancel it before starting a new one.');
     }
 
     final meDoc = await _firestore.collection('users').doc(me.uid).get();

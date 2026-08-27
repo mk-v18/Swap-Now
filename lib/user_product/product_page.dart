@@ -171,6 +171,14 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
   bool _isSubmitting        = false;
   bool _isDetectingLocation = false;
 
+  // FIX(request): whether this signed-in user already has lifetime listing
+  // access, resolved once as soon as the page opens (not just at Publish
+  // time). null = still checking → the price field and its label default
+  // to showing, same as before. Once this resolves to true, the price
+  // field and the fee-choice popup are skipped everywhere on this page —
+  // publishing just goes straight through, free, with no price collected.
+  bool? _hasLifetimeAccess;
+
   // ── Autocomplete ─────────────────────────────────────────────────────────
   List<String> _suggestions           = [];
   // FIX(gap): parallel list carrying each suggestion's coordinates so a tap
@@ -218,6 +226,11 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     _razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, _handleListingPaymentError);
     _razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, _handleListingExternalWallet);
     _loadRazorpayKey();
+    // FIX(request): resolve lifetime-access status up front so the UI can
+    // hide the price field immediately, instead of only finding out at
+    // Publish time (by which point the price field has already been shown
+    // and filled in).
+    _checkLifetimeAccessOnLoad();
   }
 
   Future<void> _loadRazorpayKey() async {
@@ -234,6 +247,20 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     } catch (e) {
       debugPrint('Remote Config fetch failed, using fallback Razorpay key: $e');
     }
+  }
+
+  // FIX(request): runs once when the page opens. Not signed in → treat as
+  // not unlocked (price field stays visible, same as today). Signed in →
+  // reuse the same Firestore check the submit flow already relies on, and
+  // store the result so build() can react to it.
+  Future<void> _checkLifetimeAccessOnLoad() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      if (mounted) setState(() => _hasLifetimeAccess = false);
+      return;
+    }
+    final unlocked = await _hasLifetimeListingAccess(user.uid);
+    if (mounted) setState(() => _hasLifetimeAccess = unlocked);
   }
 
   void _onLocationFocusChange() {
@@ -503,16 +530,110 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
   // ── Images ────────────────────────────────────────────────────────────────
   int get _totalImages => _images.length;
 
+  // Entry point for the "Add Photo" tile. Now opens a bottom sheet so the
+  // user can choose Camera or Gallery, instead of always jumping straight
+  // to the gallery multi-picker.
   Future<void> _pickImages() async {
     final remaining = _kMaxImages - _totalImages;
     if (remaining <= 0) {
       _showErrorSnack("Maximum $_kMaxImages images allowed.");
       return;
     }
+    final source = await _showImageSourceSheet();
+    if (source == null) return; // sheet dismissed without a choice
+    if (source == ImageSource.camera) {
+      await _pickFromCamera(remaining);
+    } else {
+      await _pickFromGallery(remaining);
+    }
+  }
+
+  // Bottom sheet offering Camera vs Gallery, styled to match the page.
+  Future<ImageSource?> _showImageSourceSheet() {
+    return showModalBottomSheet<ImageSource>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 14),
+                decoration: BoxDecoration(
+                    color: Colors.grey.shade300,
+                    borderRadius: BorderRadius.circular(2)),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text("Add Photo",
+                      style: TextStyle(
+                          fontSize: 15, fontWeight: FontWeight.w700, color: _kLabel)),
+                ),
+              ),
+              const SizedBox(height: 6),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: const BoxDecoration(
+                      color: _kPurpleLight, shape: BoxShape.circle),
+                  child: const Icon(Icons.camera_alt_outlined, color: _kPurple),
+                ),
+                title: const Text("Take Photo",
+                    style: TextStyle(fontWeight: FontWeight.w600, color: _kLabel)),
+                onTap: () => Navigator.pop(sheetContext, ImageSource.camera),
+              ),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: const BoxDecoration(
+                      color: _kPurpleLight, shape: BoxShape.circle),
+                  child: const Icon(Icons.photo_library_outlined, color: _kPurple),
+                ),
+                title: const Text("Choose from Gallery",
+                    style: TextStyle(fontWeight: FontWeight.w600, color: _kLabel)),
+                onTap: () => Navigator.pop(sheetContext, ImageSource.gallery),
+              ),
+              const SizedBox(height: 6),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Camera capture — pickImage only ever returns a single XFile, so this
+  // adds exactly one image per tap regardless of how many slots remain.
+  Future<void> _pickFromCamera(int remaining) async {
+    try {
+      final shot = await _picker.pickImage(
+          source: ImageSource.camera,
+          maxWidth: 1280, maxHeight: 1280, imageQuality: 80);
+      if (shot == null) return;
+      if (!mounted) return;
+      setState(() => _images.add(shot));
+      // Kick off compression now and cache the Future immediately, so a
+      // fast Publish tap reuses this work instead of duplicating it.
+      unawaited(_precompress(shot));
+    } catch (_) {
+      if (mounted) _showErrorSnack("Failed to capture photo. Try again.");
+    }
+  }
+
+  // Gallery multi-select — same behavior as before, just factored out of
+  // _pickImages now that it's one of two entry points.
+  Future<void> _pickFromGallery(int remaining) async {
     try {
       final picked = await _picker.pickMultiImage(
           maxWidth: 1280, maxHeight: 1280, imageQuality: 80);
-      if (picked == null || picked.isEmpty) return;
+      if (picked.isEmpty) return;
       if (!mounted) return;
       final toAdd = picked.take(remaining).toList();
       setState(() => _images.addAll(toAdd));
@@ -557,11 +678,16 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
     if (_titleController.text.trim().length > 120) return "Title must be 120 characters or fewer.";
     if (_descriptionController.text.trim().length < 10) return "Description must be at least 10 characters.";
     if (_descriptionController.text.trim().length > 2000) return "Description must be 2,000 characters or fewer.";
-    final priceText = _priceController.text.trim();
-    if (priceText.isEmpty) return "Please enter a price.";
-    final price = double.tryParse(priceText);
-    if (price == null || price <= 0) return "Please enter a valid price greater than 0.";
-    if (price > 9999999) return "Price seems too high — please double-check it.";
+    // FIX(request): price is only asked for (and therefore only validated
+    // for) users who don't already have lifetime listing access — those
+    // users never see the field at all, so nothing to check here for them.
+    if (_hasLifetimeAccess != true) {
+      final priceText = _priceController.text.trim();
+      if (priceText.isEmpty) return "Please enter a price.";
+      final price = double.tryParse(priceText);
+      if (price == null || price <= 0) return "Please enter a valid price greater than 0.";
+      if (price > 9999999) return "Price seems too high — please double-check it.";
+    }
     if (_condition == null) return "Please select a condition.";
     if (_category  == null) return "Please select a category.";
     if (_location.trim().isEmpty) return "Please set your location.";
@@ -612,10 +738,15 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         return;
       }
 
+      // Re-checked fresh (not just from the cached _hasLifetimeAccess used
+      // for the UI) in case access was granted in another session since
+      // this page opened.
       final alreadyUnlocked = await _hasLifetimeListingAccess(user.uid);
       if (!mounted) return;
 
       if (alreadyUnlocked) {
+        // FIX(request): lifetime users skip the fee popup entirely and go
+        // straight to publish — no price was collected, none is needed.
         await _publishListing(user);
         return;
       }
@@ -641,7 +772,13 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         'userId'     : user.uid,
         'title'      : _titleController.text.trim(),
         'description': _descriptionController.text.trim(),
-        'price'      : _enteredPrice,
+        // FIX(request): store null (not 0) when this was a lifetime-access
+        // publish with no price field shown/collected, so it isn't mistaken
+        // for an actual ₹0 asking price anywhere downstream (home page,
+        // filters, etc).
+        'price'      : (_hasLifetimeAccess == true && _priceController.text.trim().isEmpty)
+            ? null
+            : _enteredPrice,
         'category'   : _category,
         'condition'  : _condition,
         'location'   : _location.trim(),
@@ -661,6 +798,10 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
 
       if (!mounted) return;
       _showSuccessSnack("Product published successfully!");
+      // FIX(request): keep local state in sync in case this page instance
+      // is reused right after a lifetime purchase, so the price field and
+      // popup stay hidden without needing a fresh page load.
+      if (feeTypeCharged == _ListingFeeType.lifetime) _hasLifetimeAccess = true;
       _resetForm();
     } on FirebaseException catch (e) {
       if (mounted) _showErrorSnack("Upload failed: ${e.message ?? 'Try again.'}");
@@ -1034,7 +1175,7 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
                         _InputField(
                           rl: rl,
                           controller: _titleController,
-                          hintText: "e.g. Sony WH-1000XM5 Headphones",
+                          hintText: "e.g. Sony headphones",
                           prefixIcon: Icons.label_outline_rounded,
                           maxLength: 120,
                           textInputAction: TextInputAction.next,
@@ -1046,23 +1187,34 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
                           controller: _descriptionController,
                           maxLines: rl.isTablet || rl.isDesktop ? 4 : 3,
                           maxLength: 2000,
-                          hintText: "Condition, features, reason for swapping…",
+                          hintText: "Describe the product, features and any defects...",
                           prefixIcon: Icons.notes_rounded,
                           alignLabelWithHint: true,
                         ),
-                        SizedBox(height: rl.sectionGap),
-                        _FieldLabel(text: "Price (₹)", rl: rl),
-                        _InputField(
-                          rl: rl,
-                          controller: _priceController,
-                          hintText: "e.g. 1500",
-                          prefixIcon: Icons.currency_rupee_rounded,
-                          keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                          inputFormatters: [
-                            FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d{0,2}')),
-                          ],
-                          textInputAction: TextInputAction.done,
-                        ),
+                        // FIX(request): price is only relevant for users who
+                        // still need to pay the per-listing commission (it's
+                        // what that fee is calculated from) or haven't yet
+                        // chosen a plan. Once lifetime access is confirmed,
+                        // the field is replaced with a short confirmation
+                        // banner instead — no price is collected or stored.
+                        if (_hasLifetimeAccess != true) ...[
+                          SizedBox(height: rl.sectionGap),
+                          _FieldLabel(text: "Price You Bought It For (₹)", rl: rl),
+                          _InputField(
+                            rl: rl,
+                            controller: _priceController,
+                            hintText: "e.g. 1500",
+                            prefixIcon: Icons.currency_rupee_rounded,
+                            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                            inputFormatters: [
+                              FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d{0,2}')),
+                            ],
+                            textInputAction: TextInputAction.done,
+                          ),
+                        ] else ...[
+                          SizedBox(height: rl.sectionGap),
+                          _buildLifetimeAccessBadge(rl),
+                        ],
                       ],
                     ),
                   ),
@@ -1213,6 +1365,32 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
           ),
         );
       }).toList(),
+    );
+  }
+
+  // FIX(request): small confirmation banner shown in place of the price
+  // field once this user already has lifetime listing access — makes it
+  // clear why the field disappeared instead of it just looking missing.
+  Widget _buildLifetimeAccessBadge(_RL rl) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: _kPurpleLight,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(children: [
+        const Icon(Icons.workspace_premium_rounded, color: _kPurple, size: 16),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            "Lifetime access unlocked — no price needed, publishing is free.",
+            style: TextStyle(
+                fontSize: rl.fieldFontSize - 1.5,
+                color: _kPurple,
+                fontWeight: FontWeight.w600),
+          ),
+        ),
+      ]),
     );
   }
 

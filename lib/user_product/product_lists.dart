@@ -92,6 +92,13 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   Map<String, dynamic>? _existingRequest;
   bool _existingRequestChecked = false;
 
+  // FIX(one-swap-per-user): set when I have an active (pending/accepted)
+  // swap with THIS SELLER on a *different* product — i.e. _existingRequest
+  // above is null (no request on this exact item) but the pair already has
+  // a live swap going elsewhere. Blocks starting a new request until that
+  // one is completed or cancelled.
+  Map<String, dynamic>? _blockingUserRequest;
+
   @override
   void initState() {
     super.initState();
@@ -129,9 +136,23 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     }
     final existing = await _swapRequestService
         .getMyActiveRequestForProduct(widget.productId);
+
+    // FIX(one-swap-per-user): only need this second check when THIS
+    // product doesn't already have its own request — if it does,
+    // _existingRequest already fully explains the button state.
+    Map<String, dynamic>? blocking;
+    if (existing == null) {
+      final sellerId = widget.productData['userId'] as String?;
+      if (sellerId != null) {
+        blocking =
+        await _swapRequestService.getMyActiveRequestWithUser(sellerId);
+      }
+    }
+
     if (!mounted) return;
     setState(() {
       _existingRequest = existing;
+      _blockingUserRequest = blocking;
       _existingRequestChecked = true;
     });
   }
@@ -519,9 +540,14 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   //   2. existing pending request found → disabled "Request already sent".
   //   3. existing accepted request found → "Continue chat", jumps straight
   //      into the existing chat instead of restarting the swap flow.
-  //   4. no existing request → normal "Send swap request" flow.
+  //   4. FIX(one-swap-per-user): no request on THIS product, but an active
+  //      swap already exists with this seller on another item → blocked,
+  //      with a label that explains why and (if that other swap is already
+  //      accepted) a tap-through into its chat.
+  //   5. no existing/blocking request → normal "Send swap request" flow.
   Widget _buildBottomBar(_RL rl) {
     final status = _existingRequest?['status'] as String?;
+    final blockingStatus = _blockingUserRequest?['status'] as String?;
 
     String label;
     IconData icon;
@@ -542,6 +568,17 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
       label = 'Continue chat';
       icon = Icons.chat_bubble_outline_rounded;
       onTap = _isMessaging ? null : _continueExistingChat;
+    } else if (blockingStatus == 'accepted') {
+      // Other swap already has a chat — let them jump straight to it so
+      // they can complete/cancel it, rather than dead-ending here.
+      label = 'Finish your other swap first';
+      icon = Icons.swap_horiz_rounded;
+      onTap = _isMessaging ? null : _continueBlockingChat;
+    } else if (blockingStatus == 'pending') {
+      label = 'Pending swap with this user';
+      icon = Icons.hourglass_top_rounded;
+      onTap = null;
+      isNeutralDisabled = true;
     } else {
       label = _isMessaging ? 'Sending swap request...' : 'Send swap request';
       icon = Icons.swap_horiz_rounded;
@@ -647,6 +684,37 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     );
   }
 
+  // FIX(one-swap-per-user): companion to _continueExistingChat, but for the
+  // OTHER product's swap that's currently blocking this one. Same
+  // reasoning — the accepted chat is the fastest way for the user to go
+  // complete or cancel it so they can start the new request.
+  void _continueBlockingChat() {
+    final req = _blockingUserRequest;
+    if (req == null) return;
+    final chatId = req['chatId'] as String?;
+    if (chatId == null) {
+      _showSnack('Chat is not ready yet. Try again shortly.');
+      return;
+    }
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+    final iAmSender = req['fromUserId'] == myUid;
+    // Show whichever side of the pair I'm NOT on.
+    final otherId = iAmSender ? req['toUserId'] : req['fromUserId'];
+    final otherName = iAmSender ? req['toUserName'] : req['fromUserName'];
+    final otherImage = iAmSender ? req['toUserImage'] : req['fromUserImage'];
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: chatId,
+          receiverId: (otherId as String?) ?? '',
+          receiverName: (otherName as String?) ?? 'User',
+          receiverImage: (otherImage as String?) ?? '',
+        ),
+      ),
+    );
+  }
+
   // ─── INITIATE SWAP (guard → swap sheet → safety → chat) ──────────────────
   Future<void> _initiateSwap() async {
     final currentUser = FirebaseAuth.instance.currentUser;
@@ -658,6 +726,12 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     // (e.g. sent from another device) between the initial check and this
     // tap, don't reopen the flow; refresh state instead.
     if (_existingRequest != null) {
+      await _checkExistingRequest();
+      return;
+    }
+    // FIX(one-swap-per-user): same belt-and-suspenders guard for a swap
+    // with this same person that landed on a different product.
+    if (_blockingUserRequest != null) {
       await _checkExistingRequest();
       return;
     }

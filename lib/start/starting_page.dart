@@ -1,7 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import '../logs/wrapper.dart';
 import '../pages/bottom_navigation.dart';
 
 class StartingPage extends StatefulWidget {
@@ -44,8 +43,8 @@ class _StartingPageState extends State<StartingPage>
   }
 
   // ── Mark onboarding complete in Firestore ──────────────────────────────────
-  // Called from both "Start Exchanging" and "Skip" so Wrapper never
-  // redirects a returning user back to StartingPage after they've seen it.
+  // Called from "Start Exchanging" so Wrapper never redirects a returning
+  // user back to StartingPage after they've seen it.
   Future<void> _markOnboardingDone() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
@@ -75,18 +74,6 @@ class _StartingPageState extends State<StartingPage>
     );
   }
 
-  // ── Skip button ────────────────────────────────────────────────────────────
-  Future<void> _handleSkip() async {
-    await _markOnboardingDone();
-    if (!mounted) return;
-    // Push Wrapper so it re-evaluates state and routes to BottomNavigation
-    // cleanly — avoids duplicating the routing logic here.
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (_) => const Wrapper()),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
@@ -95,7 +82,6 @@ class _StartingPageState extends State<StartingPage>
     final hPad = (size.width * 0.06).clamp(20.0, 60.0);
     final titleFontSize = (size.width * 0.063).clamp(22.0, 38.0);
     final subtitleFontSize = (size.width * 0.034).clamp(13.0, 18.0);
-    final skipFontSize = (size.width * 0.035).clamp(13.0, 16.0);
     final imageWidth = isTablet ? size.width * 0.5 : size.width * 0.78;
     final buttonHeight = (size.height * 0.072).clamp(52.0, 68.0);
     final buttonFontSize = (size.width * 0.042).clamp(14.0, 18.0);
@@ -114,37 +100,6 @@ class _StartingPageState extends State<StartingPage>
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   SizedBox(height: size.height * 0.025),
-
-                  // ── Skip button ─────────────────────────────────────────
-                  Align(
-                    alignment: Alignment.topRight,
-                    child: GestureDetector(
-                      onTap: _isProcessing ? null : _handleSkip,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        decoration: BoxDecoration(
-                          color: _primary.withOpacity(0.06),
-                          borderRadius: BorderRadius.circular(24),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              'Skip',
-                              style: TextStyle(
-                                color: _primary,
-                                fontSize: skipFontSize,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(width: 4),
-                            Icon(Icons.arrow_forward_rounded,
-                                color: _primary.withOpacity(0.8), size: 14),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
 
                   SizedBox(height: size.height * 0.2),
 

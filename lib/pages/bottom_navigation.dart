@@ -1,4 +1,3 @@
-import 'package:amoeba/chats/exchange_history_page.dart';
 import 'package:amoeba/chats/swap_requests_page.dart';
 import 'package:amoeba/pages/chatspage.dart';
 import 'package:amoeba/pages/homepage.dart';
@@ -6,7 +5,6 @@ import 'package:amoeba/pages/profilepage_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_svg/svg.dart';
-
 import '../user_product/product_page.dart';
 
 // ─── Responsive Layout Helper ────────────────────────────────────────────────
@@ -180,6 +178,11 @@ class _BottomNavigationState extends State<BottomNavigation> {
 
               return Expanded(
                 child: GestureDetector(
+                  // ✅ Fix: make the ENTIRE tile tappable, not just the
+                  // pixels its child happens to paint. Without this,
+                  // unselected tabs (decoration: null) have "dead" areas
+                  // in their padding/gaps that swallow the first tap.
+                  behavior: HitTestBehavior.opaque,
                   onTap: () => setState(() => _selectedIndex = index),
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 250),
