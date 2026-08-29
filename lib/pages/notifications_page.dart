@@ -28,12 +28,12 @@ const Set<String> _kNonChatTypes = {
   'new_suggestion',
 };
 
-bool _isChatDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+bool _isNonChatDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
   final data = doc.data();
   final routeData =
   (data['data'] is Map) ? Map<String, dynamic>.from(data['data'] as Map) : {};
   final type = (routeData['type'] as String?) ?? 'text';
-  return !_kNonChatTypes.contains(type);
+  return _kNonChatTypes.contains(type);
 }
 
 /// In-app history of every push notification sent to this user — swap
@@ -134,7 +134,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
                   .snapshots(),
               builder: (context, snap) {
                 final docs =
-                (snap.data?.docs ?? []).where(_isChatDoc).toList();
+                (snap.data?.docs ?? []).where(_isNonChatDoc).toList();
                 final hasUnread =
                 docs.any((d) => (d.data()['read'] as bool?) != true);
                 if (!hasUnread) return const SizedBox.shrink();
@@ -177,7 +177,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
               child: CircularProgressIndicator(color: _kPrimary),
             );
           }
-          final docs = snapshot.data!.docs.where(_isChatDoc).toList();
+          final docs = snapshot.data!.docs.where(_isNonChatDoc).toList();
           if (docs.isEmpty) {
             return const _EmptyState(
               icon: Icons.notifications_none_rounded,

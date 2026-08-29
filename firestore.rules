@@ -20,6 +20,18 @@ rules_version = '2';
 //   exchangeHistory/{id}               participants: [both]
 //
 // CHANGE LOG:
+//   - UserProductList.create: price check now has a second branch. Users
+//     with hasLifetimeListingAccess on their user doc no longer see a price
+//     field in the app at all, and the client sends `price: 0` for them
+//     (see the app's UserProductListingPage — `_enteredPrice` defaults to 0
+//     when nothing was typed). The original rule required price > 0
+//     unconditionally, so every lifetime-access publish was rejected with
+//     PERMISSION_DENIED ("Upload failed"). The rule still requires price to
+//     be a number in both branches, and still requires price > 0 for
+//     everyone else — the >= 0 allowance only applies when
+//     hasLifetimeListingAccess == true on the requesting user's own doc, so
+//     no one else can skip the price check by simply omitting it.
+//
 //   - Added `hasPaid` to the users/{uid} update guard, alongside the
 //     existing role/banned protection. hasPaid can now ONLY be set by the
 //     verifyPayment Cloud Function (Admin SDK writes bypass these rules
@@ -191,8 +203,20 @@ service cloud.firestore {
         && request.resource.data.userId == request.auth.uid
         // A missing/zero/negative price broke home-page sorting the same
         // way a missing lat/lng did — require a real positive number.
+        //
+        // EXCEPTION (see CHANGE LOG): users with hasLifetimeListingAccess
+        // never see a price field in the app and the client sends price: 0
+        // for them — allow that one case through (price still must be a
+        // number, just >= 0 instead of > 0). Everyone else still needs a
+        // real positive price; a non-lifetime user can't get this branch
+        // just by sending 0, since hasLifetimeListingAccess on their own
+        // user doc must actually be true.
         && request.resource.data.price is number
-        && request.resource.data.price > 0;
+        && (
+          request.resource.data.price > 0
+          || (userData(request.auth.uid).get('hasLifetimeListingAccess', false) == true
+              && request.resource.data.price >= 0)
+        );
 
       // FIX: banned users could previously still edit/delete their own
       // existing listings even though blocked from creating new ones.

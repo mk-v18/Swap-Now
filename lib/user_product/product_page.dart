@@ -772,13 +772,16 @@ class _UserProductListingPageState extends State<UserProductListingPage> {
         'userId'     : user.uid,
         'title'      : _titleController.text.trim(),
         'description': _descriptionController.text.trim(),
-        // FIX(request): store null (not 0) when this was a lifetime-access
-        // publish with no price field shown/collected, so it isn't mistaken
-        // for an actual ₹0 asking price anywhere downstream (home page,
-        // filters, etc).
-        'price'      : (_hasLifetimeAccess == true && _priceController.text.trim().isEmpty)
-            ? null
-            : _enteredPrice,
+        // FIX(bugfix): originally tried writing `null` here for lifetime
+        // publishes with no price collected, to avoid it looking like a
+        // real ₹0 asking price. That broke Publish with a permission-denied
+        // error — your Firestore rules validate `price` as a number on
+        // create, and `null` fails that check. Reverted to always writing
+        // a number (0 when nothing was entered), matching what this field
+        // always sent before and what your rules expect. If you want to
+        // distinguish "no price" from "₹0" later, the rules need to allow
+        // null first — happy to help with that when you're ready.
+        'price'      : _enteredPrice,
         'category'   : _category,
         'condition'  : _condition,
         'location'   : _location.trim(),
