@@ -60,6 +60,26 @@ class _OtpSignupPageState extends State<OtpSignupPage>
   // built-in SMS Retriever auto-retrieval works on its own —
   // `verificationCompleted` fires automatically with `credential.smsCode`
   // already populated, no permission dialog, no second receiver, no crash.
+  //
+  // FIX: `verificationCompleted` alone is unreliable in practice — Play
+  // Services silently declines to start the Retriever on some devices/OEM
+  // ROMs, so relying on it as the only autofill path meant users often had
+  // to type the OTP manually. Rather than reintroducing otp_autofill (and
+  // its crash), this adds a SECOND, independent autofill path that uses
+  // Android's OS-level Autofill Framework via `AutofillHints.oneTimeCode`.
+  // That framework doesn't register an app-level broadcast receiver at all
+  // — it's serviced by the keyboard/autofill service reading the same
+  // Retriever-formatted SMS — so it can't collide with Firebase's receiver.
+  //
+  // The bug that made this "not work properly" before: the hint was placed
+  // on ALL 6 boxes. The Autofill Framework expects exactly ONE field to
+  // carry `oneTimeCode`; that field receives the *entire* 6-digit code as
+  // one autofill suggestion. With 6 competing claims, most keyboards either
+  // pick unpredictably or never surface the suggestion chip at all. The
+  // hint now lives only on box 0 (see `_buildOtpBox`), and box 0's existing
+  // `onChanged` already detects a 6-digit value and calls
+  // `_fillBoxesVisually` to spread it across the other 5 boxes — so no new
+  // wiring was needed, just removing the duplicate hints.
 
   // ── Controllers / nodes ───────────────────────────────────────────────────
   final TextEditingController _phoneController = TextEditingController();
@@ -389,7 +409,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
 
         // Fires automatically the moment Firebase's own SMS Retriever
         // detects the incoming OTP SMS (release SHA-256 is registered) —
-        // no dialog, no extra permission, no second receiver.
+        // no dialog, no extra permission, no second receiver. This is one
+        // of two independent autofill paths now — see `_buildOtpBox` for
+        // the OS Autofill Framework path, which covers the cases where
+        // Play Services doesn't start the Retriever on-device.
         verificationCompleted: (PhoneAuthCredential credential) async {
           if (!mounted) return;
 
@@ -437,6 +460,10 @@ class _OtpSignupPageState extends State<OtpSignupPage>
           _slideCtrl.forward();
           _startResendTimer();
           _showSuccessSnack('OTP sent to +91 $phone');
+          // Focus box 0 as soon as the slide-in animation settles — this is
+          // also the field carrying `AutofillHints.oneTimeCode`, so it's
+          // ready to receive the OS autofill suggestion the instant it
+          // appears, with no extra tap needed from the user.
           Future.delayed(
             const Duration(milliseconds: 320), // matches slide-in duration
                 () {
@@ -620,8 +647,24 @@ class _OtpSignupPageState extends State<OtpSignupPage>
               focusNode:       _focusNodes[index],
               keyboardType:    TextInputType.number,
               textAlign:       TextAlign.center,
-              maxLength:       1,
-              autofillHints:   const [AutofillHints.oneTimeCode],
+              maxLength:       index == 0 ? 6 : 1,
+              // FIX (autofill): `AutofillHints.oneTimeCode` must be applied
+              // to exactly ONE field, not all 6. The OS Autofill Framework
+              // treats every field carrying the hint as a candidate for the
+              // *entire* code, so 6 competing claims meant most keyboards
+              // either picked unpredictably or never showed the suggestion
+              // chip at all — this was the actual cause of autofill "not
+              // working properly". Box 0 alone now advertises the hint and
+              // receives the full 6-digit code as one value; the existing
+              // `onChanged` below already detects a length > 1 value and
+              // calls `_fillBoxesVisually` to spread it across boxes 1-5,
+              // so nothing else needed to change. `maxLength` on box 0 is
+              // raised to 6 to match — otherwise the platform truncates the
+              // incoming autofill value to 1 character before it ever
+              // reaches `onChanged`.
+              autofillHints: index == 0
+                  ? const [AutofillHints.oneTimeCode]
+                  : null,
               textInputAction:
               index < 5 ? TextInputAction.next : TextInputAction.done,
               inputFormatters: [FilteringTextInputFormatter.digitsOnly],
@@ -647,13 +690,17 @@ class _OtpSignupPageState extends State<OtpSignupPage>
                     ? const Color(0xFFF5F0FF)
                     : Colors.white,
               ),
-              // onChanged ONLY handles focus movement and paste
+              // onChanged ONLY handles focus movement and paste/autofill
               // distribution — nothing else. Fill color is handled above
               // via AnimatedBuilder, and auto-verify is handled centrally
               // by `_onOtpTextChanged`, so this can never get out of sync
               // with what the controllers actually contain.
               onChanged: (value) {
                 if (value.length > 1) {
+                  // Full-code arrival — either OS autofill on box 0, or a
+                  // manual paste on any box. Handled identically either
+                  // way: split into the 6 boxes and let auto-verify take
+                  // it from there.
                   final digits = value.replaceAll(_nonDigits, '');
                   if (digits.length == 6) {
                     _fillBoxesVisually(digits);

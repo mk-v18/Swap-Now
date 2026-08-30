@@ -166,15 +166,19 @@ class _ProfilePageScreenState extends State<ProfilePageScreen> {
   }
 
   Future<void> _logout() async {
-    await FirebaseAuth.instance.signOut();
-    if (!mounted) return;
-    _showSuccessSnack("Logout successful");
-    await Future.delayed(const Duration(milliseconds: 1500));
-    if (!mounted) return;
-    Navigator.push(
+    // Navigate first (this disposes old screens & their listeners),
+    // THEN sign out.
+    Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const OtpSignupPage()),
+          (route) => false, // clears everything underneath
     );
+
+    await FirebaseAuth.instance.signOut();
+
+    if (mounted) {
+      _showSuccessSnack("Logout successful");
+    }
   }
 
   @override

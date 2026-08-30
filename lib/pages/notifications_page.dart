@@ -166,6 +166,9 @@ class _NotificationsPageState extends State<NotificationsPage> {
             .snapshots(),
         builder: (context, snapshot) {
           if (snapshot.hasError) {
+            if (kDebugMode) {
+              debugPrint('[Notifications] stream error: ${snapshot.error}');
+            }
             return const _EmptyState(
               icon: Icons.error_outline,
               title: 'Could not load notifications',
@@ -186,20 +189,42 @@ class _NotificationsPageState extends State<NotificationsPage> {
               "You'll see swaps, messages, and updates here.",
             );
           }
-          return ListView.separated(
-            padding: const EdgeInsets.symmetric(vertical: 6),
-            itemCount: docs.length,
-            separatorBuilder: (_, __) => Divider(
-              height: 1,
-              indent: 72,
-              color: Colors.grey.shade200,
-            ),
-            itemBuilder: (context, i) {
-              final doc = docs[i];
-              return _NotificationTile(
-                doc: doc,
-                onTap: () => _onTapNotification(doc),
-                onDismiss: () => _deleteNotification(doc),
+
+          // Group into Today / Yesterday / Earlier sections for scannability.
+          final sections = _groupByDate(docs);
+
+          return ListView.builder(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+            itemCount: sections.length,
+            itemBuilder: (context, sectionIndex) {
+              final section = sections[sectionIndex];
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: EdgeInsets.fromLTRB(
+                        8, sectionIndex == 0 ? 4 : 18, 8, 8),
+                    child: Text(
+                      section.label,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.2,
+                        color: Colors.grey.shade500,
+                      ),
+                    ),
+                  ),
+                  ...section.docs.map(
+                        (doc) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: _NotificationTile(
+                        doc: doc,
+                        onTap: () => _onTapNotification(doc),
+                        onDismiss: () => _deleteNotification(doc),
+                      ),
+                    ),
+                  ),
+                ],
               );
             },
           );
@@ -207,6 +232,47 @@ class _NotificationsPageState extends State<NotificationsPage> {
       ),
     );
   }
+}
+
+class _NotificationSection {
+  final String label;
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>> docs;
+  _NotificationSection(this.label, this.docs);
+}
+
+List<_NotificationSection> _groupByDate(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final yesterday = today.subtract(const Duration(days: 1));
+
+  final todayDocs = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+  final yesterdayDocs = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+  final earlierDocs = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+
+  for (final doc in docs) {
+    final createdAt = doc.data()['createdAt'];
+    if (createdAt is! Timestamp) {
+      earlierDocs.add(doc);
+      continue;
+    }
+    final d = createdAt.toDate();
+    final day = DateTime(d.year, d.month, d.day);
+    if (day == today) {
+      todayDocs.add(doc);
+    } else if (day == yesterday) {
+      yesterdayDocs.add(doc);
+    } else {
+      earlierDocs.add(doc);
+    }
+  }
+
+  return [
+    if (todayDocs.isNotEmpty) _NotificationSection('Today', todayDocs),
+    if (yesterdayDocs.isNotEmpty)
+      _NotificationSection('Yesterday', yesterdayDocs),
+    if (earlierDocs.isNotEmpty) _NotificationSection('Earlier', earlierDocs),
+  ];
 }
 
 class _EmptyState extends StatelessWidget {
@@ -365,88 +431,116 @@ class _NotificationTile extends StatelessWidget {
       key: ValueKey(doc.id),
       direction: DismissDirection.endToStart,
       background: Container(
+        margin: const EdgeInsets.only(bottom: 0),
         alignment: Alignment.centerRight,
-        padding: const EdgeInsets.only(right: 24),
-        color: const Color(0xFFC62828),
-        child: const Icon(Icons.delete_outline, color: Colors.white),
+        padding: const EdgeInsets.only(right: 22),
+        decoration: BoxDecoration(
+          color: const Color(0xFFE53935),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: const Icon(Icons.delete_outline_rounded,
+            color: Colors.white, size: 22),
       ),
       onDismissed: (_) => onDismiss(),
       child: Material(
-        color: isRead ? Colors.white : _kPrimary.withOpacity(0.06),
-        child: InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Container(
-                  width: 42,
-                  height: 42,
-                  decoration: BoxDecoration(
-                    color: color.withOpacity(0.12),
-                    shape: BoxShape.circle,
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(16),
+        clipBehavior: Clip.antiAlias,
+        child: Ink(
+          decoration: BoxDecoration(
+            color: isRead ? Colors.white : color.withOpacity(0.055),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isRead ? Colors.grey.shade200 : color.withOpacity(0.22),
+              width: 1,
+            ),
+          ),
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(16),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          color.withOpacity(0.18),
+                          color.withOpacity(0.10),
+                        ],
+                      ),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(icon, color: color, size: 22),
                   ),
-                  child: Icon(icon, color: color, size: 22),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 14.5,
-                                fontWeight:
-                                isRead ? FontWeight.w600 : FontWeight.w800,
-                                color: _kPrimaryDark,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 14.5,
+                                  fontWeight: isRead
+                                      ? FontWeight.w600
+                                      : FontWeight.w800,
+                                  color: _kPrimaryDark,
+                                  height: 1.2,
+                                ),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 8),
+                            const SizedBox(width: 8),
+                            if (!isRead)
+                              Container(
+                                margin: const EdgeInsets.only(top: 3, right: 6),
+                                width: 7,
+                                height: 7,
+                                decoration: BoxDecoration(
+                                  color: color,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                            Text(
+                              timeLabel,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w500,
+                                color: Colors.grey.shade500,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (body.isNotEmpty) ...[
+                          const SizedBox(height: 4),
                           Text(
-                            timeLabel,
+                            body,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              fontSize: 11,
-                              color: Colors.grey.shade500,
+                              fontSize: 13,
+                              height: 1.35,
+                              color: Colors.grey.shade700,
                             ),
                           ),
                         ],
-                      ),
-                      if (body.isNotEmpty) ...[
-                        const SizedBox(height: 3),
-                        Text(
-                          body,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: Colors.grey.shade700,
-                          ),
-                        ),
                       ],
-                    ],
-                  ),
-                ),
-                if (!isRead) ...[
-                  const SizedBox(width: 8),
-                  Container(
-                    margin: const EdgeInsets.only(top: 4),
-                    width: 9,
-                    height: 9,
-                    decoration: const BoxDecoration(
-                      color: _kPrimary,
-                      shape: BoxShape.circle,
                     ),
                   ),
                 ],
-              ],
+              ),
             ),
           ),
         ),
