@@ -211,6 +211,16 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
             // ── Info Card (title + price + badges) ────────────────────────
             _buildInfoCard(rl),
 
+            // ── Blocking-swap banner ────────────────────────────────────────
+            // Shown when the user already has an active (pending/accepted)
+            // swap with THIS SAME SELLER on a different item — explains why
+            // "Send swap request" below is unavailable, up front, instead of
+            // making them scroll down and decode a disabled button label.
+            if (_existingRequestChecked && _blockingUserRequest != null) ...[
+              const SizedBox(height: 12),
+              _buildBlockingBanner(rl),
+            ],
+
             const SizedBox(height: 12),
 
             // ── Meta Card (location + category + condition) ───────────────
@@ -545,6 +555,148 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   //      with a label that explains why and (if that other swap is already
   //      accepted) a tap-through into its chat.
   //   5. no existing/blocking request → normal "Send swap request" flow.
+  // FIX(one-swap-per-user UX): explains, up front and in plain language,
+  // why a new swap can't be started with this seller right now — instead of
+  // letting the user discover it only from the bottom bar's label. Tapping
+  // it does the same thing the bottom bar's own action does for each status
+  // (jump to chat when accepted; explain when still pending, since a
+  // pending request can't be cancelled from anywhere in the app yet — the
+  // other person has to accept or decline it first).
+  Widget _buildBlockingBanner(_RL rl) {
+    final req = _blockingUserRequest;
+    if (req == null) return const SizedBox.shrink();
+
+    final blockingStatus = req['status'] as String?;
+    final isAccepted = blockingStatus == 'accepted';
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+    final iAmSender = req['fromUserId'] == myUid;
+    final otherName =
+        ((iAmSender ? req['toUserName'] : req['fromUserName']) as String?) ??
+            'this seller';
+    final theirProduct =
+    Map<String, dynamic>.from(req['listedProduct'] as Map? ?? {});
+    final theirProductTitle =
+        (theirProduct['title'] as String?) ?? 'another item';
+
+    final accent = isAccepted ? Colors.orange.shade800 : Colors.orange.shade700;
+    final bg = Colors.orange.shade50;
+    final message = isAccepted
+        ? 'You have an active swap with $otherName for "$theirProductTitle". '
+        'Complete or cancel it before starting a new one.'
+        : 'You already sent $otherName a swap request for "$theirProductTitle" '
+        'that\'s still pending. You\'ll need to wait for them to respond '
+        'before starting a new swap.';
+
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: rl.hPad),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: isAccepted
+            ? (_isMessaging ? null : _continueBlockingChat)
+            : () => _showBlockingInfoDialog(otherName, theirProductTitle),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: accent.withOpacity(0.3)),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: accent.withOpacity(0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  isAccepted
+                      ? Icons.swap_horiz_rounded
+                      : Icons.hourglass_top_rounded,
+                  color: accent,
+                  size: 20,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isAccepted
+                          ? 'Finish your other swap first'
+                          : 'Swap already pending with this user',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: accent,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      message,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: accent.withOpacity(0.9),
+                        height: 1.35,
+                      ),
+                    ),
+                    if (isAccepted) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        'Tap to open chat →',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: accent,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Tapped from either the blocking banner or the disabled bottom-bar
+  // label when the blocking swap is still pending (no chat to jump to
+  // yet, so there's nothing to navigate to — just explain the situation).
+  void _showBlockingInfoDialog(String otherName, String theirProductTitle) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        icon: Icon(Icons.hourglass_top_rounded,
+            color: Colors.orange.shade700, size: 32),
+        title: const Text('Swap pending with this user',
+            textAlign: TextAlign.center),
+        content: Text(
+          'You already sent $otherName a swap request for "$theirProductTitle" '
+              'and it\'s still awaiting their response.\n\n'
+              'Only one active swap is allowed per person at a time, so '
+              'you\'ll be able to start a new request here once they accept '
+              'or decline that one.',
+          textAlign: TextAlign.center,
+          style: const TextStyle(height: 1.4),
+        ),
+        actionsAlignment: MainAxisAlignment.center,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildBottomBar(_RL rl) {
     final status = _existingRequest?['status'] as String?;
     final blockingStatus = _blockingUserRequest?['status'] as String?;
@@ -577,7 +729,24 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     } else if (blockingStatus == 'pending') {
       label = 'Pending swap with this user';
       icon = Icons.hourglass_top_rounded;
-      onTap = null;
+      // Kept visually "disabled" (isNeutralDisabled below drives the grey
+      // gradient) but still tappable — shows the same explanation as the
+      // banner above instead of doing nothing when tapped.
+      onTap = () {
+        final req = _blockingUserRequest;
+        if (req == null) return;
+        final myUid = FirebaseAuth.instance.currentUser?.uid;
+        final iAmSender = req['fromUserId'] == myUid;
+        final otherName =
+            ((iAmSender ? req['toUserName'] : req['fromUserName'])
+            as String?) ??
+                'this seller';
+        final theirProduct =
+        Map<String, dynamic>.from(req['listedProduct'] as Map? ?? {});
+        final theirProductTitle =
+            (theirProduct['title'] as String?) ?? 'another item';
+        _showBlockingInfoDialog(otherName, theirProductTitle);
+      };
       isNeutralDisabled = true;
     } else {
       label = _isMessaging ? 'Sending swap request...' : 'Send swap request';
@@ -585,7 +754,13 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
       onTap = _isMessaging ? null : _initiateSwap;
     }
 
-    final disabled = onTap == null;
+    // `disabled` drives the grey/inactive visual styling below. It used to
+    // be identical to "onTap == null", but the pending-blocking case above
+    // is now tappable (opens an explanation dialog) while still needing to
+    // *look* disabled, so the visual and interactive states are tracked
+    // separately via isNeutralDisabled/isTealDisabled instead.
+    final isTealDisabled = !isNeutralDisabled && onTap == null;
+    final disabled = isNeutralDisabled || isTealDisabled;
 
     return SafeArea(
       child: Container(

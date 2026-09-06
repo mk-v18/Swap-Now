@@ -82,13 +82,13 @@ rules_version = '2';
 //     4. UserProductList.update/delete: banned users could still edit or
 //        delete their own existing listings even though they're blocked
 //        from creating new ones. Added the same !isBanned() guard.
-//     5. referrals.update: NOTE — the joinedUsers += 1 transaction still has
-//        no replay protection (nothing stops one account from re-running
-//        the increment). A proper fix needs a companion
-//        referrals/{code}/joinedBy/{uid} doc that's created once per user
-//        and checked for non-existence before allowing the increment — left
-//        as a follow-up since it requires a matching client-side change to
-//        write that doc, which isn't visible from these rules alone.
+//     5. referrals.update: FIXED — replay protection added via a companion
+//        referrals/{code}/joinedBy/{uid} doc, created once per redeeming
+//        user in the same transaction as the joinedUsers increment. The
+//        update rule now requires that doc to NOT already exist, and the
+//        joinedBy/{uid} doc itself can only ever be created once (no
+//        update, client can't delete). See personal_details.dart's
+//        _finishImageUpload for the matching transaction change.
 //
 //   - ADMIN CHAT ACCESS (this revision):
 //     The app reuses ChatScreen for the admin panel to open and moderate any
@@ -373,22 +373,35 @@ match /{path=**}/ads/{adId} {
       allow read: if isSignedIn();
       allow create, delete: if isAdmin();
 
-      // Allow the signup flow's counter-increment transaction, but lock down
-      // every other field so a user can't rewrite the referral itself.
-      //
-      // KNOWN LIMITATION (see CHANGE LOG above): this does not stop the same
-      // account from replaying the increment multiple times. Proper replay
-      // protection needs a companion referrals/{code}/joinedBy/{uid} doc
-      // written once per user and checked here for non-existence — not
-      // added yet since it requires a matching client-side change to write
-      // that doc.
+      // FIX (replay protection): the increment is now only allowed if the
+      // caller has NOT already redeemed this code — proven by the
+      // companion referrals/{code}/joinedBy/{uid} doc below not existing
+      // yet. The client must create that doc in the SAME transaction that
+      // performs this update (see _finishImageUpload in
+      // personal_details.dart) — if it only does one or the other, either
+      // the increment or the replay-guard doc will be missing and the
+      // transaction won't reflect reality, but neither omission lets a
+      // replay through, since this rule is the actual enforcement point,
+      // not the client's transaction logic.
       allow update: if isAdmin()
         || (
           isSignedIn()
           && request.resource.data.code == resource.data.code
           && request.resource.data.get('activeUntil', null) == resource.data.get('activeUntil', null)
           && request.resource.data.joinedUsers == resource.data.get('joinedUsers', 0) + 1
+          && !exists(/databases/$(database)/documents/referrals/$(code)/joinedBy/$(request.auth.uid))
         );
+
+      // One doc per (code, uid) pair, created exactly once by the redeeming
+      // user as proof-of-redemption. Never updatable or deletable by a
+      // client — only an admin (e.g. to manually reverse a fraudulent
+      // redemption) can remove it.
+      match /joinedBy/{uid} {
+        allow read: if isSignedIn();
+        allow create: if isOwner(uid) && request.resource.data.uid == uid;
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
     }
 
     // ---------------- reports ----------------

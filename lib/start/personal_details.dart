@@ -581,9 +581,18 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
         final refDoc = FirebaseFirestore.instance
             .collection('referrals')
             .doc(referralDocId);
+        // FIX(security): replay guard — one doc per (code, uid), created
+        // only on first redemption. Must be read+written inside the SAME
+        // transaction as the joinedUsers increment so the check-then-write
+        // is atomic (matches the rule at referrals/{code}/joinedBy/{uid}).
+        final joinedByDoc = refDoc.collection('joinedBy').doc(uid);
         await FirebaseFirestore.instance.runTransaction((tx) async {
-          final snapshot = await tx.get(refDoc);
-          if (snapshot.exists) {
+          // All reads must happen before any writes in a Firestore
+          // transaction, so read both docs first.
+          final snapshot     = await tx.get(refDoc);
+          final alreadyJoined = await tx.get(joinedByDoc);
+
+          if (snapshot.exists && !alreadyJoined.exists) {
             final data   = snapshot.data() as Map<String, dynamic>;
             final joined =
             (data['joinedUsers'] is int) ? data['joinedUsers'] as int : 0;
@@ -591,7 +600,14 @@ class _PersonalDetailsPageState extends State<PersonalDetailsPage> {
               'joinedUsers':  joined + 1,
               'lastJoinedAt': FieldValue.serverTimestamp(),
             });
+            tx.set(joinedByDoc, {
+              'uid':      uid,
+              'joinedAt': FieldValue.serverTimestamp(),
+            });
           }
+          // If alreadyJoined.exists, this account has already redeemed
+          // this code — silently skip the increment (matches the rule's
+          // enforcement; this is defense-in-depth, not the actual guard).
         });
       }
     } catch (_) {

@@ -1,0 +1,13 @@
+{
+  "name": "swapnow-rules-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Firestore security rules tests (emulator-based, isolated from Flutter test/ and functions/)",
+  "scripts": {
+    "test": "jest --testTimeout 20000"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^3.0.4",
+    "jest": "^29.7.0"
+  }
+}

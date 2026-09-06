@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:amoeba/pages/wishlistpage.dart';
-import 'package:amoeba/pages/notifications_page.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -74,22 +73,6 @@ const List<String> _kCategories = [
 // ─── Brand colours ────────────────────────────────────────────────────────────
 const Color _kPrimary = Color(0xFF5800B3);
 const Color _kPrimaryDark = Color(0xFF26004D);
-
-// Kept in sync with notifications_page.dart's `_kNonChatTypes` — used only
-// to exclude chat-message notifications from the bell's unread badge count,
-// matching what NotificationsPage itself displays.
-const Set<String> _kNonChatNotificationTypes = {
-  'swap_request',
-  'swap_accepted',
-  'swap_declined',
-  'exchange_completed',
-  'exchange_cancelled',
-  'help_query',
-  'ad_request_submitted',
-  'ad_request_approved',
-  'ad_request_rejected',
-  'new_suggestion',
-};
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -600,15 +583,8 @@ class _HomePageState extends State<HomePage> {
                             fontSize: 24,
                           ),
                         ),
-                        Row(
-                          children: [
-                            _iconBtn(context, 'assets/icons/favourite.svg',
-                                const WishlistPage()),
-                            SizedBox(
-                                width: _BP.isTablet(context) ? 10 : 8),
-                            _notificationBell(context),
-                          ],
-                        ),
+                        _iconBtn(context, 'assets/icons/favourite.svg',
+                            const WishlistPage()),
                       ],
                     )
                         : null,
@@ -708,14 +684,8 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                   if (!_showPinnedSearch)
-                    Row(
-                      children: [
-                        _iconBtn(context, 'assets/icons/favourite.svg',
-                            const WishlistPage()),
-                        SizedBox(width: isTablet ? 14 : 12),
-                        _notificationBell(context),
-                      ],
-                    ),
+                    _iconBtn(context, 'assets/icons/favourite.svg',
+                        const WishlistPage()),
                 ],
               ),
 
@@ -902,83 +872,6 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
       ),
-    );
-  }
-
-  /// Bell icon with a small unread dot, sourced from
-  /// `users/{uid}/notifications` (see NotificationsPage). Mirrors
-  /// `_iconBtn`'s look, now using the notification SVG asset instead of a
-  /// Material icon, and a plain dot instead of a numeric badge.
-  Widget _notificationBell(BuildContext context) {
-    final size = _BP.iconBtnSize(context);
-    final user = FirebaseAuth.instance.currentUser;
-
-    final button = Material(
-      color: Colors.transparent,
-      shape: const CircleBorder(),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        splashColor: _kPrimaryDark.withOpacity(0.1),
-        highlightColor: _kPrimaryDark.withOpacity(0.05),
-        onTap: () => Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const NotificationsPage()),
-        ),
-        child: _circleIcon(
-          SvgPicture.asset(
-            'assets/icons/notification.svg', // ← update to your actual asset path
-            width: size,
-            height: size,
-            colorFilter: const ColorFilter.mode(
-              _kPrimaryDark,
-              BlendMode.srcIn,
-            ),
-          ),
-        ),
-      ),
-    );
-
-    if (user == null) return button;
-
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        button,
-        Positioned(
-          top: 2,
-          right: 2,
-          child: StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance
-                .collection('users')
-                .doc(user.uid)
-                .collection('notifications')
-                .where('read', isEqualTo: false)
-                .snapshots(),
-            builder: (context, snap) {
-              // Same filtering as before — chat notifications don't count
-              // toward the indicator, matching NotificationsPage's inbox.
-              final hasUnread = (snap.data?.docs ?? []).any((d) {
-                final data = d.data() as Map<String, dynamic>? ?? {};
-                final routeData = (data['data'] is Map)
-                    ? Map<String, dynamic>.from(data['data'] as Map)
-                    : <String, dynamic>{};
-                return _kNonChatNotificationTypes
-                    .contains(routeData['type'] as String? ?? 'text');
-              });
-              if (!hasUnread) return const SizedBox.shrink();
-              return Container(
-                width: 10,
-                height: 10,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFE53935),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 1.5),
-                ),
-              );
-            },
-          ),
-        ),
-      ],
     );
   }
 
