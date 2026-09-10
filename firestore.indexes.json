@@ -176,11 +176,7 @@
       "queryScope": "COLLECTION",
       "fields": [
         {
-          "fieldPath": "chatId",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "participants",
+          "fieldPath": "productIds",
           "arrayConfig": "CONTAINS"
         },
         {

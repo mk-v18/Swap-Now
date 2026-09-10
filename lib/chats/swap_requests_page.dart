@@ -705,7 +705,14 @@ class _SwapRequestsPageState extends State<SwapRequestsPage>
         break;
       case 'cancelled':
         badgeColor = Colors.redAccent;
-        label = 'Cancelled';
+        // FIX(cross-notify-other-requesters): the onSwapCompleted Cloud
+        // Function auto-cancels a request (rather than either side tapping
+        // "Cancel") when the item got swapped with someone else first —
+        // tagged via `cancelReason` so this can read as "Item Unavailable"
+        // instead of the generic "Cancelled" a mutual cancel gets.
+        label = data['cancelReason'] == 'item_unavailable'
+            ? 'Item Unavailable'
+            : 'Cancelled';
         break;
       default:
         badgeColor = Colors.orange;

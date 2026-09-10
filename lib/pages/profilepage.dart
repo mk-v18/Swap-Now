@@ -299,11 +299,32 @@ class _ProfilePageState extends State<ProfilePage> {
 
     try {
       if (_pickedImage != null && uid != null) {
+        // FIX(profile-pic-not-displaying): this was uploading to
+        // 'user_images/$uid.jpg' while onboarding (personal_details.dart)
+        // uploads the very first profile photo to 'profile_images/$uid.jpg'
+        // — two different Storage paths for the same field. Both still
+        // write a download URL into the same Firestore 'profileImage'
+        // field, so nothing looked wrong in this file's own code, but if
+        // Storage security rules only grant read access under
+        // 'profile_images/*' (the original, and much more commonly
+        // referenced, path), any photo a user later changed from THIS
+        // screen would upload fine, save fine, and then silently fail to
+        // load everywhere it's displayed — including the chat list and
+        // chat screen avatars — because the resulting URL points
+        // somewhere reads are denied. Unified to the same path onboarding
+        // already uses, so every profile photo — first upload or a later
+        // change — lives at the same Storage location and rule.
         final ref = FirebaseStorage.instance
             .ref()
-            .child('user_images')
+            .child('profile_images')
             .child('$uid.jpg');
-        await ref.putFile(_pickedImage!);
+        await ref.putFile(
+          _pickedImage!,
+          // Matches the content type set at onboarding — without this,
+          // Storage falls back to whatever MIME type the client device
+          // reports, which some rules configurations also gate on.
+          SettableMetadata(contentType: 'image/jpeg'),
+        );
         imageUrl = await ref.getDownloadURL();
       }
 

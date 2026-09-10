@@ -592,25 +592,56 @@ exports.onExchangeHistoryCreated = onDocumentCreated("exchangeHistory/{historyId
   const data = event.data?.data();
   if (!data) return null;
 
-  const other = (data.participants || []).find((uid) => uid !== data.completedBy);
-  if (!other) return null;
-
   // cancelSwap() also writes to exchangeHistory (status: 'cancelled'),
   // reusing this same trigger — branch the notification copy so a
   // cancelled swap doesn't tell the other participant it "completed".
   const isCancelled = data.status === "cancelled";
 
-  await _sendPushToUser(other, {
-    title: isCancelled ? "Swap cancelled" : "Exchange completed ✅",
-    body: isCancelled
+  // FIX(cross-notify-other-requesters): onSwapCompleted (below) writes one
+  // of these exchangeHistory docs for every OTHER pending/accepted request
+  // it auto-cancels on the same product, with completedBy: "system" (no
+  // real uid, since neither participant chose to cancel it — the item was
+  // simply swapped with someone else first). `.find()` against
+  // `completedBy` would only ever notify ONE side in that case (whichever
+  // participant happens to be first in the array) even though BOTH need
+  // to know. Filter instead of find so both get notified when the
+  // canceller isn't a real participant, while the normal manual-cancel /
+  // mark-successful path still only pings the *other* person as before.
+  const isAutoCancelled = data.reason === "item_unavailable";
+  const recipients = isAutoCancelled
+    ? (data.participants || [])
+    : (data.participants || []).filter((uid) => uid !== data.completedBy);
+
+  if (recipients.length === 0) return null;
+
+  const title = isAutoCancelled
+    ? "Item no longer available"
+    : isCancelled
+      ? "Swap cancelled"
+      : "Exchange completed ✅";
+  const body = isAutoCancelled
+    ? `"${data.listedProduct?.title || "This item"}" was swapped with someone else, so this request was cancelled.`
+    : isCancelled
       ? `Your swap for "${data.listedProduct?.title || "an item"}" was cancelled.`
-      : `Your swap for "${data.listedProduct?.title || "an item"}" was marked as completed.`,
-    data: {
-      type: isCancelled ? "exchange_cancelled" : "exchange_completed",
-      historyId: event.params.historyId,
-    },
-    channelId: "swap_updates",
-  });
+      : `Your swap for "${data.listedProduct?.title || "an item"}" was marked as completed.`;
+
+  await Promise.all(
+    recipients.map((uid) =>
+      _sendPushToUser(uid, {
+        title,
+        body,
+        data: {
+          type: isAutoCancelled
+            ? "swap_item_unavailable"
+            : isCancelled
+              ? "exchange_cancelled"
+              : "exchange_completed",
+          historyId: event.params.historyId,
+        },
+        channelId: "swap_updates",
+      })
+    )
+  );
   return null;
 });
 
@@ -700,6 +731,84 @@ exports.onSwapCompleted = onDocumentUpdated("swapRequests/{requestId}", async (e
         }).catch((e) => console.warn(`Could not mark UserProductList/${productId} exchanged:`, e.message))
       )
     );
+  }
+
+  // FIX(cross-notify-other-requesters): nothing before this stopped a
+  // seller from having several DIFFERENT users' pending/accepted requests
+  // open on the same listing at once (createSwapRequest only blocks the
+  // SAME user from double-requesting, and only blocks a second request
+  // with a seller they already have a live swap with — it never checked
+  // whether the LISTING already had someone else's live request on it).
+  // So when request A above completes and the listing/offered items get
+  // marked 'exchanged', any other swapRequests docs still sitting on the
+  // now-gone product(s) — e.g. user2's still-pending or already-accepted
+  // request while the seller completes with user3 instead — were
+  // previously left dangling: still 'accepted'/'pending' forever, with no
+  // way for that other user to learn the item is gone. Find and
+  // auto-cancel every one of those here, and log a matching
+  // exchangeHistory entry (reason: 'item_unavailable') so
+  // onExchangeHistoryCreated (above) pushes both sides a notification.
+  //
+  // `productIds` (an array field on every swapRequests doc, added at
+  // creation time) is what makes this queryable at all — `listedProduct`/
+  // `offeredProducts` are a map / list-of-maps, which Firestore can't
+  // filter into directly.
+  const idsForLookup = [...productIds].slice(0, 10); // array-contains-any cap
+  if (idsForLookup.length > 0) {
+    const staleDocs = [];
+    // Firestore forbids combining `array-contains-any` with an `in` filter
+    // in the same query, so — mirroring the two-separate-queries pattern
+    // already used throughout swap_request_service.dart — pending and
+    // accepted are queried one at a time rather than via `status in [...]`.
+    for (const status of ["pending", "accepted"]) {
+      const snap = await db
+        .collection("swapRequests")
+        .where("productIds", "array-contains-any", idsForLookup)
+        .where("status", "==", status)
+        .get();
+      for (const doc of snap.docs) {
+        if (doc.id !== event.params.requestId) staleDocs.push(doc);
+      }
+    }
+
+    if (staleDocs.length > 0) {
+      console.log(
+        `onSwapCompleted ${event.params.requestId} auto-cancelling ${staleDocs.length} other request(s) on the same product(s):`,
+        staleDocs.map((d) => d.id)
+      );
+      const cancelBatch = db.batch();
+      for (const doc of staleDocs) {
+        const d = doc.data();
+        cancelBatch.update(doc.ref, {
+          status: "cancelled",
+          cancelReason: "item_unavailable",
+          completedAt: FieldValue.serverTimestamp(),
+        });
+        cancelBatch.set(db.collection("exchangeHistory").doc(), {
+          participants: [d.fromUserId, d.toUserId],
+          participantNames: {
+            [d.fromUserId]: d.fromUserName || "User",
+            [d.toUserId]: d.toUserName || "User",
+          },
+          requestId: doc.id,
+          chatId: d.chatId || null,
+          listedProduct: d.listedProduct || {},
+          offeredProducts: d.offeredProducts || [],
+          status: "cancelled",
+          reason: "item_unavailable",
+          // Not a real uid — neither participant chose to cancel this one,
+          // the item was swapped with someone else first. See the
+          // `isAutoCancelled` branch in onExchangeHistoryCreated above,
+          // which relies on this to notify BOTH participants instead of
+          // just "the other one".
+          completedBy: "system",
+          completedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      await cancelBatch.commit().catch((err) =>
+        console.warn(`Could not auto-cancel stale requests for swapRequests/${event.params.requestId}:`, err.message)
+      );
+    }
   }
 
   return null;

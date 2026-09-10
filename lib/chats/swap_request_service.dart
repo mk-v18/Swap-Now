@@ -209,6 +209,22 @@ class SwapRequestService {
     final meName = (meData?['name'] as String?) ?? 'User';
     final meImage = (meData?['profileImage'] as String?) ?? '';
 
+    // FIX(cross-notify-other-requesters): flat array of every UserProductList
+    // id this request touches (the listing itself + whatever was offered for
+    // it). A seller can have several *different* people's pending/accepted
+    // requests open on the same listing at once — nothing before this
+    // stopped that — so when one of them is completed, the
+    // `onSwapCompleted` Cloud Function needs a cheap way to find every OTHER
+    // swapRequests doc referencing the same product id(s) and auto-cancel
+    // them. `offeredProducts`/`listedProduct` are maps (and a list of maps),
+    // which Firestore can't query into directly — this flat top-level array
+    // is what makes an `array-contains-any` lookup possible server-side.
+    final productIds = <String>{
+      if (productId.isNotEmpty) productId,
+      for (final p in offeredProducts)
+        if ((p['id'] as String?)?.isNotEmpty == true) p['id'] as String,
+    }.toList();
+
     final ref = await _firestore.collection('swapRequests').add({
       'fromUserId': me.uid,
       'fromUserName': meName,
@@ -221,8 +237,14 @@ class SwapRequestService {
       'participants': [me.uid, toUserId],
       'listedProduct': listedProduct,
       'offeredProducts': offeredProducts,
+      'productIds': productIds,
       // pending | accepted | declined | completed | cancelled
       'status': 'pending',
+      // Set only when `status` is auto-flipped to 'cancelled' by the
+      // onSwapCompleted Cloud Function because the item was swapped with
+      // someone else first — lets the UI show "Item unavailable" instead
+      // of a generic "Cancelled" for this case. Null for every other path.
+      'cancelReason': null,
       'chatId': null,
       'createdAt': FieldValue.serverTimestamp(),
       'respondedAt': null,
@@ -325,6 +347,14 @@ class SwapRequestService {
         // offering Y" text to both sides regardless of which side they're on.
         'fromUserId': fromUserId,
         'toUserId': toUserId,
+        // FIX(live-swap-status-in-chat): lets ChatScreen subscribe to this
+        // exact swapRequests doc and react live if its status changes —
+        // e.g. auto-cancelled by onSwapCompleted because the seller
+        // completed the swap with someone ELSE on the same listing first.
+        // Without this the chat's banner was a one-time snapshot that kept
+        // showing "Wants to Swap" forever, even long after the request
+        // behind it had been resolved one way or another.
+        'requestId': requestId,
         'updatedAt': FieldValue.serverTimestamp(),
       }
     }, SetOptions(merge: true));

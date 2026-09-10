@@ -16,6 +16,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:intl/intl.dart';
 import 'package:amoeba/chats/location_picker.dart';
 import 'package:amoeba/chats/notification_service.dart';
+import 'package:amoeba/pages/customer_products_page.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:dio/dio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -78,6 +79,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Map<String, dynamic>? _intent;
   bool _bannerCollapsed = false;
+
+  // ── Live swap status (see swap_request_service.dart's acceptRequest,
+  // which now stores `requestId` inside the chat's `intent` map) ──────────
+  // `_intent` above is a one-time snapshot loaded in `_loadIntent()`, so
+  // without this the banner kept showing "Wants to Swap" / "Offering: ..."
+  // forever even after the underlying swapRequests doc resolved —
+  // including the case where onSwapCompleted auto-cancels it because the
+  // seller completed the swap with a DIFFERENT person on the same listing
+  // first. This subscription is what lets the banner flip live once that
+  // happens, instead of only the Sent/Active tabs and a push notification
+  // reflecting it.
+  StreamSubscription<DocumentSnapshot>? _swapRequestSub;
+  String? _liveSwapStatus; // pending | accepted | completed | cancelled | declined
+  String? _liveCancelReason; // 'item_unavailable' when auto-cancelled, else null
 
   final Set<String> _alreadySaved = {};
 
@@ -177,6 +192,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _messageController.dispose();
     _scrollController.dispose();
     _recordTimer?.cancel();
+    _swapRequestSub?.cancel();
     _audioRecorder.dispose();
     _audioPlayer.dispose();
     _chatService.setTyping(widget.chatId, FirebaseAuth.instance.currentUser!.uid, false);
@@ -261,15 +277,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       var intent = (doc.data() as Map<String, dynamic>)['intent'] as Map<String, dynamic>?;
       if (intent == null) return;
 
-      // Chats accepted before `fromUserId`/`toUserId` were added to `intent`
-      // (see swap_request_service.dart's acceptRequest) still show the same
-      // un-personalized "wants X / offering Y" text to both participants —
-      // this fix only applies going forward for new writes. Self-heal those
-      // older chats the first time either person opens them: look up the
-      // direction from the matching accepted swapRequests doc and patch it
-      // onto the chat, so this only ever has to run once per chat, from
-      // either side.
-      if (intent['type'] == 'swap' && intent['fromUserId'] == null) {
+      // Chats accepted before `fromUserId`/`toUserId` (and, later,
+      // `requestId`) were added to `intent` (see swap_request_service.dart's
+      // acceptRequest) still show the same un-personalized "wants X /
+      // offering Y" text to both participants, and can't get live status
+      // updates without a requestId to subscribe to. This fix only applies
+      // going forward for new writes. Self-heal those older chats the first
+      // time either person opens them: look up the matching ACCEPTED
+      // swapRequests doc (the only case where a live subscription still
+      // matters — anything already completed/cancelled by now doesn't need
+      // one) and patch whichever of these fields are missing onto the chat,
+      // so this only ever has to run once per chat, from either side.
+      if (intent['type'] == 'swap' &&
+          (intent['fromUserId'] == null || intent['requestId'] == null)) {
         final myUid = FirebaseAuth.instance.currentUser?.uid;
         if (myUid != null) {
           final reqSnap = await FirebaseFirestore.instance
@@ -280,18 +300,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               .limit(1)
               .get();
           if (reqSnap.docs.isNotEmpty) {
-            final reqData = reqSnap.docs.first.data();
+            final reqDoc = reqSnap.docs.first;
+            final reqData = reqDoc.data();
             final fromUserId = reqData['fromUserId'] as String?;
             final toUserId = reqData['toUserId'] as String?;
             if (fromUserId != null && toUserId != null) {
-              intent = {...intent, 'fromUserId': fromUserId, 'toUserId': toUserId};
+              intent = {
+                ...intent,
+                'fromUserId': fromUserId,
+                'toUserId': toUserId,
+                'requestId': reqDoc.id,
+              };
               // Best-effort — don't block showing the banner on this write,
               // and don't fail the load if it can't write for some reason.
               unawaited(FirebaseFirestore.instance
                   .collection('chats')
                   .doc(widget.chatId)
                   .set({
-                'intent': {'fromUserId': fromUserId, 'toUserId': toUserId}
+                'intent': {
+                  'fromUserId': fromUserId,
+                  'toUserId': toUserId,
+                  'requestId': reqDoc.id,
+                }
               }, SetOptions(merge: true))
                   .catchError((_) {}));
             }
@@ -300,9 +330,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
 
       if (mounted) setState(() => _intent = intent);
+
+      final requestId = intent['requestId'] as String?;
+      if (intent['type'] == 'swap' && requestId != null) {
+        _subscribeToSwapRequest(requestId);
+      }
     } on FirebaseException catch (_) {
       // chat deleted or no longer accessible — nothing to show
     }
+  }
+
+  // FIX(live-swap-status-in-chat): keeps `_liveSwapStatus`/
+  // `_liveCancelReason` in sync with the swapRequests doc behind this
+  // chat's swap intent, so `_buildIntentBanner()` can immediately reflect
+  // a completion or (auto-)cancellation instead of the stale one-time
+  // snapshot `_intent` was loaded from.
+  void _subscribeToSwapRequest(String requestId) {
+    _swapRequestSub?.cancel();
+    _swapRequestSub = FirebaseFirestore.instance
+        .collection('swapRequests')
+        .doc(requestId)
+        .snapshots()
+        .listen((doc) {
+      if (!mounted || !doc.exists) return;
+      final data = doc.data() as Map<String, dynamic>;
+      setState(() {
+        _liveSwapStatus = data['status'] as String?;
+        _liveCancelReason = data['cancelReason'] as String?;
+      });
+    });
   }
 
   // ── Send actions ──────────────────────────────────────────────────────────
@@ -1080,6 +1136,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // a buy request. Anything else stored in old data just falls back to swap.
   Widget _buildIntentBanner() {
     final intentType = _intent!['type'] as String? ?? 'swap';
+
+    // FIX(live-swap-status-in-chat): once the swapRequests doc behind this
+    // swap intent has moved past pending/accepted, show a resolved-state
+    // banner instead of the normal "Wants to Swap" / "Offering: ..." one —
+    // covers a manual completion, a manual cancel, AND the auto-cancel
+    // case from onSwapCompleted (item swapped with someone else first).
+    // `_liveSwapStatus` starts null until the subscription's first
+    // snapshot arrives, so this only kicks in once we actually know.
+    if (intentType == 'swap' &&
+        _liveSwapStatus != null &&
+        _liveSwapStatus != 'pending' &&
+        _liveSwapStatus != 'accepted') {
+      return _buildResolvedSwapBanner();
+    }
+
     final isBuy = intentType == 'buy';
     final color = isBuy ? _purple : _teal;
     final icon = isBuy ? Icons.shopping_bag_outlined : Icons.swap_horiz_rounded;
@@ -1187,6 +1258,59 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ],
             ],
             Divider(height: 1, color: color.withOpacity(0.15)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // FIX(live-swap-status-in-chat): shown instead of the normal intent
+  // banner once `_liveSwapStatus` reflects a resolved swapRequests doc.
+  Widget _buildResolvedSwapBanner() {
+    final isCompleted = _liveSwapStatus == 'completed';
+    final isAutoCancelled = _liveCancelReason == 'item_unavailable';
+
+    final Color color = isCompleted
+        ? const Color(0xFF1B8A4C)
+        : isAutoCancelled
+        ? const Color(0xFFB00020)
+        : Colors.grey.shade600;
+
+    final IconData icon = isCompleted
+        ? Icons.check_circle_rounded
+        : isAutoCancelled
+        ? Icons.block_rounded
+        : Icons.cancel_outlined;
+
+    final String message = isCompleted
+        ? 'This swap was completed 🎉'
+        : isAutoCancelled
+        ? 'This item was swapped with someone else — this request is no longer active.'
+        : 'This swap was cancelled.';
+
+    return Container(
+      color: color.withOpacity(0.08),
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+            horizontal: _isSmall ? 10 : 14, vertical: 10),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(6),
+              decoration:
+              BoxDecoration(color: color.withOpacity(0.12), shape: BoxShape.circle),
+              child: Icon(icon, color: color, size: 18),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                message,
+                style: TextStyle(
+                    fontSize: _isSmall ? 12 : 13,
+                    fontWeight: FontWeight.w600,
+                    color: color),
+              ),
+            ),
           ],
         ),
       ),
@@ -1625,6 +1749,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             onPressed: () => setState(() => _selectedMessageIds.clear())),
       ]
           : [
+        // NEW: "Customer Products" icon — opens the other participant's
+        // still-unexchanged listings in a new page. Uses `widget.receiverId`/
+        // `widget.receiverName`, which already resolve to "the other person"
+        // from whichever side opens this same ChatScreen, so this works
+        // symmetrically: user1 sees user2's unexchanged items and vice versa.
+        IconButton(
+          icon: const Icon(Icons.storefront_outlined, color: Colors.white),
+          tooltip: 'Customer Products',
+          onPressed: () => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => CustomerProductsPage(
+                userId: widget.receiverId,
+                userName: widget.receiverName,
+              ),
+            ),
+          ),
+        ),
         PopupMenuButton<String>(
           icon: const Icon(Icons.more_vert, color: Colors.white),
           offset: const Offset(0, 45),
