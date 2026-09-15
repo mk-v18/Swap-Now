@@ -13,11 +13,17 @@ class SplashScreen extends StatefulWidget {
   // now owns awaiting this instead of main.dart awaiting it before
   // runApp() — see the fix note in main.dart for why that mattered.
   final Future<FirebaseApp> firebaseInit;
+  // NEW: the in-flight App Check activation (+ first token fetch) future
+  // from main(). Splash waits on this too, alongside route-resolution,
+  // before handing off to Wrapper -- see the fix note on appCheckReady in
+  // main.dart for the "signs out on every launch" bug this closes.
+  final Future<void> appCheckReady;
 
   const SplashScreen({
     super.key,
     required this.navigatorKey,
     required this.firebaseInit,
+    required this.appCheckReady,
   });
 
   @override
@@ -99,17 +105,55 @@ class _SplashScreenState extends State<SplashScreen>
 
     // FIX (white-screen after splash): warm Wrapper's routing decision now,
     // in parallel with the splash animation, instead of letting it start
-    // cold the moment Wrapper mounts 4.5s from now. This is a
-    // SharedPreferences read + a Firestore `users/{uid}` read -- previously
-    // that round trip only began AFTER the splash screen had already
-    // disappeared, so the user saw a second blank frame right after this
-    // one. RouteResolver caches the result so Wrapper just picks it up.
-    FirebaseAuth.instance.authStateChanges().first.then((user) {
-      if (user != null) {
-        RouteResolver.instance.resolve(user); // fire-and-forget cache warm-up
-      }
-    }).catchError((e) {
+    // cold the moment Wrapper mounts. This is a SharedPreferences read + a
+    // Firestore `users/{uid}` read -- RouteResolver caches the result so
+    // Wrapper's FutureBuilder just picks up an already-finished Future
+    // instead of showing its own blank `_InstantScreen` placeholder while
+    // it waits.
+    //
+    // FIX(startup speed): navigation used to be a flat, unconditional
+    // Future.delayed(4500ms) -- paid IN FULL every single launch, on top
+    // of whatever Firebase.initializeApp() itself took, regardless of how
+    // fast this route-resolve actually finished. That's what was showing
+    // up as several extra seconds before the bottom nav appeared. Instead:
+    // race a short minimum "branding" delay against the real route-resolve
+    // future, capped so a slow/flaky connection can't hang the splash
+    // indefinitely -- on a fast connection this leaves in ~1.1s; on a slow
+    // one it waits (up to the cap) for the resolve so Wrapper doesn't have
+    // to show its own blank frame right after this one.
+    final minSplashTime =
+    Future<void>.delayed(const Duration(milliseconds: 1100));
+
+    // FIX(re-login-every-launch, root cause): App Check's activation (+
+    // first token fetch, see main.dart) has to finish BEFORE the very
+    // first authenticated Firestore read of this session below -- not
+    // just before Splash navigates away. Defining it first and awaiting
+    // it INSIDE the routeReady chain (rather than only racing it
+    // alongside routeReady) is what actually closes the race: previously
+    // this Firestore call and App Check activation ran concurrently, so
+    // whichever happened to finish first was down to luck -- and once
+    // Splash got faster, the Firestore call started winning that race
+    // consistently, which is what was getting misread as an invalid
+    // session. Capped with its own timeout so a genuinely broken App
+    // Check setup degrades to "proceed anyway" instead of stalling login.
+    final appCheckReady = widget.appCheckReady
+        .timeout(const Duration(milliseconds: 3000), onTimeout: () {})
+        .catchError((e) {
+      debugPrint('[SwapNow] Splash: appCheckReady wait failed: $e');
+    });
+
+    final routeReady = FirebaseAuth.instance
+        .authStateChanges()
+        .first
+        .then<Widget?>((user) async {
+      if (user == null) return null;
+      await appCheckReady; // ordering fix -- see appCheckReady above
+      return await RouteResolver.instance.resolve(user);
+    })
+        .timeout(const Duration(milliseconds: 6000), onTimeout: () => null)
+        .catchError((e) {
       debugPrint('[SwapNow] Splash route prefetch failed: $e');
+      return null;
     });
 
     // M2 fix: wrapped in try/catch so a notification init failure
@@ -127,21 +171,23 @@ class _SplashScreenState extends State<SplashScreen>
       }
     });
 
-    // Navigate to Wrapper after splash — C2 fix: mounted check before push
-    Future.delayed(const Duration(milliseconds: 4500), () {
-      if (!mounted) return;                          // C2 fix: mounted guard
-      Navigator.pushReplacement(
-        context,
-        PageRouteBuilder(
-          pageBuilder: (_, __, ___) => const Wrapper(),
-          transitionsBuilder: (_, anim, __, child) => FadeTransition(
-            opacity: anim,
-            child: child,
-          ),
-          transitionDuration: const Duration(milliseconds: 600),
+    // Navigate to Wrapper once ready — C2 fix: mounted check before push.
+    // (appCheckReady doesn't need to be listed separately here: routeReady
+    // already awaits it internally above, and when there's no signed-in
+    // user there's no Firestore read to protect, so nothing needs it.)
+    await Future.wait([minSplashTime, routeReady]);
+    if (!mounted) return;                            // C2 fix: mounted guard
+    Navigator.pushReplacement(
+      context,
+      PageRouteBuilder(
+        pageBuilder: (_, __, ___) => const Wrapper(),
+        transitionsBuilder: (_, anim, __, child) => FadeTransition(
+          opacity: anim,
+          child: child,
         ),
-      );
-    });
+        transitionDuration: const Duration(milliseconds: 400),
+      ),
+    );
   }
 
   void _retryFirebaseInit() {

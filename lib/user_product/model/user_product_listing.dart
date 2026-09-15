@@ -1,6 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 
+/// Shared distance formatting so every screen reads the same way:
+/// - under 1 km: whole meters, e.g. "350 m" (always precise — no vague
+///   "Nearby" label, even for very short distances)
+/// - 1 km and up: one decimal, e.g. "5.7 km"
+String formatDistanceLabel(double km) {
+  if (km < 1) return '${(km * 1000).round()} m';
+  return '${km.toStringAsFixed(1)} km';
+}
+
 /// A product card with:
 /// • Full-card tap (no "View Details" button)
 /// • CachedNetworkImage for memory + disk caching
@@ -18,6 +27,17 @@ class UserProductListing extends StatelessWidget {
   final VoidCallback onFavoriteToggle;
   final bool isFavorite;
 
+  /// Distance (in km) between the current user and this listing's owner.
+  /// Only ever rendered when non-null AND <= 15 km — callers should still
+  /// pass values above that threshold (or null); this widget enforces the
+  /// cutoff itself so every screen behaves consistently.
+  final double? distanceKm;
+
+  /// false (home/default): the distance badge shows just "x.x km".
+  /// true (other pages, e.g. wishlist): the badge shows "x.x km • location"
+  /// so the owner's location comes along with the distance value.
+  final bool showDistanceWithLocation;
+
   const UserProductListing({
     super.key,
     required this.imageUrl,
@@ -28,6 +48,8 @@ class UserProductListing extends StatelessWidget {
     required this.onPressed,
     required this.onFavoriteToggle,
     this.isFavorite = false,
+    this.distanceKm,
+    this.showDistanceWithLocation = false,
   });
 
   // ── Responsive scale: 0.85 (compact phone) → 1.3 (tablet) ───────────────
@@ -58,6 +80,26 @@ class UserProductListing extends StatelessWidget {
     const Color primaryDark    = Color(0xFF4A148C);
     const Color accentLight    = Color(0xFFF3E5F5);
     const Color borderColor    = Color(0xFFECEAFF);
+
+    // Only ever shown within the 15 km cutoff — anything farther (or
+    // unknown) falls back to plain location text below.
+    final bool showDistance = distanceKm != null && distanceKm! <= 15;
+    final String? distanceValueLabel =
+    showDistance ? formatDistanceLabel(distanceKm!) : null;
+    final bool hasLocation = location != null && location!.isNotEmpty;
+
+    // What renders below the title, and which icon it uses:
+    // - within 15 km, home (showDistanceWithLocation=false): distance ONLY
+    // - within 15 km, other pages (showDistanceWithLocation=true):
+    //   distance + location together
+    // - otherwise: plain location (unchanged fallback)
+    final String? metaLine = distanceValueLabel != null
+        ? (showDistanceWithLocation && hasLocation
+        ? '$distanceValueLabel • ${location!}'
+        : distanceValueLabel)
+        : (hasLocation ? location : null);
+    final IconData metaIcon =
+    distanceValueLabel != null ? Icons.near_me_rounded : Icons.location_on_rounded;
 
     return Semantics(
       label: '$title${condition != null ? ", $condition" : ""}${location != null ? ", $location" : ""}',
@@ -236,21 +278,23 @@ class UserProductListing extends StatelessWidget {
                           ),
                         ),
 
-                        // Location
-                        if (location != null && location!.isNotEmpty) ...[
+                        // Distance (within 15 km) or plain location,
+                        // below the name — a plain text row, not a badge,
+                        // so it doesn't compete visually with the title.
+                        if (metaLine != null) ...[
                           SizedBox(height: spacingMid),
                           Row(
                             crossAxisAlignment: CrossAxisAlignment.center,
                             children: [
                               Icon(
-                                Icons.location_on_rounded,
+                                metaIcon,
                                 size: metaIconSize,
                                 color: primary.withOpacity(0.7),
                               ),
                               SizedBox(width: 3.5 * s),
                               Expanded(
                                 child: Text(
-                                  location!,
+                                  metaLine,
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(

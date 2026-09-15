@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:amoeba/pages/wishlistpage.dart';
+import 'package:amoeba/pages/profilepage_screen.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -90,6 +91,7 @@ class _HomePageState extends State<HomePage> {
   String userLocation = "";
   double? userLat;
   double? userLng;
+  String? _profileImageUrl;
   List<String> _selectedFilters = [];
 
   final TextEditingController _searchController = TextEditingController();
@@ -275,16 +277,57 @@ class _HomePageState extends State<HomePage> {
       if (data == null) return;
 
       final fetchedName = (data['name'] as String?) ?? '';
+      final fetchedImage = data['profileImage'] as String?;
 
       // Push name to UI immediately — don't wait on geocoding.
       if (mounted) {
         setState(() {
           name = fetchedName;
+          _profileImageUrl = fetchedImage;
         });
       }
 
       final loc = data['location'];
-      if (loc is String && loc.isNotEmpty) {
+      final topLat = data['lat'];
+      final topLng = data['lng'];
+
+      // FIX(consistency): the profile page saves the user's own
+      // coordinates as top-level 'lat'/'lng' fields (see profilepage.dart)
+      // — the exact same fields product docs use, and the exact same
+      // fields the details/wishlist pages read directly. This branch used
+      // to skip those and always re-geocode the 'location' text through
+      // the device's geocoder instead, which can land on a different
+      // point than the one originally picked when the address was saved
+      // (different geocoding backend/precision) — that drift is what was
+      // making home's distance disagree with the details page's, even for
+      // the exact same two users/products. Preferring the stored fields
+      // makes every screen agree on "where am I" the same way they
+      // already agree on "where is this listing".
+      if (topLat != null && topLng != null) {
+        final latVal = (topLat as num).toDouble();
+        final lngVal = (topLng as num).toDouble();
+        if (mounted) {
+          setState(() {
+            userLat = latVal;
+            userLng = lngVal;
+            if (loc is String && loc.isNotEmpty) userLocation = loc;
+          });
+          if (_lastDocs != null) _processItems(_lastDocs!);
+        }
+        if (loc == null || (loc is String && loc.isEmpty)) {
+          try {
+            final p = await placemarkFromCoordinates(latVal, lngVal);
+            if (mounted) {
+              setState(() {
+                userLocation =
+                p.isNotEmpty ? (p.first.locality ?? 'Unknown') : 'Unknown';
+              });
+            }
+          } catch (_) {}
+        }
+      } else if (loc is String && loc.isNotEmpty) {
+        // No stored coordinates at all (older profile, saved before the
+        // lat/lng fields existed) — geocoding the text is the only option.
         if (mounted) setState(() => userLocation = loc);
         try {
           final geo = await locationFromAddress(loc);
@@ -583,8 +626,15 @@ class _HomePageState extends State<HomePage> {
                             fontSize: 24,
                           ),
                         ),
-                        _iconBtn(context, 'assets/icons/favourite.svg',
-                            const WishlistPage()),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _iconBtn(context, 'assets/icons/favourite.svg',
+                                const WishlistPage()),
+                            const SizedBox(width: 8),
+                            _profileAvatarBtn(context),
+                          ],
+                        ),
                       ],
                     )
                         : null,
@@ -684,8 +734,14 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                   if (!_showPinnedSearch)
-                    _iconBtn(context, 'assets/icons/favourite.svg',
-                        const WishlistPage()),
+                    Row(
+                      children: [
+                        _iconBtn(context, 'assets/icons/favourite.svg',
+                            const WishlistPage()),
+                        const SizedBox(width: 8),
+                        _profileAvatarBtn(context),
+                      ],
+                    ),
                 ],
               ),
 
@@ -870,6 +926,48 @@ class _HomePageState extends State<HomePage> {
               BlendMode.srcIn,
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  // NEW: profile picture, top-right beside the wishlist icon — the header
+  // otherwise ended on the wishlist heart alone, which read as unfinished/
+  // empty on that side. Tapping it opens the same Profile tab as the
+  // bottom nav. Falls back to a person icon (same circle chrome as the
+  // wishlist button) until/unless the user has a saved photo.
+  Widget _profileAvatarBtn(BuildContext context) {
+    final size = _BP.iconBtnSize(context);
+    final hasPhoto = _profileImageUrl != null && _profileImageUrl!.isNotEmpty;
+    return Material(
+      color: Colors.transparent,
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        splashColor: _kPrimaryDark.withOpacity(0.1),
+        highlightColor: _kPrimaryDark.withOpacity(0.05),
+        onTap: () => Navigator.push(
+            context, MaterialPageRoute(builder: (_) => const ProfilePageScreen())),
+        // FIX: reuse the exact same _circleIcon chrome (padding/border/
+        // shadow) the wishlist button uses, with a child sized to exactly
+        // match the icon's footprint (`size` x `size`) either way -- so
+        // the two circles come out pixel-identical instead of the photo
+        // version being sized by its own separate width/height+border.
+        child: _circleIcon(
+          hasPhoto
+              ? ClipOval(
+            child: SizedBox(
+              width: size,
+              height: size,
+              child: Image.network(
+                _profileImageUrl!,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) =>
+                    Icon(Icons.person_rounded, size: size, color: _kPrimaryDark),
+              ),
+            ),
+          )
+              : Icon(Icons.person_rounded, size: size, color: _kPrimaryDark),
         ),
       ),
     );
@@ -1415,10 +1513,18 @@ class _HomePageState extends State<HomePage> {
                 // bookkeeping saves work on large grids. RepaintBoundary is
                 // still on (the default) so scrolling doesn't repaint the
                 // whole grid every frame, just the cards that changed.
+                final rawDistance = chunk[index]['distance'] as double?;
+                // 9999.0 is the "unresolved/unknown" sentinel used while
+                // processing items — treat it as no distance at all.
+                final distanceKm =
+                (rawDistance != null && rawDistance < 9999.0)
+                    ? rawDistance
+                    : null;
                 return _ProductCard(
                   key: ValueKey(doc.id),
                   doc: doc,
                   favoriteIdsListenable: _favoriteIds,
+                  distanceKm: distanceKm,
                 );
               },
               childCount: chunk.length,
@@ -1915,11 +2021,13 @@ class _SkeletonProductCard extends StatelessWidget {
 class _ProductCard extends StatelessWidget {
   final QueryDocumentSnapshot doc;
   final ValueListenable<Set<String>> favoriteIdsListenable;
+  final double? distanceKm;
 
   const _ProductCard({
     super.key,
     required this.doc,
     required this.favoriteIdsListenable,
+    this.distanceKm,
   });
 
   @override
@@ -1945,6 +2053,10 @@ class _ProductCard extends StatelessWidget {
           condition: data['condition'],
           location: data['location'],
           isFavorite: isFavorite,
+          distanceKm: distanceKm,
+          // Home stays compact — just the "x.x km" badge, no location text
+          // folded into it.
+          showDistanceWithLocation: false,
           onPressed: () => _openDetail(context, data),
           onFavoriteToggle: () => _toggleWishlist(context, isFavorite),
         );

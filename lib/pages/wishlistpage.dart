@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import '../user_product/model/user_product_listing.dart';
 import '../user_product/product_lists.dart';
 
@@ -28,11 +29,49 @@ class _WishlistPageState extends State<WishlistPage> {
   // Track in-flight remove operations to prevent double-taps
   final Set<String> _removingIds = {};
 
+  // Current user's own coordinates — fetched once so every card in the
+  // grid can show "distance to this listing's owner" without each item
+  // re-reading the user's profile doc.
+  double? _myLat;
+  double? _myLng;
+
   @override
   void initState() {
     super.initState();
     // FIX: obtain uid once; avoids repeated nullable-bang inside callbacks
     _uid = _auth.currentUser!.uid;
+    _loadMyLocation();
+  }
+
+  Future<void> _loadMyLocation() async {
+    try {
+      final doc = await _db.collection('users').doc(_uid).get();
+      final data = doc.data();
+      if (data == null || !mounted) return;
+      final lat = data['lat'];
+      final lng = data['lng'];
+      if (lat != null && lng != null) {
+        setState(() {
+          _myLat = (lat as num).toDouble();
+          _myLng = (lng as num).toDouble();
+        });
+      }
+    } catch (_) {
+      // Distance badges just won't show — not worth surfacing an error for.
+    }
+  }
+
+  /// Distance (km) from the current user to a listing's stored lat/lng, or
+  /// null when either side is missing. Kept a plain sync helper since both
+  /// coordinates are already loaded/available by the time cards build.
+  double? _distanceKmTo(Map<String, dynamic> data) {
+    if (_myLat == null || _myLng == null) return null;
+    final lat = data['lat'];
+    final lng = data['lng'];
+    if (lat == null || lng == null) return null;
+    return Geolocator.distanceBetween(
+        _myLat!, _myLng!, (lat as num).toDouble(), (lng as num).toDouble()) /
+        1000;
   }
 
   // ── Stream ────────────────────────────────────────────────────────────────
@@ -380,6 +419,10 @@ class _WishlistPageState extends State<WishlistPage> {
                       price: data['price'],
                       condition: data['condition'],
                       location: data['location'],
+                      distanceKm: _distanceKmTo(data),
+                      // Wishlist is an "other page" — pair the distance
+                      // value with the owner's location in one badge.
+                      showDistanceWithLocation: true,
                       // RELIABILITY: reflect in-progress removal in UI
                       isFavorite: !isRemoving,
                       onPressed: () => Navigator.push(

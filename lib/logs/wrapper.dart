@@ -189,6 +189,29 @@ class Wrapper extends StatelessWidget {
       // session (and can still reach things like the banned-account page
       // or Help Center).
       if (_isSessionInvalid(e)) {
+        // DIAGNOSTIC: if you're seeing "asks for login every time the app
+        // is reopened", check the device logs for this exact line right
+        // after you relaunch -- it prints the FirebaseAuthException code
+        // that's triggering the forced sign-out below. In practice this
+        // almost always turns out to be 'user-token-expired' or
+        // 'invalid-user-token' coming from a failed silent ID-token
+        // refresh, and the #1 real-world cause of THAT is Firebase App
+        // Check enforcement on the Authentication API being turned on in
+        // the console while the app is tested via a build Play Integrity
+        // can't attest (anything not installed through Google Play --
+        // sideloaded APKs, most internal/ad-hoc test builds, emulators
+        // without Play Store, etc.). If that's the case, Play Integrity
+        // fails to produce a valid App Check token on literally every
+        // launch, the Auth SDK's background token refresh gets rejected
+        // every time, and the session dies every time as a result -- so
+        // it FEELS like sign-out isn't persisting, but the actual bug is
+        // upstream of this file, in Firebase Console -> App Check ->
+        // APIs -> Authentication (set it to "Unenforced"/"Monitor" while
+        // testing on non-Play-Store builds, or install via an internal
+        // testing track so Play Integrity can actually verify the app).
+        debugPrint("Wrapper: forcing sign-out due to ${e.runtimeType}"
+            "${e is FirebaseAuthException ? ' (code: ${e.code})' : ''}");
+
         // FIX: clear the routing cache too -- otherwise a later sign-in
         // (maybe a different account) could pick up this uid's stale
         // cached result if uids ever collided across a fast sign-out/in.

@@ -45,33 +45,79 @@ void main() {
   // ready (FirebaseAuth, Firestore).
   final firebaseInit = Firebase.initializeApp();
 
-  firebaseInit.then((_) {
+  // FIX(re-login-every-launch, root cause): SplashScreen's navigation timing
+  // got faster (see splash_screen.dart), which is good, but it exposed a
+  // pre-existing race that used to be hidden by the old flat 4.5s delay:
+  // Wrapper's very first Firestore read (to look up the signed-in user's
+  // profile doc) could now land BEFORE App Check finished activating.
+  // If App Check enforcement is on for Firestore/Auth, a request that goes
+  // out before App Check is ready can come back rejected, which Wrapper's
+  // error handling can misread as "this session is invalid" and sign the
+  // user out -- on every single launch, since the timing was consistently
+  // losing the race, not occasionally. Exposing this as an awaited Future
+  // (instead of the previous fire-and-forget) lets SplashScreen actually
+  // wait for App Check before handing off to Wrapper, restoring the
+  // ordering the old delay used to give us for free, without bringing
+  // back a multi-second flat wait for everyone.
+  final appCheckReady = firebaseInit.then((_) {
     FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-    _activateAppCheck();
+    return _activateAppCheck();
   }).catchError((e) {
     debugPrint('[SwapNow] Firebase.initializeApp failed: $e');
-    // SplashScreen awaits this same future and shows its own retry UI --
-    // no separate navigation needed here.
+    // SplashScreen awaits firebaseInit separately and shows its own retry
+    // UI for this case -- nothing else to do with the error here.
   });
 
-  runApp(SwapNowApp(navigatorKey: navigatorKey, firebaseInit: firebaseInit));
+  runApp(SwapNowApp(
+    navigatorKey: navigatorKey,
+    firebaseInit: firebaseInit,
+    appCheckReady: appCheckReady,
+  ));
 
   _deferMediaKitInit();
   _deferAdsInit();
 }
 
-void _activateAppCheck() {
-  FirebaseAppCheck.instance
-      .activate(
-    androidProvider:
-    kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
-    appleProvider:
-    kDebugMode ? AppleProvider.debug : AppleProvider.deviceCheck,
-  )
-      .catchError((e) {
+Future<void> _activateAppCheck() async {
+  try {
+    await FirebaseAppCheck.instance.activate(
+      androidProvider:
+      kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+      appleProvider:
+      kDebugMode ? AppleProvider.debug : AppleProvider.deviceCheck,
+    );
+  } catch (e) {
     // Non-fatal: app still works without AppCheck, just less protected.
     debugPrint('[SwapNow] AppCheck activation failed: $e');
-  });
+    return;
+  }
+
+  // FIX(slow OTP send): App Check's Play Integrity provider is slow on
+  // its FIRST token fetch -- a cold call to Play Integrity commonly
+  // takes several seconds (10-15s is normal on some devices/networks)
+  // because it's a real round trip to Google Play services, not a local
+  // computation. Phone Auth's verifyPhoneNumber() needs a valid App
+  // Check token before it can even ask Firebase to send the SMS, so if
+  // nothing has fetched one yet, that entire Play Integrity round trip
+  // happened to land right when the user tapped "Continue" on the OTP
+  // page -- which is exactly the multi-second spinner being reported.
+  // Fetching (and letting the SDK cache) a token here, immediately
+  // after activation during app startup, means that round trip happens
+  // in the background while the user is still looking at the splash/
+  // home screen instead of blocking the OTP flow later. Later calls
+  // (including the one verifyPhoneNumber() makes internally) reuse the
+  // cached token until it's close to expiry, so this only pays the cold
+  // fetch cost once per app session.
+  //
+  // A plain getToken() (no force-refresh) still warms the cache the
+  // first time -- nothing is cached yet on a fresh session -- but
+  // reuses whatever's already there afterwards, same as every other
+  // caller asking App Check for a token.
+  try {
+    await FirebaseAppCheck.instance.getToken();
+  } catch (e) {
+    debugPrint('[SwapNow] AppCheck token pre-fetch failed: $e');
+  }
 }
 
 void _deferMediaKitInit() {
@@ -97,10 +143,12 @@ void _deferAdsInit() {
 class SwapNowApp extends StatelessWidget {
   final GlobalKey<NavigatorState> navigatorKey;
   final Future<FirebaseApp> firebaseInit;
+  final Future<void> appCheckReady;
   const SwapNowApp({
     super.key,
     required this.navigatorKey,
     required this.firebaseInit,
+    required this.appCheckReady,
   });
 
   @override
@@ -117,8 +165,15 @@ class SwapNowApp extends StatelessWidget {
       ),
       // firebaseInit is now the source of truth for "is Firebase ready" --
       // SplashScreen awaits it before touching FirebaseAuth/Firestore, and
-      // renders its own retry UI if it fails.
-      home: SplashScreen(navigatorKey: navigatorKey, firebaseInit: firebaseInit),
+      // renders its own retry UI if it fails. appCheckReady lets it also
+      // wait for App Check specifically before handing off to Wrapper --
+      // see the comment on appCheckReady in main() for why that ordering
+      // matters.
+      home: SplashScreen(
+        navigatorKey: navigatorKey,
+        firebaseInit: firebaseInit,
+        appCheckReady: appCheckReady,
+      ),
       onGenerateRoute: (settings) {
         if (settings.name == '/chat') {
           final args = settings.arguments as Map<String, dynamic>? ?? {};

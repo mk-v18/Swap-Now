@@ -2,8 +2,11 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:amoeba/Advertisement/location_ad.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import '../chats/chatscreen.dart';
 import '../chats/swap_request_service.dart';
+import '../chats/swap_requests_page.dart';
+import 'model/user_product_listing.dart' show formatDistanceLabel;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DESIGN TOKENS
@@ -99,11 +102,56 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   // one is completed or cancelled.
   Map<String, dynamic>? _blockingUserRequest;
 
+  // Current user's (user1's) own coordinates — fetched once so the meta
+  // card can show the distance to this listing's owner (user2). Left
+  // null (badge just stays hidden) whenever the profile has no saved
+  // coordinates or the fetch fails.
+  double? _myLat;
+  double? _myLng;
+
   @override
   void initState() {
     super.initState();
     _loadSeller();
     _checkExistingRequest();
+    _loadMyLocation();
+  }
+
+  Future<void> _loadMyLocation() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    try {
+      final doc =
+      await FirebaseFirestore.instance.collection('users').doc(uid).get();
+      final data = doc.data();
+      if (data == null || !mounted) return;
+      final lat = data['lat'];
+      final lng = data['lng'];
+      if (lat != null && lng != null) {
+        setState(() {
+          _myLat = (lat as num).toDouble();
+          _myLng = (lng as num).toDouble();
+        });
+      }
+    } catch (_) {
+      // Not worth surfacing — the distance row simply won't appear.
+    }
+  }
+
+  /// Distance in km from the current user to this listing's owner, or
+  /// null when either side's coordinates are unavailable, or when the
+  /// viewer IS the owner (distance-to-self is meaningless, not "0.0").
+  double? get _distanceToSellerKm {
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+    final sellerId = widget.productData['userId'] as String?;
+    if (myUid != null && myUid == sellerId) return null;
+    if (_myLat == null || _myLng == null) return null;
+    final lat = widget.productData['lat'];
+    final lng = widget.productData['lng'];
+    if (lat == null || lng == null) return null;
+    return Geolocator.distanceBetween(
+        _myLat!, _myLng!, (lat as num).toDouble(), (lng as num).toDouble()) /
+        1000;
   }
 
   void _loadSeller() {
@@ -405,6 +453,12 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
     final category = widget.productData['category'] ?? '—';
     final condition = widget.productData['condition'] ?? '—';
 
+    // Only ever shown within 15 km — this is a details/"other" page, so
+    // when it does show, it pairs the distance value with the owner's
+    // location rather than the bare number home uses.
+    final distanceKm = _distanceToSellerKm;
+    final showDistance = distanceKm != null && distanceKm <= 15;
+
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: rl.hPad),
       child: Container(
@@ -419,6 +473,15 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
               label: 'Location',
               value: location,
             ),
+            if (showDistance) ...[
+              _metaDivider(),
+              _metaRow(
+                icon:  Icons.near_me_rounded,
+                color: _T.teal,
+                label: 'Distance',
+                value: '${formatDistanceLabel(distanceKm)} • $location',
+              ),
+            ],
             _metaDivider(),
             _metaRow(
               icon:  Icons.category_rounded,
@@ -592,7 +655,7 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
       child: InkWell(
         borderRadius: BorderRadius.circular(18),
         onTap: isAccepted
-            ? (_isMessaging ? null : _continueBlockingChat)
+            ? (_isMessaging ? null : _openBlockingSwapInRequests)
             : () => _showBlockingInfoDialog(otherName, theirProductTitle),
         child: Container(
           width: double.infinity,
@@ -647,7 +710,7 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
                     if (isAccepted) ...[
                       const SizedBox(height: 6),
                       Text(
-                        'Tap to open chat →',
+                        'Tap to view in Requests →',
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w700,
@@ -721,11 +784,12 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
       icon = Icons.chat_bubble_outline_rounded;
       onTap = _isMessaging ? null : _continueExistingChat;
     } else if (blockingStatus == 'accepted') {
-      // Other swap already has a chat — let them jump straight to it so
-      // they can complete/cancel it, rather than dead-ending here.
+      // Other swap already has a chat — send them to the Requests page's
+      // Active tab, where that swap actually lives, so they can complete
+      // or cancel it before starting a new one here.
       label = 'Finish your other swap first';
       icon = Icons.swap_horiz_rounded;
-      onTap = _isMessaging ? null : _continueBlockingChat;
+      onTap = _isMessaging ? null : _openBlockingSwapInRequests;
     } else if (blockingStatus == 'pending') {
       label = 'Pending swap with this user';
       icon = Icons.hourglass_top_rounded;
@@ -860,32 +924,17 @@ class _UserProductDetailsPageState extends State<UserProductDetailsPage> {
   }
 
   // FIX(one-swap-per-user): companion to _continueExistingChat, but for the
-  // OTHER product's swap that's currently blocking this one. Same
-  // reasoning — the accepted chat is the fastest way for the user to go
-  // complete or cancel it so they can start the new request.
-  void _continueBlockingChat() {
-    final req = _blockingUserRequest;
-    if (req == null) return;
-    final chatId = req['chatId'] as String?;
-    if (chatId == null) {
-      _showSnack('Chat is not ready yet. Try again shortly.');
-      return;
-    }
-    final myUid = FirebaseAuth.instance.currentUser?.uid;
-    final iAmSender = req['fromUserId'] == myUid;
-    // Show whichever side of the pair I'm NOT on.
-    final otherId = iAmSender ? req['toUserId'] : req['fromUserId'];
-    final otherName = iAmSender ? req['toUserName'] : req['fromUserName'];
-    final otherImage = iAmSender ? req['toUserImage'] : req['fromUserImage'];
+  // OTHER product's swap that's currently blocking this one. Rather than
+  // jumping straight into that chat (which buried "Active" swaps state
+  // deep in a screen the user didn't ask for), this opens the Requests
+  // page's "Active" tab — the actual home for accepted swaps, where the
+  // user can see it alongside any others and complete/cancel it from
+  // there.
+  void _openBlockingSwapInRequests() {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => ChatScreen(
-          chatId: chatId,
-          receiverId: (otherId as String?) ?? '',
-          receiverName: (otherName as String?) ?? 'User',
-          receiverImage: (otherImage as String?) ?? '',
-        ),
+        builder: (_) => const SwapRequestsPage(initialTab: 1), // Active tab
       ),
     );
   }
